@@ -10,7 +10,7 @@ holds the changes. Every change can be switched off at run time, which restores 
 |---|---|---|
 | `calc_chiqw` | new band-pair loop (`src/chiqw/chi_fast.f90`), see below | `flg_fast` in `&param_chiqw` (default 1) |
 | `calc_chiqw` | faster generalized-tetrahedron weights (`src/chiqw/m_tetrahedron_fast.F`) | used by `flg_fast=1` |
-| `calc_chiqw` | optional CUDA path (`src/chiqw/chi_gpu.cu`), see “GPU path” | `flg_gpu` (default 0), build with `-DRESPACK_CUDA=ON` |
+| `calc_chiqw` | optional GPU path (`src/chiqw/chi_gpu.cu`) for NVIDIA (CUDA) and AMD (ROCm/HIP) GPUs, see “GPU path” | `flg_gpu` (default 0), build with `-DRESPACK_CUDA=ON` or `-DRESPACK_HIP=ON` |
 | `calc_w3d`, `calc_j3d` | cached real-space Wannier functions + FFTW, ZGEMM contractions (`src/calc_int/int_fast.f90`) | `flg_fast` in `&param_calc_int` (default 1) |
 | `calc_w3d`, `calc_j3d` | `make_LG0` loops limited to the cutoff sphere; `exp(-iq.R)` tables | always on; gives numerically identical results |
 
@@ -94,7 +94,8 @@ budget means larger tiles and fewer backward FFTs.
 | `src/calc_int/m_rdinput.f90`, `config_w3d.h`, `config_j3d.h`, `CMakeLists.txt` | modified | inputs, declarations, FFTW3 |
 | `CMakeLists.txt` (top level and all subdirectories) | modified | modern target-based CMake (3.18 to 4.x): imported MPI/OpenMP/LAPACK/FFTW3 targets, CPU and LTO options |
 | `cmake/FindFFTW3.cmake`, `CMakePresets.json` | new | FFTW3 finder, build presets |
-| `src/chiqw/chi_gpu.cu`, `chi_gpu_stub.c` | new | CUDA path of the band-pair loop, stub without CUDA |
+| `src/chiqw/chi_gpu.cu`, `chi_gpu_stub.c` | new | GPU path of the band-pair loop, stub without a GPU build |
+| `src/chiqw/gpu_api.h` | new | maps the CUDA names in `chi_gpu.cu` onto HIP/hipFFT/hipBLAS for the ROCm build |
 | `local-tools/*`, `README-zen-opt.md` | new | build script, validation and benchmark tools, this document |
 
 All changed places in modified files are marked with `fork` comments. The full diff is
@@ -163,6 +164,50 @@ list is `all-major`.
 
   A `mpirun` started from an `salloc` shell sees all GPUs of the node.
 - **BLAS threads:** keep `OPENBLAS_NUM_THREADS=1`.
+
+### AMD GPUs (ROCm/HIP, branch `gpu-hip`)
+
+The same `chi_gpu.cu` is compiled as HIP. `src/chiqw/gpu_api.h` maps the CUDA runtime, cuFFT, cuBLAS and
+cuComplex names one-to-one onto the HIP runtime, hipFFT (rocFFT) and hipBLAS (rocBLAS), so the kernels, the
+precision model and all switches (`flg_gpu`, `fast_fft_sp`, `fast_mem_mb`, `RESPACK_GPU_KC`) are the same as
+on NVIDIA GPUs. The kernels use no warp-level operations, so the wavefront size (32 or 64) does not matter.
+
+**Build** (ROCm ≥ 6 with hipFFT and hipBLAS, CMake ≥ 3.21):
+
+    cmake --preset hip -B build/hip -DCMAKE_HIP_ARCHITECTURES=gfx1200   # e.g. gfx1200 = RX 9060/9070, gfx942 = MI300
+    cmake --build build/hip -j
+
+Without `CMAKE_HIP_ARCHITECTURES`, CMake builds for the GPU(s) of the build machine. ROCm is looked up in
+`ROCM_PATH` (CMake or environment variable), default `/opt/rocm`. `RESPACK_CUDA` and `RESPACK_HIP` are
+mutually exclusive.
+
+**Running:** as on NVIDIA GPUs, one MPI rank per GPU (local rank modulo device count); restrict the visible
+GPUs with `HIP_VISIBLE_DEVICES` or `ROCR_VISIBLE_DEVICES`. On consumer Radeon GPUs, which are weak in
+FP64 like the L40S, use `fast_fft_sp=1`.
+
+**CGEMM block length:** the HIP build uses blocks of at most 512 rows (`GPU_KC_MAX` in `gpu_api.h`) instead
+of 2048. rocBLAS accumulates the inner dimension sequentially in FP32, so the error grows about linearly with
+the block length. For SrVO₃ with double-precision FFTs, ε⁻¹ deviates from the CPU double-precision run by
+3.8×10⁻⁶ at 2048 rows, 8.4×10⁻⁷ at 512 and 2.2×10⁻⁷ at 128. The CGEMM time is 13.0 s, 16.6 s and 33.1 s. At
+512 rows the accuracy matches cuBLAS at 2048 rows.
+
+**Validation** (Radeon RX 9060 XT, gfx1200, 16 GB; ROCm 7.2.1; Ryzen 9 9950X3D, 1 rank × 4 threads), against the
+CPU double-precision run of the same build:
+
+| test | ε⁻¹ (all q) | U(ω), J(ω) | static U, U′, J |
+|---|---|---|---|
+| SrVO₃ cRPA | 8.4×10⁻⁷ | ≤ 1×10⁻⁵ eV | identical |
+| SrVO₃ cRPA, `fast_fft_sp=1` | 3.1×10⁻⁶ | ≤ 3×10⁻⁵ eV | identical |
+| Si cRPA | 9.8×10⁻⁷ | ≤ 1×10⁻⁵ eV | identical |
+| Si cRPA, `fast_fft_sp=1` | 8.9×10⁻⁷ | ≤ 1×10⁻⁵ eV | identical |
+
+Compare with the CPU build of another machine, not of the same build. The CPU double-precision runs on this
+machine (`-march=native` on Zen 5, Ubuntu's gfortran/glibc/OpenBLAS) and on the Ryzen 7 PRO 6850U
+(`-march=znver3`, LTO, static OpenBLAS) already differ by 3.4×10⁻⁵ in ε⁻¹ (SrVO₃; Si: 3.9×10⁻⁶). The
+tetrahedron weights cause this, and it is below the method's rounding level of 7×10⁻⁵ (see above). The static
+U, U′, J agree to all printed digits.
+
+The test machine was also running another job on 16 cores, so the timings above are not a benchmark.
 
 ### Validation (GPU vs CPU double precision; L40S, CUDA 13.0)
 

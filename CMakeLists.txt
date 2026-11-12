@@ -37,6 +37,7 @@ set(RESPACK_ARCH "" CACHE STRING "Target CPU for -march/-mtune with GNU compiler
 option(RESPACK_LTO "Link-time (interprocedural) optimisation" OFF)
 option(RESPACK_BUILD_XTAPP "Build the xTAPP converters (strconv, wfn2respack)" ON)
 option(RESPACK_CUDA "Build the CUDA path of calc_chiqw (flg_gpu=1; needs CUDA toolkit with cuBLAS/cuFFT)" OFF)
+option(RESPACK_HIP "Build the ROCm/HIP path of calc_chiqw for AMD GPUs (flg_gpu=1; needs ROCm with hipBLAS/hipFFT and CMake >= 3.21)" OFF)
 
 #-----------------------------------------------------------------------------------------------------
 # Dependencies
@@ -55,6 +56,30 @@ if(RESPACK_CUDA)
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
   message(STATUS "CUDA: ${CMAKE_CUDA_COMPILER_VERSION}, architectures ${CMAKE_CUDA_ARCHITECTURES}")
+endif()
+if(RESPACK_CUDA AND RESPACK_HIP)
+  message(FATAL_ERROR "RESPACK_CUDA and RESPACK_HIP are mutually exclusive")
+endif()
+if(RESPACK_HIP)
+  if(CMAKE_VERSION VERSION_LESS 3.21)
+    message(FATAL_ERROR "RESPACK_HIP needs CMake >= 3.21 (HIP language support)")
+  endif()
+  # ROCm location: -DROCM_PATH=... or environment ROCM_PATH, default /opt/rocm
+  if(NOT DEFINED ROCM_PATH)
+    if(DEFINED ENV{ROCM_PATH})
+      set(ROCM_PATH "$ENV{ROCM_PATH}")
+    else()
+      set(ROCM_PATH /opt/rocm)
+    endif()
+  endif()
+  list(APPEND CMAKE_PREFIX_PATH "${ROCM_PATH}")
+  # default: the GPU architecture(s) of the build machine, detected by CMake;
+  # e.g. -DCMAKE_HIP_ARCHITECTURES=gfx1200 (RX 9060/9070), gfx90a (MI210/MI250X), gfx942 (MI300)
+  enable_language(HIP)
+  find_package(hip REQUIRED CONFIG)
+  find_package(hipfft REQUIRED CONFIG)
+  find_package(hipblas REQUIRED CONFIG)
+  message(STATUS "HIP: ${CMAKE_HIP_COMPILER_VERSION}, architectures ${CMAKE_HIP_ARCHITECTURES}, ROCm ${ROCM_PATH}")
 endif()
 
 #-----------------------------------------------------------------------------------------------------

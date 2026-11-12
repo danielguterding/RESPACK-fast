@@ -33,6 +33,14 @@
       }
     },
     {
+      "name": "hip",
+      "inherits": "default",
+      "displayName": "Release with the ROCm/HIP GPU path (AMD GPUs; ROCm in ROCM_PATH or /opt/rocm)",
+      "cacheVariables": {
+        "RESPACK_HIP": "ON"
+      }
+    },
+    {
       "name": "debug",
       "inherits": "default",
       "displayName": "Debug (-O0 -g)",
@@ -45,6 +53,7 @@
     { "name": "default", "configurePreset": "default" },
     { "name": "native", "configurePreset": "native" },
     { "name": "zen3", "configurePreset": "zen3" },
+    { "name": "hip", "configurePreset": "hip" },
     { "name": "debug", "configurePreset": "debug" }
   ]
 }

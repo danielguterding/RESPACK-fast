@@ -8,7 +8,10 @@
 // even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
 // General Public License (GPL/GPLv3.txt) for more details.
 //
-// chi_gpu.cu -- CUDA path of m_chi_fast (calc_chiqw), selected with flg_gpu=1.
+// chi_gpu.cu -- GPU path of m_chi_fast (calc_chiqw), selected with flg_gpu=1.
+// Written against CUDA (cuFFT, cuBLAS); with RESPACK_HIP=ON the same file is compiled as HIP for AMD GPUs
+// (ROCm: hipFFT/rocFFT, hipBLAS/rocBLAS), with the names mapped in gpu_api.h. Below, cuFFT/cuBLAS stand
+// for hipFFT/hipBLAS in a HIP build.
 //
 // Same quantity as the CPU path with fast_gemm_sp=1:
 //   chi(G,G',w) += sum_{pairs p, k} conj(M_pk(G)) * W_pk(w) * M_pk(G')
@@ -23,20 +26,17 @@
 // Conventions as cuFFT/FFTW: inverse (backward) unnormalised exp(+i...), forward exp(-i...).
 // Fortran array u(n1,n2,n3) <-> cuFFT dims {n3,n2,n1}.
 
-#include <cuda_runtime.h>
-#include <cufft.h>
-#include <cublas_v2.h>
-#include <cuComplex.h>
+#include "gpu_api.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
-  fprintf(stderr, "chi_gpu: CUDA error '%s' at %s:%d\n", cudaGetErrorString(e_), __FILE__, __LINE__); return -1; } } while (0)
+  fprintf(stderr, "chi_gpu: " GPU_RT_NAME " error '%s' at %s:%d\n", cudaGetErrorString(e_), __FILE__, __LINE__); return -1; } } while (0)
 #define CF(x) do { cufftResult r_ = (x); if (r_ != CUFFT_SUCCESS) { \
-  fprintf(stderr, "chi_gpu: cuFFT error %d at %s:%d\n", (int)r_, __FILE__, __LINE__); return -2; } } while (0)
+  fprintf(stderr, "chi_gpu: " GPU_FFT_NAME " error %d at %s:%d\n", (int)r_, __FILE__, __LINE__); return -2; } } while (0)
 #define CB(x) do { cublasStatus_t s_ = (x); if (s_ != CUBLAS_STATUS_SUCCESS) { \
-  fprintf(stderr, "chi_gpu: cuBLAS error %d at %s:%d\n", (int)s_, __FILE__, __LINE__); return -3; } } while (0)
+  fprintf(stderr, "chi_gpu: " GPU_BLAS_NAME " error %d at %s:%d\n", (int)s_, __FILE__, __LINE__); return -3; } } while (0)
 
 typedef cuDoubleComplex zc;
 typedef cuComplex cc;
@@ -199,7 +199,7 @@ extern "C" int chi_gpu_init(int n1, int n2, int n3, int fbatch, int verbose, int
   memset(&g, 0, sizeof(g));
   int ndev = 0;
   CK(cudaGetDeviceCount(&ndev));
-  if (ndev < 1) { fprintf(stderr, "chi_gpu: no CUDA device\n"); return -10; }
+  if (ndev < 1) { fprintf(stderr, "chi_gpu: no " GPU_RT_NAME " device\n"); return -10; }
   g.dev = local_rank() % ndev;
   CK(cudaSetDevice(g.dev));
   g.n1 = n1; g.n2 = n2; g.n3 = n3; g.fbatch = fbatch > 0 ? fbatch : 16;
@@ -332,6 +332,9 @@ extern "C" int chi_gpu_pairs(int ik0, int NTK, int ubJ, int ubI, double scl) {
 extern "C" int chi_gpu_gemm(const zc *W, const zc *V, int kc) {
   const int NG = g.NG, nen = g.nen, rows = g.rows;
   size_t nA = (size_t)NG * rows, nW = (size_t)rows * nen;
+#ifdef GPU_KC_MAX
+  if (kc > GPU_KC_MAX) kc = GPU_KC_MAX;   // HIP: shorter blocks for rocBLAS, see gpu_api.h
+#endif
   { const char *e = getenv("RESPACK_GPU_KC"); if (e && atoi(e) > 0) kc = atoi(e); }   // rows per CGEMM block (testing)
   if (kc < 1 || kc > rows) kc = rows;
   if (ensure(&g.A4, &g.A4_cap, nA)) return -1;
