@@ -138,7 +138,7 @@ contains
       if (chi_gpu_available() /= 1) then
         write(6,*) 'flg_gpu=1, but calc_chiqw was built without CUDA (cmake -DRESPACK_CUDA=ON)'; stop
       end if
-      rc = chi_gpu_init(nx, ny, nz, 16, merge(1, 0, lverbose), merge(1, 0, lfft_sp))
+      rc = chi_gpu_init(nx, ny, nz, 0, merge(1, 0, lverbose), merge(1, 0, lfft_sp))   ! 0: batch size automatic
       if (rc /= 0) then
         write(6,*) 'chi_gpu_init failed, code ', rc; stop
       end if
