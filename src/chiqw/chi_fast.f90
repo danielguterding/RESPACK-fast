@@ -376,14 +376,15 @@ contains
       block
         type(c_ptr) :: pbuf
         complex(c_float_complex), pointer :: ubuf(:, :)
-        complex(8), allocatable :: cbuf(:), cJ(:, :), cI(:, :)
+        complex(8), allocatable :: cbuf(:), cJ(:, :), cI(:, :), pmap(:)
+        integer, allocatable :: jmap(:), gpos(:)
         integer :: ik, ikq, ikir, iop, ikirq, iopq, jl, il, ig, lp, row, jb, ib, ix, g
         complex(8) :: sumv(3), vm(3), nlvm(3)
         real(8) :: gv(3), del
 
         pbuf = fftwf_alloc_complex(int(ldg, c_size_t)*int(bj + bi + 1, c_size_t))
         call c_f_pointer(pbuf, ubuf, [ldg, bj + bi + 1])     ! columns 1..ntj: occ, bj+1..bj+nti: vir, last: product
-        allocate(cbuf(NTG))
+        allocate(cbuf(NTG), pmap(NTG), jmap(NTG), gpos(NTG))
         if (lq0) then
           allocate(cJ(NTG, bj), cI(NTG, bi))
         end if
@@ -392,28 +393,33 @@ contains
         do ik = 1, NTK
           ikq = kpq(ik)
           ikir = numirr(ik); iop = numrot(ik)
+          call make_C0_map(NTG, trs(ik), NG0(ik), KG0(1, 1, ik), RW(1, ik), rginv(1, 1, iop), pg(1, iop), &
+               nnp, L1, L2, L3, packing(-L1, -L2, -L3, ikir), jmap, pmap)
+          do ig = 1, NG0(ik)
+            gpos(ig) = gidx(KG0(1, ig, ik), KG0(2, ig, ik), KG0(3, ig, ik))
+          end do
           do jl = 1, ntj
             jb = tj(jl)
-            cbuf = zzero
-            call make_C0(NTG, trs(ik), NG0(ik), KG0(1, 1, ik), RW(1, ik), rginv(1, 1, iop), pg(1, iop), &
-                 nnp, L1, L2, L3, packing(-L1, -L2, -L3, ikir), OCC(1, jb, ikir), cbuf)
+            call c0_apply(NG0(ik), trs(ik), jmap, pmap, OCC(1, jb, ikir), cbuf)
             ubuf(:, jl) = (0.0, 0.0)
             do ig = 1, NG0(ik)
-              ubuf(gidx(KG0(1, ig, ik), KG0(2, ig, ik), KG0(3, ig, ik)), jl) = cmplx(cbuf(ig), kind=4)
+              ubuf(gpos(ig), jl) = cmplx(cbuf(ig), kind=4)
             end do
             call fftwf_execute_dft(plan_bw4, ubuf(:, jl), ubuf(:, jl))
             if (lq0) cJ(1:NG0(ik), jl) = cbuf(1:NG0(ik))
           end do
           ikirq = numirr(ikq); iopq = numrot(ikq)
+          call make_C0_map(NTG, trs(ikq), NG0(ikq), KG0(1, 1, ikq), RW(1, ikq), rginv(1, 1, iopq), pg(1, iopq), &
+               nnp, L1, L2, L3, packing(-L1, -L2, -L3, ikirq), jmap, pmap)
+          do ig = 1, NG0(ikq)
+            gpos(ig) = gidx(KG0(1, ig, ikq) - shG(1, ik), KG0(2, ig, ikq) - shG(2, ik), KG0(3, ig, ikq) - shG(3, ik))
+          end do
           do il = 1, nti
             ib = ti(il)
-            cbuf = zzero
-            call make_C0(NTG, trs(ikq), NG0(ikq), KG0(1, 1, ikq), RW(1, ikq), rginv(1, 1, iopq), pg(1, iopq), &
-                 nnp, L1, L2, L3, packing(-L1, -L2, -L3, ikirq), VIR(1, ib, ikirq), cbuf)
+            call c0_apply(NG0(ikq), trs(ikq), jmap, pmap, VIR(1, ib, ikirq), cbuf)
             ubuf(:, bj + il) = (0.0, 0.0)
             do ig = 1, NG0(ikq)
-              ubuf(gidx(KG0(1, ig, ikq) - shG(1, ik), KG0(2, ig, ikq) - shG(2, ik), &
-                        KG0(3, ig, ikq) - shG(3, ik)), bj + il) = cmplx(cbuf(ig), kind=4)
+              ubuf(gpos(ig), bj + il) = cmplx(cbuf(ig), kind=4)
             end do
             call fftwf_execute_dft(plan_bw4, ubuf(:, bj + il), ubuf(:, bj + il))
             if (lq0) cI(1:NG0(ikq), il) = cbuf(1:NG0(ikq))
@@ -448,7 +454,7 @@ contains
         end do
         !$omp end do
 
-        deallocate(cbuf)
+        deallocate(cbuf, pmap, jmap, gpos)
         if (lq0) deallocate(cJ, cI)
         call fftwf_free(pbuf)
       end block
