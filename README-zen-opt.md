@@ -1,0 +1,98 @@
+# RESPACK 20240804 — `zen-opt` fork
+
+Local fork of [RESPACK](https://sites.google.com/view/kazuma7k6r) 20240804 (GPLv3) with a restructured
+polarization and interaction code. Branch `upstream` holds the unmodified release; branch `zen-opt`
+holds the changes. Every change can be switched off at run time, which restores the original code paths.
+
+## What changed
+
+| program | change | switch |
+|---|---|---|
+| `calc_chiqw` | new band-pair loop (`src/chiqw/chi_fast.f90`), see below | `flg_fast` in `&param_chiqw` (default 1) |
+| `calc_chiqw` | faster generalized-tetrahedron weights (`src/chiqw/m_tetrahedron_fast.F`) | used by `flg_fast=1` |
+| `calc_w3d`, `calc_j3d` | cached real-space Wannier functions + FFTW, ZGEMM contractions (`src/calc_int/int_fast.f90`) | `flg_fast` in `&param_calc_int` (default 1) |
+| `calc_w3d`, `calc_j3d` | `make_LG0` loops limited to the cutoff sphere; `exp(-iq.R)` tables | always on; gives numerically identical results |
+
+### `calc_chiqw` band-pair loop (`m_chi_fast`)
+
+The original loop does the following for every (occupied j, virtual i) pair and every k:
+- rotates both wave functions by symmetry;
+- transforms both to real space with the built-in FFT;
+- applies the umklapp phase with one complex `exp` per grid point;
+- forms the product and forward-transforms it;
+- accumulates 70 small ZGEMMs into a per-thread copy of χ(G,G′,ω).
+
+The fork computes the same quantity this way:
+
+1. **Tiles of pairs.** Pairs are processed in tiles (a block of occupied × a block of virtual bands). For
+   every k, all bands of a tile are rotated and transformed once: (n_occ + n_vir) backward FFTs instead of
+   2·n_occ·n_vir.
+2. **FFTW.** FFTW, planned once, replaces the built-in FFT, with the identical sign and normalization
+   convention.
+3. **Exact umklapp shift.** The phase e^{−2πiΔG·r/N} is applied by placing C(G) at grid index G−ΔG
+   before the FFT. This is mathematically identical and costs no `exp`.
+4. **One ZGEMM per frequency.** The sums over k and over the pairs of a tile are fused into one ZGEMM per
+   frequency, with K = NTK·n_pairs. It runs parallel over frequencies into one shared χ, so there are no
+   per-thread copies. That saves memory: the original needed n_threads × NG² × n_ω × 16 bytes.
+5. **q = 0.** The three head/wing variants differ only in the G = 0 row and column. They are computed as
+   one ZGEMM plus ZGEMV corrections instead of three ZGEMMs.
+6. **Tetrahedron weights** (`m_tetrahedron_fast`):
+   - Every log((g_a+ω)/(g_b+ω)) is computed as ½log(|a|²/|b|²) + i·atan2(a·b̄) in a SIMD loop, so it uses
+     libmvec's AVX2 `log`/`atan2` instead of scalar `clog`.
+   - Both signs (dsgn = ±1) are done in one pass, so the Fermi-surface cuts are computed once.
+   - Non-degenerate tetrahedra use a fused kernel: 6 instead of 12 logarithms, frequency-independent
+     denominators inverted once, and powers as explicit products.
+
+`fast_mem_mb` (default 4096) is the memory budget for one tile of pair densities and weights. A larger
+budget means larger tiles and fewer backward FFTs.
+
+### `calc_w3d` / `calc_j3d` (`m_int_fast`)
+
+- **Cached real-space functions.** u_{w,k}(r) of all Wannier-gauge Bloch functions are transformed once and
+  cached (NWF × NTK × N_grid × 16 bytes, limited by `fast_mem_mb`, default 8192). Each (q, k, pair) then
+  needs one product and one forward FFT; the original did three FFTs per call.
+- **`calc_j3d` loop order.** q is the outer loop and the lattice vectors R the inner one: the pair densities
+  are computed once per q for all requested R. The original recomputed every FFT for each R.
+- **ZGEMM contractions.** ρᵀ ε⁻¹ ρ* is evaluated as ZGEMMs instead of scalar quadruple loops, which matters
+  for large NG and many Wannier functions.
+
+## Validation (against the unmodified code, same compiler flags)
+
+| test | quantity | deviation fork vs original |
+|---|---|---|
+| SrVO₃ t₂g cRPA (6³ k, 55 bands, 70 ω) | ε⁻¹(G,G′,ω), all 20 q | ≤ 7×10⁻⁵ rel. (= original −O2 vs −O3 spread; only at ω > 99 eV) |
+| | U(ω), J(ω) | ≤ 2×10⁻⁴ eV; static U, U′, J identical to 5 digits |
+| Si sp³ RPA and cRPA (nonsymmorphic, time reversal) | ε⁻¹, all 16 q | ≤ 6×10⁻⁶ rel. |
+| | U(ω=0) | identical to 5 digits |
+| calc_w3d/j3d on identical ε⁻¹ | V, W, X, J | ≤ 7×10⁻⁹ eV |
+| tetrahedron weights (model bands) | error vs quad-precision evaluation of the original formulas | identical to the original's own error (1×10⁻⁵ metallic, 4×10⁻⁸ insulating) |
+
+The 10⁻⁵ level is set by the double-precision tetrahedron formulas themselves; the quad-precision test in
+`local-tools/acc_tetra_quad.f90` shows the original has the same error.
+
+## Performance (AMD Ryzen 7 PRO 6850U, 8 cores, both built -O3 -march=znver3 -flto)
+
+| | original | fork | speed-up |
+|---|---|---|---|
+| SrVO₃ `calc_chiqw` (20 q, cRPA) | 1197 s | 169 s | 7.1× |
+| SrVO₃ `calc_w3d` / `calc_j3d` | 33 s / 58 s | 9 s / 14 s | 3.7× / 4.3× |
+| SrVO₃ whole chain incl. `calc_wannier` | ≈ 1310 s | ≈ 200 s | 6.6× |
+| Si `calc_chiqw` (16 q, RPA) | 148 s | 21 s | 7.1× |
+| Si `calc_w3d` / `calc_j3d` | 37 s / 119 s | 8 s / 15 s | 4.9× / 8.2× |
+
+Remaining `calc_chiqw` time for SrVO₃ (sum over q): pair densities 64 s, tetrahedron weights 46 s,
+ZGEMM 51 s. Use 1 MPI process × 8 OpenMP threads (2 × 4 is ≈ 10 % slower; results identical to 1e-13).
+
+## Build
+
+    local-tools/build-zen3.sh [prefix]      # needs FFTW3 (FFTW3_ROOT) and BLAS/LAPACK
+
+## Tools
+
+| file | purpose |
+|---|---|
+| `local-tools/build-zen3.sh` | build and install |
+| `local-tools/cmp_epsqw.py` | compare `dir-eps/qNNN/dat.epsqw.600` of two runs |
+| `local-tools/bench_tetra.f90`, `acc_tetra_quad.f90` | tetrahedron speed, and accuracy vs quad precision |
+| `local-tools/eps_freq_dev.py` | deviation of ε⁻¹ per frequency |
+| `local-tools/validate_si.sh`, `validate_full.sh` | end-to-end validation against the original |
