@@ -2,7 +2,8 @@
       use mpi
       use fft_3d 
       use m_tetrahedron
-      use m_rdinput       
+      use m_rdinput
+      use m_chi_fast
       include "config.h"
 !mpi global 
       comm_glb=MPI_COMM_WORLD
@@ -60,6 +61,10 @@
       call MPI_Bcast(n_calc_q,1,MPI_INTEGER,0,comm_glb,ierr) 
       if(myrank_glb /= 0) allocate(calc_num_k(n_calc_q))
       call MPI_Bcast(calc_num_k,n_calc_q,MPI_INTEGER,0,comm_glb,ierr)
+!fork: restructured pair loop (m_chi_fast)
+      call MPI_Bcast(flg_fast,1,MPI_INTEGER,0,comm_glb,ierr)
+      call MPI_Bcast(fast_mem_mb,1,MPI_DOUBLE_PRECISION,0,
+     +               comm_glb,ierr)
 !--
 !      call MPI_FINALIZE(ierr)
 !      stop
@@ -422,7 +427,12 @@
        write(6,*)'nfft3=',nfft3 
        write(6,*)'NL123=',Nl123  
       endif 
-      call fft3_init(nwx2,nwy2,nwz2,nfft1,nfft2,nfft3,fs) 
+      call fft3_init(nwx2,nwy2,nwz2,nfft1,nfft2,nfft3,fs)
+!fork: FFTW plans for m_chi_fast
+      if(flg_fast==1)then
+       call chi_fast_init(nwx2,nwy2,nwz2,fast_mem_mb,
+     +                    myrank_glb.eq.MPI_io_rank)
+      endif
 !--
 !20180302  
       call est_NTK(Nk_irr,Nsymq,SKI(1,1),rg(1,1,1),NTK)
@@ -1327,7 +1337,16 @@
         enddo!ib 
        enddo!jb  
        N_PAIR=ij 
-       if(myrank.eq.0)write(6,*)'FOR q/=0,N_PAIR=',N_PAIR 
+       if(myrank.eq.0)write(6,*)'FOR q/=0,N_PAIR=',N_PAIR
+!fork: restructured pair loop (m_chi_fast); flg_fast=0 -> original
+       if(flg_fast==1)then
+        call chi_fast_pairs(.false.,NTK,NTG,Nk_irr,nbufo,nbufv,NTB,
+     +   N_PAIR,i_for_pair,j_for_pair,OCC,VIR,E_OCC,E_VIR,P_OCC,P_VIR,
+     +   SK0,(/q1,q2,q3/),numirr,numrot,trs,NG0,KG0,RW,rginv,pg,nsymq,
+     +   nnp,L1,L2,L3,packing,LG0(1,1,iq),NG_for_eps,0,b1,b2,b3,
+     +   MAT_NLr_rNL,N_docc+bnv-1,bno-1,dmna,dmnr,nkb1,nkb2,nkb3,imt1,
+     +   index_kpt,FermiEnergy,delt,nen,em,pchi=pchiqw)
+       else
 !$OMP PARALLEL PRIVATE(ij,i_band,j_band
 !$OMP&                ,e1_1D,e2_1D,ik,shift_G,ikq
 !$OMP&                ,C0_K,C0_KQ,dsgn,kpq
@@ -1454,10 +1473,11 @@
        pchiqw=pchiqw+pc0d
 !$OMP END CRITICAL
        deallocate(pc0d,fftwk,wfunc,m_tmp,ism,mtx)
-       deallocate(C0_K,C0_KQ,kpq,e1_1D,e2_1D,e1_3D,e2_3D,xow,xow_1D,ca1) 
+       deallocate(C0_K,C0_KQ,kpq,e1_1D,e2_1D,e1_3D,e2_3D,xow,xow_1D,ca1)
 !$OMP END PARALLEL
+       endif!flg_fast
        !--
-       if(myrank.eq.0)write(6,*)'#MPI start' 
+       if(myrank.eq.0)write(6,*)'#MPI start'
        call MPI_BARRIER(comm,ierr)
        dest=modulo(myrank+1,nproc)
        source=modulo(myrank-1,nproc)
@@ -1774,6 +1794,15 @@
 !--
        enddo!ij_intra 
        deallocate(pk_1D,pk_3D,fk_1D,fk_3D,gk_1D,gk_3D,xo)
+!fork: restructured pair loop (m_chi_fast); flg_fast=0 -> original
+       if(flg_fast==1)then
+        call chi_fast_pairs(.true.,NTK,NTG,Nk_irr,nbufo,nbufv,NTB,
+     +   N_PAIR,i_for_pair,j_for_pair,OCC,VIR,E_OCC,E_VIR,P_OCC,P_VIR,
+     +   SK0,(/q1,q2,q3/),numirr,numrot,trs,NG0,KG0,RW,rginv,pg,nsymq,
+     +   nnp,L1,L2,L3,packing,LG0(1,1,iq),NG_for_eps,No_G_0,b1,b2,b3,
+     +   MAT_NLr_rNL,N_docc+bnv-1,bno-1,dmna,dmnr,nkb1,nkb2,nkb3,imt1,
+     +   index_kpt,FermiEnergy,delt,nen,em,pchigm=pchiqwgm)
+       else
 !$OMP PARALLEL PRIVATE(ij,ib,jb,ix,
 !$OMP&                 e1_1D,e2_1D,ik,shift_G,ikq, 
 !$OMP&                 C0_K,C0_KQ,dsgn,kpq, 
@@ -1968,6 +1997,7 @@
       deallocate(C0_K,C0_KQ,kpq,e1_1D,e2_1D,e1_3D,e2_3D,xow,xow_1D,ca1) 
 !     deallocate(xow_1D_av,m_tmp_st,ism_st)!20170322
 !$OMP END PARALLEL
+      endif!flg_fast
       !--
       if(myrank.eq.0)write(6,*)'#MPI start' 
        call MPI_BARRIER(comm,ierr)

@@ -1,0 +1,424 @@
+!
+! m_chi_fast -- restructured band-pair loop of calc_chiqw (RESPACK fork, branch zen-opt)
+!
+! Computes exactly the same quantity as the original OpenMP band-pair loops in chiqw.F
+! (q/=0: pc0d -> pchiqw ; q=0: pc0dgm -> pchiqwgm), i.e. for every frequency w
+!
+!   chi(G,G',w) += sum_{pairs p} sum_k conj(M_pk(G)) * x_pk(w)/NTK * (1-P_occ*P_vir) * M_pk(G')
+!
+! with M_pk(G) the pair density of (occupied band j at k, virtual band i at k+q) and x_pk(w) the
+! generalized-tetrahedron weights.  Only the organisation of the work differs:
+!
+!  1. Pairs are processed in tiles (block of occupied x block of virtual bands).  For every k the
+!     symmetry-rotated wave functions of all bands of a tile are FFT'ed to real space once (the
+!     original code did this twice per band pair and k).
+!  2. FFTW (planned once) replaces the built-in FFT.  Conventions are identical: backward FFT
+!     unnormalised with exp(+i2pi G.r/N), forward FFT with exp(-i2pi G.r/N) and 1/N.
+!  3. The umklapp phase exp(-i2pi dG.r/N) applied to u_{k+q}(r) in the original is applied
+!     exactly by placing the coefficient C(G) at grid index G-dG before the FFT.
+!  4. Sum over k and pairs is one ZGEMM per frequency with K = NTK*npairs rows, parallelised over
+!     frequencies into a single shared accumulator (no per-thread copies of chi(G,G',w)).
+!  5. q=0: the three head/wing variants differ only in the G=0 row/column of the pair density,
+!     so one ZGEMM plus three ZGEMV-based row/column corrections replace three ZGEMMs.
+!
+! Rounding-level differences to the original arise from the different summation order and FFT.
+!
+module m_chi_fast
+  use, intrinsic :: iso_c_binding
+  use omp_lib
+  use m_tetrahedron, only: ttrhdrn_chi0
+  implicit none
+  include 'fftw3.f03'
+  private
+  public :: chi_fast_init, chi_fast_pairs
+
+  integer, save :: n1 = 0, n2 = 0, n3 = 0, ngrid = 0, ldg = 0
+  type(c_ptr), save :: plan_bw = c_null_ptr, plan_fw = c_null_ptr
+  real(8), save :: mem_budget_mb = 4096d0
+  logical, save :: verbose = .false.
+
+  complex(8), parameter :: zone = (1d0, 0d0), zzero = (0d0, 0d0), zimag = (0d0, 1d0)
+
+contains
+
+  !---------------------------------------------------------------------------------------------
+  subroutine chi_fast_init(nx, ny, nz, mem_mb, lverbose)
+    integer, intent(in) :: nx, ny, nz
+    real(8), intent(in) :: mem_mb
+    logical, intent(in) :: lverbose
+    type(c_ptr) :: p
+    complex(c_double_complex), pointer :: buf(:)
+
+    n1 = nx; n2 = ny; n3 = nz
+    ngrid = nx*ny*nz
+    ldg = ((ngrid + 7)/8)*8        ! column stride: multiple of 128 bytes -> all columns keep the planning alignment
+    if (mem_mb > 0d0) mem_budget_mb = mem_mb
+    verbose = lverbose
+    p = fftw_alloc_complex(int(ldg, c_size_t))
+    call c_f_pointer(p, buf, [ldg])
+    ! Fortran array u(n1,n2,n3) <-> FFTW row-major (n3,n2,n1)
+    plan_bw = fftw_plan_dft_3d(n3, n2, n1, buf, buf, FFTW_BACKWARD, FFTW_MEASURE)
+    plan_fw = fftw_plan_dft_3d(n3, n2, n1, buf, buf, FFTW_FORWARD, FFTW_MEASURE)
+    call fftw_free(p)
+    if (.not. c_associated(plan_bw) .or. .not. c_associated(plan_fw)) then
+      write(6,*) 'chi_fast_init: FFTW planning failed'; stop
+    end if
+    if (verbose) write(6,'(a,3i5,a,f10.1)') ' chi_fast: FFTW grid ', n1, n2, n3, ' ; memory budget (MB) ', mem_budget_mb
+  end subroutine chi_fast_init
+
+  !---------------------------------------------------------------------------------------------
+  pure integer function gidx(i, j, k)
+    integer, intent(in) :: i, j, k
+    gidx = modulo(i, n1) + 1 + modulo(j, n2)*n1 + modulo(k, n3)*n1*n2
+  end function gidx
+
+  !---------------------------------------------------------------------------------------------
+  subroutine chi_fast_pairs(lq0, NTK, NTG, Nk_irr, nbufo, nbufv, NTB, N_PAIR, ipair, jpair, &
+       OCC, VIR, E_OCC, E_VIR, P_OCC, P_VIR, &
+       SK0, q, numirr, numrot, trs, NG0, KG0, RW, rginv, pg, nsymq, nnp, L1, L2, L3, packing, &
+       LG0, NGeps, No_G_0, b1, b2, b3, MAT_NL, off_v, off_o, &
+       dmna, dmnr, nkb1, nkb2, nkb3, imt1, index_kpt, Ef, delt, nen, em, &
+       pchi, pchigm)
+    logical, intent(in) :: lq0
+    integer, intent(in) :: NTK, NTG, Nk_irr, nbufo, nbufv, NTB, N_PAIR
+    integer, intent(in) :: ipair(N_PAIR), jpair(N_PAIR)
+    complex(8), intent(in) :: OCC(NTG, nbufo, Nk_irr), VIR(NTG, nbufv, Nk_irr)
+    real(8), intent(in) :: E_OCC(nbufo, Nk_irr), E_VIR(nbufv, Nk_irr)
+    complex(8), intent(in) :: P_OCC(nbufo, NTK), P_VIR(nbufv, NTK)
+    real(8), intent(in) :: SK0(3, NTK), q(3)
+    integer, intent(in) :: numirr(NTK), numrot(NTK), trs(NTK), NG0(NTK), KG0(3, NTG, NTK), RW(3, NTK)
+    integer, intent(in) :: nsymq, nnp, L1, L2, L3
+    real(8), intent(in) :: rginv(3, 3, nsymq)
+    integer, intent(in) :: pg(3, nsymq)
+    integer, intent(in) :: packing(-L1:L1, -L2:L2, -L3:L3, Nk_irr)
+    integer, intent(in) :: NGeps, No_G_0
+    integer, intent(in) :: LG0(3, NTG)
+    real(8), intent(in) :: b1(3), b2(3), b3(3)
+    complex(8), intent(in) :: MAT_NL(3, NTB, NTB, Nk_irr)
+    integer, intent(in) :: off_v, off_o
+    real(8), intent(in) :: dmna, dmnr, Ef, delt
+    integer, intent(in) :: nkb1, nkb2, nkb3, nen
+    integer, intent(in) :: imt1(*), index_kpt(nkb1, nkb2, nkb3)
+    complex(8), intent(in) :: em(nen)
+    complex(8), intent(inout), optional, contiguous :: pchi(:, :, :)        ! (NGeps,NGeps,nen)   q/=0
+    complex(8), intent(inout), optional, contiguous :: pchigm(:, :, :, :)   ! (NGeps,NGeps,nen,3) q=0
+
+    external :: search_kq, make_C0
+
+    integer, allocatable :: kpq(:), shG(:, :), ext(:), k3d(:)
+    integer, allocatable :: jlist(:), ilist(:), posj(:), posi(:)
+    integer, allocatable :: tcount(:), tstart(:), tpairs(:), fill(:)
+    integer :: nJ, nI, bj, bi, nbj, nbi, ntile, it, ip, ik, ikb1, ikb2, ikb3, t
+    integer :: np, rows, nthr
+    real(8) :: bytes_pair, bytes_thrA, budget, scl
+    integer(8) :: npmax
+    complex(8), allocatable :: A(:, :), W(:, :), V(:, :)
+    integer, allocatable :: tj(:), ti(:), pjl(:), pil(:)
+    integer :: ntj, nti
+    real(8) :: t0, tA, tB, tC
+
+    if (ngrid == 0) then
+      write(6,*) 'chi_fast_pairs: chi_fast_init not called'; stop
+    end if
+    if (N_PAIR <= 0) return
+    nthr = omp_get_max_threads()
+    scl = 1d0/dble(ngrid)
+
+    !--- k+q mapping and umklapp shifts
+    allocate(kpq(NTK), shG(3, NTK))
+    do ik = 1, NTK
+      shG(:, ik) = 0
+      if (lq0) then
+        kpq(ik) = ik
+      else
+        call search_kq(NTK, SK0, q(1), q(2), q(3), ik, kpq(ik), shG(1, ik))
+      end if
+    end do
+    !--- extraction indices (-G_L on the compact grid), k -> position in the 3D tetrahedron mesh
+    allocate(ext(NGeps))
+    do t = 1, NGeps
+      ext(t) = gidx(-LG0(1, t), -LG0(2, t), -LG0(3, t))
+    end do
+    allocate(k3d(NTK))
+    do ikb3 = 1, nkb3
+      do ikb2 = 1, nkb2
+        do ikb1 = 1, nkb1
+          k3d(index_kpt(ikb1, ikb2, ikb3)) = ikb1 + (ikb2 - 1)*nkb1 + (ikb3 - 1)*nkb1*nkb2
+        end do
+      end do
+    end do
+
+    !--- distinct occupied / virtual bands occurring in the pair list
+    allocate(posj(nbufo), posi(nbufv))
+    posj = 0; posi = 0
+    do ip = 1, N_PAIR
+      posj(jpair(ip)) = 1; posi(ipair(ip)) = 1
+    end do
+    nJ = count(posj > 0); nI = count(posi > 0)
+    allocate(jlist(nJ), ilist(nI))
+    nJ = 0
+    do t = 1, nbufo
+      if (posj(t) > 0) then; nJ = nJ + 1; jlist(nJ) = t; posj(t) = nJ; end if
+    end do
+    nI = 0
+    do t = 1, nbufv
+      if (posi(t) > 0) then; nI = nI + 1; ilist(nI) = t; posi(t) = nI; end if
+    end do
+
+    !--- tile size from the memory budget
+    bytes_pair = 16d0*dble(NTK)*dble(NGeps + nen + merge(3, 0, lq0))     ! A, W, V rows of one pair
+    budget = 0.7d0*mem_budget_mb*1048576d0
+    npmax = max(1_8, int(budget/bytes_pair, 8))
+    bj = int(min(dble(nJ), max(1d0, sqrt(dble(npmax)))))
+    bi = int(min(dble(nI), max(1d0, dble(npmax)/dble(bj))))
+    if (bi == nI) bj = int(min(dble(nJ), max(1d0, dble(npmax)/dble(nI))))
+    ! per-thread real-space buffers of phase A must also fit (into the remaining 30 %)
+    do
+      bytes_thrA = 16d0*dble(ldg)*dble(bj + bi + 1)*dble(nthr)
+      if (bytes_thrA <= 0.3d0*mem_budget_mb*1048576d0 .or. (bj == 1 .and. bi == 1)) exit
+      if (bj >= bi) then; bj = max(1, bj/2); else; bi = max(1, bi/2); end if
+    end do
+    nbj = (nJ + bj - 1)/bj
+    nbi = (nI + bi - 1)/bi
+    ntile = nbj*nbi
+
+    !--- bucket the pairs into tiles (original order kept inside a tile)
+    allocate(tcount(ntile), tstart(ntile + 1), tpairs(N_PAIR), fill(ntile))
+    tcount = 0
+    do ip = 1, N_PAIR
+      t = ((posj(jpair(ip)) - 1)/bj)*nbi + (posi(ipair(ip)) - 1)/bi + 1
+      tcount(t) = tcount(t) + 1
+    end do
+    tstart(1) = 1
+    do t = 1, ntile
+      tstart(t + 1) = tstart(t) + tcount(t)
+    end do
+    fill = 0
+    do ip = 1, N_PAIR
+      t = ((posj(jpair(ip)) - 1)/bj)*nbi + (posi(ipair(ip)) - 1)/bi + 1
+      tpairs(tstart(t) + fill(t)) = ip
+      fill(t) = fill(t) + 1
+    end do
+    if (verbose) write(6,'(a,l2,a,i8,a,2i6,a,2i6,a,i6)') ' chi_fast: q0=', lq0, ' pairs=', N_PAIR, &
+         ' bands(occ,vir)=', nJ, nI, ' tile=', bj, bi, ' ntile=', ntile
+
+    tA = 0d0; tB = 0d0; tC = 0d0
+    allocate(tj(bj), ti(bi))
+    do it = 1, ntile
+      np = tcount(it)
+      if (np == 0) cycle
+      rows = NTK*np
+      ! bands of this tile and local pair -> (jl, il)
+      ntj = 0; nti = 0
+      allocate(pjl(np), pil(np))
+      block
+        integer :: ljpos(nbufo), lipos(nbufv), jb, ib
+        ljpos = 0; lipos = 0
+        do t = 1, np
+          ip = tpairs(tstart(it) + t - 1)
+          jb = jpair(ip); ib = ipair(ip)
+          if (ljpos(jb) == 0) then; ntj = ntj + 1; tj(ntj) = jb; ljpos(jb) = ntj; end if
+          if (lipos(ib) == 0) then; nti = nti + 1; ti(nti) = ib; lipos(ib) = nti; end if
+          pjl(t) = ljpos(jb); pil(t) = lipos(ib)
+        end do
+      end block
+
+      allocate(A(rows, NGeps), W(rows, nen))
+      if (lq0) then
+        allocate(V(rows, 3))
+      else
+        allocate(V(1, 1))
+      end if
+
+      t0 = omp_get_wtime()
+      call phase_a()
+      tA = tA + omp_get_wtime() - t0
+      t0 = omp_get_wtime()
+      call phase_b()
+      tB = tB + omp_get_wtime() - t0
+      t0 = omp_get_wtime()
+      call phase_c()
+      tC = tC + omp_get_wtime() - t0
+
+      deallocate(A, W, V, pjl, pil)
+    end do
+    if (verbose) write(6,'(a,3f10.2)') ' chi_fast: time (s) pair densities / tetrahedron / zgemm ', tA, tB, tC
+
+  contains
+
+    !------------------------------------------------------------------------------------------
+    ! phase A: pair densities M_pk(G) -> A(ik+NTK*(p-1), G); q=0 also the k.p G=0 elements -> V
+    subroutine phase_a()
+      !$omp parallel default(shared)
+      block
+        type(c_ptr) :: pbuf
+        complex(c_double_complex), pointer :: ubuf(:, :)
+        complex(8), allocatable :: cbuf(:), cJ(:, :), cI(:, :)
+        integer :: ik, ikq, ikir, iop, ikirq, iopq, jl, il, ig, lp, row, jb, ib, ix, g
+        complex(8) :: sumv(3), vm(3), nlvm(3)
+        real(8) :: gv(3), del
+
+        pbuf = fftw_alloc_complex(int(ldg, c_size_t)*int(bj + bi + 1, c_size_t))
+        call c_f_pointer(pbuf, ubuf, [ldg, bj + bi + 1])     ! columns 1..ntj: occ, bj+1..bj+nti: vir, last: product
+        allocate(cbuf(NTG))
+        if (lq0) then
+          allocate(cJ(NTG, bj), cI(NTG, bi))
+        end if
+
+        !$omp do schedule(dynamic,1)
+        do ik = 1, NTK
+          ikq = kpq(ik)
+          ikir = numirr(ik); iop = numrot(ik)
+          do jl = 1, ntj
+            jb = tj(jl)
+            cbuf = zzero
+            call make_C0(NTG, trs(ik), NG0(ik), KG0(1, 1, ik), RW(1, ik), rginv(1, 1, iop), pg(1, iop), &
+                 nnp, L1, L2, L3, packing(-L1, -L2, -L3, ikir), OCC(1, jb, ikir), cbuf)
+            ubuf(:, jl) = zzero
+            do ig = 1, NG0(ik)
+              ubuf(gidx(KG0(1, ig, ik), KG0(2, ig, ik), KG0(3, ig, ik)), jl) = cbuf(ig)
+            end do
+            call fftw_execute_dft(plan_bw, ubuf(:, jl), ubuf(:, jl))
+            if (lq0) cJ(1:NG0(ik), jl) = cbuf(1:NG0(ik))
+          end do
+          ikirq = numirr(ikq); iopq = numrot(ikq)
+          do il = 1, nti
+            ib = ti(il)
+            cbuf = zzero
+            call make_C0(NTG, trs(ikq), NG0(ikq), KG0(1, 1, ikq), RW(1, ikq), rginv(1, 1, iopq), pg(1, iopq), &
+                 nnp, L1, L2, L3, packing(-L1, -L2, -L3, ikirq), VIR(1, ib, ikirq), cbuf)
+            ubuf(:, bj + il) = zzero
+            do ig = 1, NG0(ikq)
+              ubuf(gidx(KG0(1, ig, ikq) - shG(1, ik), KG0(2, ig, ikq) - shG(2, ik), &
+                        KG0(3, ig, ikq) - shG(3, ik)), bj + il) = cbuf(ig)
+            end do
+            call fftw_execute_dft(plan_bw, ubuf(:, bj + il), ubuf(:, bj + il))
+            if (lq0) cI(1:NG0(ikq), il) = cbuf(1:NG0(ikq))
+          end do
+          do lp = 1, np
+            jl = pjl(lp); il = pil(lp)
+            row = ik + NTK*(lp - 1)
+            ubuf(1:ngrid, bj + bi + 1) = conjg(ubuf(1:ngrid, bj + il))*ubuf(1:ngrid, jl)
+            call fftw_execute_dft(plan_fw, ubuf(:, bj + bi + 1), ubuf(:, bj + bi + 1))
+            do g = 1, NGeps
+              A(row, g) = ubuf(ext(g), bj + bi + 1)*scl
+            end do
+            if (lq0) then
+              ! calc_VMab (ikq=ik at q=0) + non-local correction + energy denominator, as in chiqw.F
+              jb = tj(jl); ib = ti(il)
+              sumv = zzero
+              do ig = 1, NG0(ik)
+                gv(:) = dble(KG0(1, ig, ik))*b1(:) + dble(KG0(2, ig, ik))*b2(:) + dble(KG0(3, ig, ik))*b3(:)
+                sumv(:) = sumv(:) + gv(:)*conjg(cI(ig, il))*cJ(ig, jl)
+              end do
+              vm(:) = sumv(:)*zimag
+              del = E_VIR(ib, numirr(ikq)) - E_OCC(jb, numirr(ik))
+              if (abs(del) < delt) del = delt
+              nlvm(:) = MAT_NL(:, ib + off_v, jb + off_o, numirr(ik))
+              vm(:) = -zimag*(vm(:) - nlvm(:))/del
+              do ix = 1, 3
+                V(row, ix) = vm(ix)
+                if (abs(del) <= delt) V(row, ix) = zzero
+              end do
+            end if
+          end do
+        end do
+        !$omp end do
+
+        deallocate(cbuf)
+        if (lq0) deallocate(cJ, cI)
+        call fftw_free(pbuf)
+      end block
+      !$omp end parallel
+    end subroutine phase_a
+
+    !------------------------------------------------------------------------------------------
+    ! phase B: tetrahedron weights x_pk(w), times cRPA factor and 1/NTK -> W(ik+NTK*(p-1), w)
+    subroutine phase_b()
+      !$omp parallel default(shared)
+      block
+        complex(8), allocatable :: e1(:), e2(:), xow(:, :), ca1(:)
+        complex(8) :: fac
+        integer :: lp, ip, jb, ib, ik, ikq, row
+        allocate(e1(NTK), e2(NTK), xow(nen, NTK), ca1(4*nen))
+        !$omp do schedule(dynamic,1)
+        do lp = 1, np
+          ip = tpairs(tstart(it) + lp - 1)
+          jb = jpair(ip); ib = ipair(ip)
+          do ik = 1, NTK
+            e1(k3d(ik)) = cmplx(E_OCC(jb, numirr(ik)), 0d0, 8)
+            e2(k3d(ik)) = cmplx(E_VIR(ib, numirr(kpq(ik))), 0d0, 8)
+          end do
+          xow = zzero
+          ca1 = zzero
+          call ttrhdrn_chi0(dmna, dmnr, nkb1, nkb2, nkb3, imt1, e1, e2, Ef, Ef, delt, 1d0, nen, em, ca1, xow)
+          ca1 = zzero
+          call ttrhdrn_chi0(dmna, dmnr, nkb1, nkb2, nkb3, imt1, e1, e2, Ef, Ef, delt, -1d0, nen, em, ca1, xow)
+          do ik = 1, NTK
+            ikq = kpq(ik)
+            row = ik + NTK*(lp - 1)
+            fac = (1d0 - P_OCC(jb, ik)*P_VIR(ib, ikq))/dble(NTK)
+            W(row, :) = xow(:, k3d(ik))*fac
+          end do
+        end do
+        !$omp end do
+        deallocate(e1, e2, xow, ca1)
+      end block
+      !$omp end parallel
+    end subroutine phase_b
+
+    !------------------------------------------------------------------------------------------
+    ! phase C: chi(:,:,w) += A^H diag(W(:,w)) A, parallel over w (each thread owns whole w slices)
+    subroutine phase_c()
+      integer :: chunk
+      chunk = max(1, min(np, 4096/NTK))          ! pairs per ZGEMM block (K = NTK*chunk rows)
+      !$omp parallel default(shared)
+      block
+        complex(8), allocatable :: Bc(:, :), T(:, :), wv(:), wcv(:), y(:), z(:)
+        complex(8) :: d
+        integer :: ie, p0, p1, r0, nr, g, ix, G0
+        allocate(Bc(NTK*chunk, NGeps))
+        if (lq0) allocate(T(NGeps, NGeps), wv(rows), wcv(rows), y(NGeps), z(NGeps))
+        G0 = No_G_0
+        !$omp do schedule(dynamic,1)
+        do ie = 1, nen
+          if (lq0) T = zzero
+          do p0 = 1, np, chunk
+            p1 = min(np, p0 + chunk - 1)
+            r0 = NTK*(p0 - 1) + 1
+            nr = NTK*(p1 - p0 + 1)
+            do g = 1, NGeps
+              Bc(1:nr, g) = A(r0:r0 + nr - 1, g)*W(r0:r0 + nr - 1, ie)
+            end do
+            if (lq0) then
+              call zgemm('C', 'N', NGeps, NGeps, nr, zone, A(r0, 1), rows, Bc, NTK*chunk, zone, T, NGeps)
+            else
+              call zgemm('C', 'N', NGeps, NGeps, nr, zone, A(r0, 1), rows, Bc, NTK*chunk, zone, &
+                   pchi(:, :, ie), NGeps)
+            end if
+          end do
+          if (lq0) then
+            do ix = 1, 3
+              wv(:) = W(:, ie)*V(:, ix)
+              wcv(:) = W(:, ie)*conjg(V(:, ix))
+              call zgemv('C', rows, NGeps, zone, A, rows, wv, 1, zzero, y, 1)    ! sum conj(A) w v
+              call zgemv('T', rows, NGeps, zone, A, rows, wcv, 1, zzero, z, 1)   ! sum conj(v) w A
+              d = sum(conjg(V(:, ix))*W(:, ie)*V(:, ix))
+              pchigm(:, :, ie, ix) = pchigm(:, :, ie, ix) + T
+              pchigm(:, G0, ie, ix) = pchigm(:, G0, ie, ix) + y - T(:, G0)
+              pchigm(G0, :, ie, ix) = pchigm(G0, :, ie, ix) + z - T(G0, :)
+              ! (G0,G0) now holds old + y0 + z0 - T00; it must be old + d
+              pchigm(G0, G0, ie, ix) = pchigm(G0, G0, ie, ix) + d - y(G0) - z(G0) + T(G0, G0)
+            end do
+          end if
+        end do
+        !$omp end do
+        deallocate(Bc)
+        if (lq0) deallocate(T, wv, wcv, y, z)
+      end block
+      !$omp end parallel
+    end subroutine phase_c
+
+  end subroutine chi_fast_pairs
+
+end module m_chi_fast
