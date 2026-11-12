@@ -1,6 +1,7 @@
       PROGRAM MATRIX_J 
       use m_rdinput       
       use fft_3d 
+      use m_int_fast
       include "config_j3d.h" 
       call read_input 
 !--
@@ -341,6 +342,11 @@
        !
       enddo!ik 
       write(6,*)'FINISH REDING C0'
+!fork: real-space cache of the Wannier-gauge Bloch functions (m_int_fast)
+      if(flg_fast==1)then
+       call int_fast_init(nwx2,nwy2,nwz2,NTK,NTG,NWF,NG0,KG0,C0,
+     +  fast_mem_mb)
+      endif
       CLOSE(113)  
 !--
 !      do ik=1,Nk_irr 
@@ -629,6 +635,123 @@
        allocate(J_MAT(NWF,NWF,-Na1:Na1,-Na2:Na2,-Na3:Na3,ne)) 
        J_MAT(:,:,:,:,:,:)=0.0D0 
 !--
+!fork: q outer / R inner (m_int_fast): pair densities once per q for all
+!R, rho^T eps conj(rho) as ZGEMMs; flg_fast=0 -> original loops below
+      if(flg_fast==1.and.int_fast_ok)then
+       nRf=(ix_intJ_max-ix_intJ_min+1)*(iy_intJ_max-iy_intJ_min+1)
+     +    *(iz_intJ_max-iz_intJ_min+1)
+       allocate(Rf(3,nRf),kphf(NTK,nRf))
+       iRf=0
+       do ia1=ix_intJ_min,ix_intJ_max
+        do ia2=iy_intJ_min,iy_intJ_max
+         do ia3=iz_intJ_min,iz_intJ_max
+          iRf=iRf+1
+          Rf(1,iRf)=ia1;Rf(2,iRf)=ia2;Rf(3,iRf)=ia3
+          do ik=1,NTK
+           kphf(ik,iRf)=exp(-ci*tpi*(SK0(1,ik)*dble(ia1)
+     +                       +SK0(2,ik)*dble(ia2)
+     +                       +SK0(3,ik)*dble(ia3)))
+          enddo
+         enddo
+        enddo
+       enddo
+       npf=NWF*NWF
+       allocate(iwpf(npf),jwpf(npf))
+       do iw=1,NWF
+        do jw=1,NWF
+         iwpf((iw-1)*NWF+jw)=iw
+         jwpf((iw-1)*NWF+jw)=jw
+        enddo
+       enddo
+       allocate(Xsf(NWF,NWF,nRf),Jsf(NWF,NWF,nRf,ne),fwf(npf,ne))
+       Xsf=0.0d0
+       Jsf=0.0d0
+       do iq=1,NTQ
+        q1=SQ(1,iq);q2=SQ(2,iq);q3=SQ(3,iq)
+        lq0f=(q1==0.0d0.and.q2==0.0d0.and.q3==0.0d0)
+        NG_for_eps=NGQ_eps(iq)
+        NG_for_psi=NGQ_psi(iq)
+        allocate(length_qg(NG_for_psi))
+        length_qg(:)=0.0D0
+        do igL=1,NG_for_psi
+         igL1=LG0(1,igL,iq)
+         igL2=LG0(2,igL,iq)
+         igL3=LG0(3,igL,iq)
+         if(lq0f.and.igL1==0.and.igL2==0.and.igL3==0)then
+          NoG0=igL
+         else
+          qgL(:)=(q1+dble(igL1))*b1(:)
+     +          +(q2+dble(igL2))*b2(:)
+     +          +(q3+dble(igL3))*b3(:)
+          qgL2=qgL(1)**2+qgL(2)**2+qgL(3)**2
+          qgL1=dsqrt(qgL2)
+          length_qg(igL)=qgL1
+         endif
+        enddo
+        allocate(Sfast(NG_for_psi,npf,nRf),rhof(NG_for_psi,npf))
+        call int_fast_pairdens(NTK,SK0,(/q1,q2,q3/),lq0f,
+     +   NG_for_psi,LG0(1,1,iq),npf,iwpf,jwpf,nRf,kphf,Sfast)
+        if(.not.lq0f)then
+         allocate(epsmk(NTGQ,NTGQ,ne))
+         epsmk(:,:,:)=0.0d0
+         allocate(packtmp(-Lq1:Lq1,-Lq2:Lq2,-Lq3:Lq3))
+         iqir=numirrq(iq)
+         iop=numrotq(iq)
+         packtmp(:,:,:)=packingq(:,:,:,iqir)
+         call make_eps(NTG,NTGQ,ne,trsq(iq),NGQ_eps(iq),
+     +    LG0(1,1,iq),RWq(1,iq),rginv(1,1,iop),pg(1,iop),
+     +    nnp,Lq1,Lq2,Lq3,packtmp(-Lq1,-Lq2,-Lq3),
+     +    epsirr(1,1,1,iqir),epsmk(1,1,1))
+        endif
+        do iRf=1,nRf
+         do ipf=1,npf
+          if(lq0f)then
+           do igL=1,NG_for_psi
+            if(igL/=NoG0)then
+             rhof(igL,ipf)=Sfast(igL,ipf,iRf)/length_qg(igL)
+     +                    /dble(NTK)
+            else
+             rhof(igL,ipf)=0.0d0
+            endif
+           enddo
+          else
+           rhof(:,ipf)=Sfast(:,ipf,iRf)/length_qg(:)/dble(NTK)
+          endif
+          SUM_CMPX=0.0D0
+          do igL=1,NG_for_psi
+           SUM_CMPX=SUM_CMPX+rhof(igL,ipf)*CONJG(rhof(igL,ipf))
+          enddo
+          Xsf(iwpf(ipf),jwpf(ipf),iRf)
+     +   =Xsf(iwpf(ipf),jwpf(ipf),iRf)+SUM_CMPX
+         enddo
+         if(lq0f)then
+          call int_fast_funcw_diag(NG_for_eps,NG_for_psi,npf,rhof,
+     +     NG_for_psi,ne,epsirr(1,1,1,iq),NTGQ,fwf)
+         else
+          call int_fast_funcw_diag(NG_for_eps,NG_for_psi,npf,rhof,
+     +     NG_for_psi,ne,epsmk,NTGQ,fwf)
+         endif
+         do ie=1,ne
+          do ipf=1,npf
+           Jsf(iwpf(ipf),jwpf(ipf),iRf,ie)
+     +    =Jsf(iwpf(ipf),jwpf(ipf),iRf,ie)+fwf(ipf,ie)
+          enddo
+         enddo
+        enddo
+        if(.not.lq0f) deallocate(epsmk,packtmp)
+        deallocate(length_qg,Sfast,rhof)
+        write(6,*)'finish iq=',iq
+       enddo!iq
+       do iRf=1,nRf
+        ia1=Rf(1,iRf);ia2=Rf(2,iRf);ia3=Rf(3,iRf)
+        X_MAT(:,:,ia1,ia2,ia3)=2.0D0*tpi*Xsf(:,:,iRf)/VOLUME/DBLE(NTQ)
+        do ie=1,ne
+         J_MAT(:,:,ia1,ia2,ia3,ie)
+     +   =2.0D0*tpi*Jsf(:,:,iRf,ie)/VOLUME/DBLE(NTQ)
+        enddo
+       enddo
+       deallocate(Rf,kphf,iwpf,jwpf,Xsf,Jsf,fwf)
+      else
       do ia1=ix_intJ_min,ix_intJ_max
        do ia2=iy_intJ_min,iy_intJ_max
         do ia3=iz_intJ_min,iz_intJ_max
@@ -891,6 +1014,7 @@
         enddo!ia3      
        enddo!ia2 
       enddo!ia1      
+      endif!flg_fast
 !--
 !CORRECTION TERM TO DIVERGENCE 
 !--

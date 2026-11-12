@@ -456,11 +456,33 @@
       integer,parameter::NGL1=150!100!300 
       integer,parameter::NGL2=150!100!300 
       integer,parameter::NGL3=150!100!300 
+!fork (zen-opt): restrict the G loops to the cutoff sphere; same set and
+!order of G vectors as the full -150..150 cube (|q+G| >= 2pi|q_i+n_i|/|a_i|)
+      integer::lo1,hi1,lo2,hi2,lo3,hi3
+      real(8)::av(3,3),vol,rad,qv(3)
+      av(1,1)=b2(2)*b3(3)-b2(3)*b3(2)
+      av(2,1)=b2(3)*b3(1)-b2(1)*b3(3)
+      av(3,1)=b2(1)*b3(2)-b2(2)*b3(1)
+      av(1,2)=b3(2)*b1(3)-b3(3)*b1(2)
+      av(2,2)=b3(3)*b1(1)-b3(1)*b1(3)
+      av(3,2)=b3(1)*b1(2)-b3(2)*b1(1)
+      av(1,3)=b1(2)*b2(3)-b1(3)*b2(2)
+      av(2,3)=b1(3)*b2(1)-b1(1)*b2(3)
+      av(3,3)=b1(1)*b2(2)-b1(2)*b2(1)
+      vol=abs(b1(1)*av(1,1)+b1(2)*av(2,1)+b1(3)*av(3,1))
+      rad=sqrt(max(Gcut_for_eps,Gcut_for_psi,0.0d0))
+      qv(1)=q1;qv(2)=q2;qv(3)=q3
+      lo1=max(-NGL1,floor(-qv(1)-rad*norm2(av(:,1))/vol)-1)
+      hi1=min( NGL1,ceiling(-qv(1)+rad*norm2(av(:,1))/vol)+1)
+      lo2=max(-NGL2,floor(-qv(2)-rad*norm2(av(:,2))/vol)-1)
+      hi2=min( NGL2,ceiling(-qv(2)+rad*norm2(av(:,2))/vol)+1)
+      lo3=max(-NGL3,floor(-qv(3)-rad*norm2(av(:,3))/vol)-1)
+      hi3=min( NGL3,ceiling(-qv(3)+rad*norm2(av(:,3))/vol)+1)
 !--
       igL=0
-      do igL1=-NGL1,NGL1 
-      do igL2=-NGL2,NGL2 
-      do igL3=-NGL3,NGL3 
+      do igL1=lo1,hi1 
+      do igL2=lo2,hi2 
+      do igL3=lo3,hi3 
       qgL(:)=(q1+dble(igL1))*b1(:)
      +      +(q2+dble(igL2))*b2(:)
      +      +(q3+dble(igL3))*b3(:)    
@@ -477,9 +499,9 @@
       enddo 
       NG_for_eps=igL 
 !--
-      do igL1=-NGL1,NGL1 
-      do igL2=-NGL2,NGL2 
-      do igL3=-NGL3,NGL3 
+      do igL1=lo1,hi1 
+      do igL2=lo2,hi2 
+      do igL3=lo3,hi3 
       qgL(:)=(q1+dble(igL1))*b1(:)
      +      +(q2+dble(igL2))*b2(:)
      +      +(q3+dble(igL3))*b3(:)    

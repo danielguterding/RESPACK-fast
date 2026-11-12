@@ -119,3 +119,9 @@
       integer::ia1,ia2,ia3,igL,jgL,igL1,igL2,igL3 
       integer::iq,ig,jg,ie 
 !END CONFIG.H 
+!fork: m_int_fast
+      complex(8),allocatable::Sfast(:,:,:),rhof(:,:),kphf(:,:)
+      complex(8),allocatable::Xsf(:,:,:),Jsf(:,:,:,:),fwf(:,:)
+      integer,allocatable::Rf(:,:),iwpf(:),jwpf(:)
+      integer::nRf,iRf,npf,ipf
+      logical::lq0f

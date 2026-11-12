@@ -223,23 +223,8 @@
       call chk1(dmna,dmnr,nnn,gk,ia1,ia2,ia3,ia4,i3)
       select case(sum(ia2))
       case(0)
-        call ttrhdrn_sub2normal(
-     $             gk(ia4(2)),gk(ia4(1)),gk(ia4(3)),gk(ia4(4))
-     $            ,ne,em,ca1(:,1))
-        call ttrhdrn_sub2normal(
-     $             gk(ia4(1)),gk(ia4(2)),gk(ia4(3)),gk(ia4(4))
-     $            ,ne,em,ca1(:,2))
-        call ttrhdrn_sub2normal(
-     $             gk(ia4(1)),gk(ia4(3)),gk(ia4(2)),gk(ia4(4))
-     $            ,ne,em,ca1(:,3))
-        call ttrhdrn_sub1normal(
-     $             gk(ia4(1)),gk(ia4(4)),gk(ia4(2)),gk(ia4(3))
-     $            ,ne,em,ca1(:,4))
-          xo(:,ia4(1))=xo(:,ia4(1))+fk(ia4(1))*ca1(:,1)
-          xo(:,ia4(2))=xo(:,ia4(2))+fk(ia4(2))*ca1(:,2)
-          xo(:,ia4(3))=xo(:,ia4(3))+fk(ia4(3))*ca1(:,3)
-          xo(:,ia4(4))=xo(:,ia4(4))+fk(ia4(4))
-     $            *(ca1(:,4)-ca1(:,3)-ca1(:,2)-ca1(:,1))
+!fork (zen-opt): fused evaluation of the four normal-tetrahedron terms
+        call calc0_fused(nnn,fk,gk,ia4,ne,em,xo)
       case(2)
           geq1=sum(gk(ia3(1:2)))/2.d0
           call ttrhdrn_sub2g10   (
@@ -702,6 +687,78 @@
         xi(i)=atan2(ai*br-ar*bi,ar*br+ai*bi)
       end do
       lr=dcmplx(xr,xi)
+      end subroutine
+
+!--- fork (zen-opt): case(0) of calc, i.e. the four calls
+!      ca1(:,1)=sub2normal(B,A,C,D)  ca1(:,2)=sub2normal(A,B,C,D)
+!      ca1(:,3)=sub2normal(A,C,B,D)  ca1(:,4)=sub1normal(A,D,B,C)
+!    with A..D = ia4(1..4), fused into one pass over the frequencies:
+!    the 6 distinct log ratios are computed once (log(b/a)=-log(a/b), all
+!    arguments in one half plane), the frequency-independent denominators
+!    are inverted once, and powers are explicit products.
+      subroutine calc0_fused(nnn,fk,gk,ia4,ne,em,xo)
+      integer, intent(in) :: nnn,ia4(4),ne
+      complex(8), intent(in) :: fk(nnn),gk(nnn),em(ne)
+      complex(8), intent(inout) :: xo(ne,nnn)
+      complex(8) :: a,b,c,d
+      complex(8) :: lab(ne),lac(ne),lad(ne),lbc(ne),lbd(ne),lcd(ne)
+      complex(8) :: k11,k12,k13,k14,k21,k22,k23,k24
+      complex(8) :: k31,k32,k33,k34,m1,m2,m3
+      complex(8) :: za,zb,zc,zd,za2,zb2,zc2,zd2,x1,x2,x3,x4,t1
+      integer :: i
+      a=gk(ia4(1)); b=gk(ia4(2)); c=gk(ia4(3)); d=gk(ia4(4))
+      call lratio(ne,a,b,em,lab)
+      call lratio(ne,a,c,em,lac)
+      call lratio(ne,a,d,em,lad)
+      call lratio(ne,b,c,em,lbc)
+      call lratio(ne,b,d,em,lbd)
+      call lratio(ne,c,d,em,lcd)
+!     sub2normal(g0,g1,g2,g3): -z1^2/(6(g0-g1)(g1-g2)(g1-g3))
+!       -z2^3 L21/(6(g0-g2)(g1-g2)^2(g2-g3)) +z3^3 L31/(6(g0-g3)(g1-g3)^2(g2-g3))
+!       +z0^3 L01/(6(g0-g1)^2(g0-g2)(g0-g3))
+!     term 1: (g0,g1,g2,g3)=(b,a,c,d)
+      k11=1.d0/(6.d0*(b-a)*(a-c)*(a-d))
+      k12=1.d0/(6.d0*(b-c)*(a-c)**2*(c-d))
+      k13=1.d0/(6.d0*(b-d)*(a-d)**2*(c-d))
+      k14=1.d0/(6.d0*(b-a)**2*(b-c)*(b-d))
+!     term 2: (a,b,c,d)
+      k21=1.d0/(6.d0*(a-b)*(b-c)*(b-d))
+      k22=1.d0/(6.d0*(a-c)*(b-c)**2*(c-d))
+      k23=1.d0/(6.d0*(a-d)*(b-d)**2*(c-d))
+      k24=1.d0/(6.d0*(a-b)**2*(a-c)*(a-d))
+!     term 3: (a,c,b,d)
+      k31=1.d0/(6.d0*(a-c)*(c-b)*(c-d))
+      k32=1.d0/(6.d0*(a-b)*(c-b)**2*(b-d))
+      k33=1.d0/(6.d0*(a-d)*(c-d)**2*(b-d))
+      k34=1.d0/(6.d0*(a-c)**2*(a-b)*(a-d))
+!     sub1normal(g0,g1,g2,g3)=(a,d,b,c):
+!       0.5*[-z1^2 L10/((g0-g2)(g0-g3)(g0-g1))
+!            -(z1^2 L10-z2^2 L20)/((g0-g2)(g1-g2)(g2-g3))
+!            +(z1^2 L10-z3^2 L30)/((g1-g3)(g0-g3)(g2-g3))]
+      m1=1.d0/((a-b)*(a-c)*(a-d))
+      m2=1.d0/((a-b)*(d-b)*(b-c))
+      m3=1.d0/((d-c)*(a-c)*(b-c))
+!$omp simd private(za,zb,zc,zd,za2,zb2,zc2,zd2,x1,x2,x3,x4,t1)
+      do i=1,ne
+        za=a+em(i); zb=b+em(i); zc=c+em(i); zd=d+em(i)
+        za2=za*za; zb2=zb*zb; zc2=zc*zc; zd2=zd*zd
+!       term 1 (b,a,c,d): L(c,a)=-lac, L(d,a)=-lad, L(b,a)=-lab
+        x1=-za2*k11+zc2*zc*lac(i)*k12-zd2*zd*lad(i)*k13
+     $     -zb2*zb*lab(i)*k14
+!       term 2 (a,b,c,d): L(c,b)=-lbc, L(d,b)=-lbd, L(a,b)=lab
+        x2=-zb2*k21+zc2*zc*lbc(i)*k22-zd2*zd*lbd(i)*k23
+     $     +za2*za*lab(i)*k24
+!       term 3 (a,c,b,d): L(b,c)=lbc, L(d,c)=-lcd, L(a,c)=lac
+        x3=-zc2*k31-zb2*zb*lbc(i)*k32-zd2*zd*lcd(i)*k33
+     $     +za2*za*lac(i)*k34
+!       term 4 (a,d,b,c): L(d,a)=-lad, L(b,a)=-lab, L(c,a)=-lac
+        t1=-zd2*lad(i)
+        x4=(-t1*m1-(t1+zb2*lab(i))*m2+(t1+zc2*lac(i))*m3)*.5d0
+        xo(i,ia4(1))=xo(i,ia4(1))+fk(ia4(1))*x1
+        xo(i,ia4(2))=xo(i,ia4(2))+fk(ia4(2))*x2
+        xo(i,ia4(3))=xo(i,ia4(3))+fk(ia4(3))*x3
+        xo(i,ia4(4))=xo(i,ia4(4))+fk(ia4(4))*(x4-x3-x2-x1)
+      end do
       end subroutine
 
       end module

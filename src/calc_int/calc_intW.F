@@ -2,6 +2,7 @@
 !--
       use m_rdinput       
       use fft_3d 
+      use m_int_fast
       include "config_w3d.h" 
       call read_input 
 !--
@@ -358,6 +359,16 @@
        !
       enddo!ik
       write(6,*)'FINISH REDING C0'
+!fork: real-space cache of the Wannier-gauge Bloch functions (m_int_fast)
+      if(flg_fast==1)then
+       call int_fast_init(nwx2,nwy2,nwz2,NTK,NTG,NWF,NG0,KG0,C0,
+     +  fast_mem_mb)
+      endif
+      allocate(iwl(NWF),kph1(NTK,1))
+      do iw=1,NWF
+       iwl(iw)=iw
+      enddo
+      kph1(:,1)=(1.0d0,0.0d0)
       CLOSE(113)  
 !--
 !      do ik=1,Nk_irr 
@@ -684,6 +695,14 @@
          qgL1=dsqrt(qgL2) 
          length_qg(igL)=qgL1
         enddo 
+!fork: cached real-space Wannier functions + FFTW (m_int_fast)
+        if(flg_fast==1.and.int_fast_ok)then
+         allocate(Sfast(NG_for_psi,NWF,1))
+         call int_fast_pairdens(NTK,SK0,(/q1,q2,q3/),.false.,
+     +    NG_for_psi,LG0(1,1,iq),NWF,iwl,iwl,1,kph1,Sfast)
+         rho(1:NG_for_psi,:,iq)=rho(1:NG_for_psi,:,iq)+Sfast(:,:,1)
+         deallocate(Sfast)
+        else
 !$OMP PARALLEL PRIVATE(ik,iw,igL,shift_G,ikq,C0_K,C0_KQ,
 !$OMP&  fftwk,wfunc,rho_tmp,prho)
         allocate(prho(NTG,NWF));prho(:,:)=0.0D0 
@@ -715,6 +734,7 @@
 !$OMP END CRITICAL 
         deallocate(prho,fftwk,wfunc,rho_tmp,C0_K,C0_KQ) 
 !$OMP END PARALLEL 
+        endif!flg_fast
         do iw=1,NWF
          do igL=1,NG_for_psi 
           rho(igL,iw,iq)=rho(igL,iw,iq)/length_qg(igL)
@@ -743,6 +763,15 @@
           length_qg(igL)=qgL1
          endif  
         enddo 
+!fork: cached real-space Wannier functions + FFTW (m_int_fast)
+        if(flg_fast==1.and.int_fast_ok)then
+         allocate(Sfast(NG_for_psi,NWF,1))
+         call int_fast_pairdens(NTK,SK0,(/q1,q2,q3/),.true.,
+     +    NG_for_psi,LG0(1,1,iq),NWF,iwl,iwl,1,kph1,Sfast)
+         Sfast(NoG0,:,1)=0.0d0
+         rho(1:NG_for_psi,:,iq)=rho(1:NG_for_psi,:,iq)+Sfast(:,:,1)
+         deallocate(Sfast)
+        else
 !$OMP PARALLEL PRIVATE(ik,iw,igL,shift_G,ikq,C0_K,C0_KQ,
 !$OMP&  fftwk,wfunc,rho_tmp,prho)
         allocate(prho(NTG,NWF));prho(:,:)=0.0D0 
@@ -775,6 +804,7 @@
 !$OMP END CRITICAL 
         deallocate(prho,fftwk,wfunc,rho_tmp,C0_K,C0_KQ) 
 !$OMP END PARALLEL 
+        endif!flg_fast
         do iw=1,NWF 
          do igL=1,NG_for_psi  
           if(igL/=NoG0)then 
@@ -902,6 +932,13 @@
 !          enddo 
 !         enddo 
 !        endif 
+!fork: rho^T eps conj(rho) as ZGEMMs (m_int_fast)
+        if(flg_fast==1)then
+         if(.not.allocated(fwq)) allocate(fwq(NWF,NWF,ne))
+         call int_fast_funcw_mat(NGQ_eps(iq),NGQ_psi(iq),NWF,
+     +    rho(1,1,iq),NTG,ne,epsmk,NTGQ,fwq)
+         funcw(:,:,:,iq)=fwq(:,:,:)
+        else
 !$OMP PARALLEL PRIVATE(ie,iw,jw,SUM_CMPX,igL,jgL)
 !$OMP DO 
         do ie=1,ne 
@@ -929,6 +966,7 @@
         enddo!ie 
 !$OMP END DO 
 !$OMP END PARALLEL 
+        endif!flg_fast
         deallocate(epsmk,packtmp)  
         write(6,'(a,x,i5)')'FINISH iq',iq
        enddo!iq 
@@ -961,6 +999,19 @@
 !      enddo 
 !-- 
 !make MATRIX_W  
+!fork: phase table exp(-i2pi q.R), same values as the former inner-loop exp
+       allocate(pfR(NTQ,-Na1:Na1,-Na2:Na2,-Na3:Na3))
+       do ia3=-Na3,Na3
+        do ia2=-Na2,Na2
+         do ia1=-Na1,Na1
+          do iq=1,NTQ
+           q1=SQ(1,iq);q2=SQ(2,iq);q3=SQ(3,iq)
+           phase=tpi*(q1*dble(ia1)+q2*dble(ia2)+q3*dble(ia3)) 
+           pfR(iq,ia1,ia2,ia3)=exp(-ci*phase) 
+          enddo
+         enddo
+        enddo
+       enddo
        allocate(V_MAT(NWF,NWF,-Na1:Na1,-Na2:Na2,-Na3:Na3))  
        V_MAT(:,:,:,:,:)=0.0D0 
        do ia1=-Na1,Na1
@@ -970,10 +1021,7 @@
            do jw=1,NWF 
             SUM_CMPX=0.0D0 
             do iq=1,NTQ 
-             q1=SQ(1,iq);q2=SQ(2,iq);q3=SQ(3,iq)
-             phase=tpi*(q1*dble(ia1)+q2*dble(ia2)+q3*dble(ia3)) 
-             pf=exp(-ci*phase) 
-             SUM_CMPX=SUM_CMPX+func(iw,jw,iq)*pf
+             SUM_CMPX=SUM_CMPX+func(iw,jw,iq)*pfR(iq,ia1,ia2,ia3)
             enddo 
             V_MAT(iw,jw,ia1,ia2,ia3)
      +     =2.0D0*tpi*SUM_CMPX/VOLUME/DBLE(NTQ)+chead 
@@ -992,10 +1040,7 @@
             do jw=1,NWF 
              SUM_CMPX=0.0D0 
              do iq=1,NTQ 
-              q1=SQ(1,iq);q2=SQ(2,iq);q3=SQ(3,iq)
-              phase=tpi*(q1*dble(ia1)+q2*dble(ia2)+q3*dble(ia3)) 
-              pf=exp(-ci*phase) 
-              SUM_CMPX=SUM_CMPX+funcw(iw,jw,ie,iq)*pf
+              SUM_CMPX=SUM_CMPX+funcw(iw,jw,ie,iq)*pfR(iq,ia1,ia2,ia3)
              enddo 
              W_MAT(iw,jw,ia1,ia2,ia3,ie)
      +      =2.0D0*tpi*SUM_CMPX/VOLUME/DBLE(NTQ)+cheadw(ie) 

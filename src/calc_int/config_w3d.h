@@ -119,3 +119,7 @@
       integer::i1,j1,k1,ia1,ia2,ia3
       integer::L1,L2,L3,Lq1,Lq2,Lq3  
 !END CONFIG.H 
+!fork: m_int_fast
+      complex(8),allocatable::Sfast(:,:,:),kph1(:,:),fwq(:,:,:)
+      complex(8),allocatable::pfR(:,:,:,:)
+      integer,allocatable::iwl(:)
