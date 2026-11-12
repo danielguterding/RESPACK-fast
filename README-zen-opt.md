@@ -11,6 +11,7 @@ holds the changes. Every change can be switched off at run time, which restores 
 | `calc_chiqw` | new band-pair loop (`src/chiqw/chi_fast.f90`), see below | `flg_fast` in `&param_chiqw` (default 1) |
 | `calc_chiqw` | faster generalized-tetrahedron weights (`src/chiqw/m_tetrahedron_fast.F`) | used by `flg_fast=1` |
 | `calc_chiqw` | optional CUDA path (`src/chiqw/chi_gpu.cu`), see “GPU path” | `flg_gpu` (default 0), build with `-DRESPACK_CUDA=ON` |
+| `calc_chiqw` | ε(ω) built and inverted for all frequencies in parallel (OpenMP); each inversion uses single-threaded LAPACK as before, so the results are bitwise identical | always on |
 | `calc_w3d`, `calc_j3d` | cached real-space Wannier functions + FFTW, ZGEMM contractions (`src/calc_int/int_fast.f90`) | `flg_fast` in `&param_calc_int` (default 1) |
 | `calc_w3d`, `calc_j3d` | `make_LG0` loops limited to the cutoff sphere; `exp(-iq.R)` tables | always on; gives numerically identical results |
 
@@ -85,7 +86,7 @@ budget means larger tiles and fewer backward FFTs.
 |---|---|---|
 | `src/chiqw/chi_fast.f90` | new | restructured band-pair loop (module `m_chi_fast`) |
 | `src/chiqw/m_tetrahedron_fast.F` | new (derived from `m_tetrahedron_20170325.F`) | vectorised log ratios, fused ± pass, fused normal tetrahedra |
-| `src/chiqw/chiqw.F` | modified | calls `m_chi_fast` for `flg_fast=1`; original loops kept for `flg_fast=0` |
+| `src/chiqw/chiqw.F` | modified | calls `m_chi_fast` for `flg_fast=1`, original loops kept for `flg_fast=0`; frequency loops of the ε inversion parallel (OpenMP) |
 | `src/chiqw/m_rdinput.f90` | modified | inputs `flg_fast`, `fast_mem_mb` |
 | `src/chiqw/CMakeLists.txt` | modified | FFTW3, new sources |
 | `src/calc_int/int_fast.f90` | new | module `m_int_fast` |
