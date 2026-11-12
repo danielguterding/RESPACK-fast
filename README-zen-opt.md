@@ -445,7 +445,9 @@ For example:
 
 **Options:**
 - `RESPACK_NATIVE`, `RESPACK_ARCH`: CPU tuning.
-- `RESPACK_LTO`: link-time optimization.
+- `RESPACK_LTO`: link-time optimization. It brings no measurable gain for RESPACK (SrVO₃ `calc_chiqw`: 58.7 s
+  with, 55.4 s without, on a Zen 5 CPU). With gfortran the build passes `-fcx-fortran-rules` to the LTO link
+  step, see the note below.
 - `RESPACK_BUILD_XTAPP`: also build the xTAPP converters (default ON).
 
 Libraries are found through CMake's standard `FindMPI`, `FindOpenMP` and `FindLAPACK` (use `BLA_VENDOR`
@@ -457,6 +459,13 @@ per-directory Makefiles are unchanged but don't know about the fork's new files;
 - **Single-threaded BLAS:** BLAS is called inside OpenMP regions. Use a single-threaded BLAS, or set
   `OPENBLAS_NUM_THREADS=1` (or `MKL_NUM_THREADS=1`) at run time.
 - **FFTW built with LTO:** if your FFTW was itself built with LTO-only objects, enable `RESPACK_LTO` too.
+- **gfortran and LTO:** the LTO code generator does not inherit gfortran's rules for complex multiplication and
+  division (`-fcx-fortran-rules`, set by the Fortran front end). Without the flag at the link step, every complex
+  product or quotient becomes a call to `__muldc3`/`__divdc3` (434 + 147 call sites in `calc_chiqw`, 308 + 87 in
+  `calc_wannier`), and the loops containing them are not vectorized. The tetrahedron weights then ran 2–3×
+  slower (SrVO₃: 17.2 s instead of 8.7 s), and ε⁻¹ differed from a build without LTO by 3.4×10⁻⁵ (1.3×10⁻⁵ with
+  the flag). The CMake build sets the flag automatically. Builds made before this fix with LTO (e.g. the `zen3`
+  preset) should be rebuilt.
 - **Other compilers:** the GNU toolchain is tested. Intel/ifx get `-xHost` with `RESPACK_NATIVE`;
   other compilers use their defaults.
 - **Validated builds:** the `zen3` and `default` builds were both checked against the reference results
