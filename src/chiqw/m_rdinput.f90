@@ -38,13 +38,14 @@ integer,public::file_num_eps_base_start
 !calc_num_k 
 integer,public::flg_fast!fork: 1=restructured pair loop (m_chi_fast), 0=original loop
 real(8),public::fast_mem_mb!fork: memory budget (MB) of one pair tile in m_chi_fast
+integer,public::flg_async_eps!fork: 1=eps inversion/output of a q point in a background thread (m_eps_async), -1=auto
 integer,public::n_calc_q!total number of calculated q pts
 integer,public,allocatable::calc_num_k(:)!calc_num_k(n_calc_q) 
 namelist/param_chiqw/N_CALC_BAND,Ecut_for_eps,shift_ef,Max_excitation_energy,& 
 Green_func_delt,ttrhdrn_dmna,ttrhdrn_dmnr,MPI_io_rank,MPI_num_proc_per_qcomm,&
 MPI_num_qcomm,Num_freq_grid,Lower_bound_energy_window,Upper_bound_energy_window,&
 flg_cRPA,flg_calc_type,file_num_log_start,file_num_chi_start,file_num_eps_start,&
-file_num_chi_base_start,file_num_eps_base_start,n_calc_q,flg_fast,fast_mem_mb 
+file_num_chi_base_start,file_num_eps_base_start,n_calc_q,flg_fast,fast_mem_mb,flg_async_eps 
 contains
 subroutine read_input(nproc)  
 integer::nproc 
@@ -74,6 +75,7 @@ FILE_NUM_EPS_BASE_START=600000
 N_CALC_Q=0
 FLG_FAST=1!fork: restructured pair loop
 FAST_MEM_MB=4096.0d0!fork: MB per pair tile
+FLG_ASYNC_EPS=-1!fork: auto (CPU build: off)
 !--
 !open(999,file='input.in')
 !read(999,nml=param_chiqw)
