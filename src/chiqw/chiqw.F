@@ -4,6 +4,7 @@
       use m_tetrahedron
       use m_rdinput
       use m_chi_fast
+      use m_eps_async
       include "config.h"
 !mpi global 
       comm_glb=MPI_COMM_WORLD
@@ -68,6 +69,13 @@
       call MPI_Bcast(fast_gemm_sp,1,MPI_INTEGER,0,comm_glb,ierr)
       call MPI_Bcast(flg_gpu,1,MPI_INTEGER,0,comm_glb,ierr)
       call MPI_Bcast(fast_fft_sp,1,MPI_INTEGER,0,comm_glb,ierr)
+      call MPI_Bcast(flg_async_eps,1,MPI_INTEGER,0,comm_glb,ierr)
+!fork: auto -> on with flg_gpu=1 (the CPU is idle while the GPU
+! computes chi0), off otherwise (all cores compute chi0)
+      if(flg_async_eps<0)then
+       flg_async_eps=0
+       if(flg_gpu==1) flg_async_eps=1
+      endif
 !--
 !      call MPI_FINALIZE(ierr)
 !      stop
@@ -1306,11 +1314,10 @@
        endif 
 !q.ne.0 
       if((q1/=0.0d0).or.(q2/=0.0d0).or.(q3/=0.0d0))then 
-       allocate(chiqw(NG_for_eps,NG_for_eps,nen))
+!fork: no chiqw; the MPI sum goes in place into pchiqw (m_eps_async)
        allocate(pchiqw(NG_for_eps,NG_for_eps,nen))
        allocate(i_for_pair(N_CALC_BAND*N_CALC_BAND))
        allocate(j_for_pair(N_CALC_BAND*N_CALC_BAND))
-       chiqw(:,:,:)=0.0D0 
        pchiqw(:,:,:)=0.0D0 
 !wavefunction rotation loop  
        do irot=0,nproc-1
@@ -1535,16 +1542,18 @@
        enddo!irot 
        !--
        tfk(1)=MPI_Wtime()!fork
-       call MPI_REDUCE(pchiqw,chiqw,NG_for_eps*NG_for_eps*nen,
-     +      MPI_DOUBLE_COMPLEX,MPI_SUM,0,comm,ierr)
+       if(myrank.eq.0)then 
+        call MPI_REDUCE(MPI_IN_PLACE,pchiqw,NG_for_eps*NG_for_eps*nen,
+     +       MPI_DOUBLE_COMPLEX,MPI_SUM,0,comm,ierr)
+       else
+        call MPI_REDUCE(pchiqw,pchiqw,NG_for_eps*NG_for_eps*nen,
+     +       MPI_DOUBLE_COMPLEX,MPI_SUM,0,comm,ierr)
+       endif 
        tfk(2)=MPI_Wtime()!fork
 !--
-!output 
+!output (fork: m_eps_async; eps, its inverse and the files of
+! dir-eps/qNNN as before, optionally in a background thread)
        if(myrank.eq.0)then 
-        chiqw(:,:,:)=chiqw(:,:,:)/VOLUME 
-        ierr=CHDIR("./dir-eps") 
-        call system('pwd') 
-!--
 !2017413 
         do ik=1,Nk_irr 
          if(ABS(SKI_list(1,ik)-q1)<1.D-6.and.
@@ -1554,83 +1563,15 @@
          endif 
         enddo 
         write(6,*) 'qnum=',qnum
-        write(dirname,"('q',i3.3)")qnum 
-        ierr=CHDIR(dirname) 
-        call system('pwd') 
-!--
-!OPEN(301,W,FILE='dat.sq') 
-        OPEN(301,FILE='dat.sq') 
-        rewind(301)
-        write(301,*) q1,q2,q3 
-        close(301) 
-        !--
-        allocate(epsqw(NG_for_eps,NG_for_eps,nen));epsqw(:,:,:)=0.0d0 
-        allocate(eps_rpa(NG_for_eps,NG_for_eps));eps_rpa(:,:)=0.0d0 
-        allocate(chi0(NG_for_eps,NG_for_eps));chi0(:,:)=0.0d0 
-!--
-!OPEN(60000-,W,FILE='epsqw(G,G)) 
-        file_num_eps_base=file_num_eps_base_start!20171011  
-        do ie=1,nen 
-         file_num_eps_ie=file_num_eps_base+ie!-1 
-         write(filename,'("dat.epsqw.",i6.6)')file_num_eps_ie   
-         OPEN(file_num_eps_ie,FILE=filename) 
-         rewind(file_num_eps_ie)
-         write(file_num_eps_ie,'(a)')'#epsqw diagonal term' 
-         write(file_num_eps_ie,'(a)')
-     +   '#1:q+G [au], 2:Re(eps-1), 3:Im(eps-1)'
-        enddo!ie 
-        !--
-        tfk(3)=MPI_Wtime()!fork
-! fork: the frequencies in parallel (OpenMP), each inverted with
-! single-threaded LAPACK as before. chiqw is not needed afterwards and
-! is used in place (calc_eps_rpa doubles it); eps goes to epsqw.
-!$OMP PARALLEL DO DEFAULT(SHARED) SCHEDULE(DYNAMIC,1)
-!$OMP&            PRIVATE(ie,file_num_chi_ie,file_num_eps_ie)
-        do ie=1,nen 
-         file_num_chi_ie=0!file_num_chi_base+ie-1
-         file_num_eps_ie=file_num_eps_base+ie!-1 
-         call calc_eps_rpa(NTG,NG_for_eps,LG0(1,1,iq),
-     +                     q1,q2,q3,b1(1),b2(1),b3(1),
-     +                     chiqw(1,1,ie),tpi,epsqw(1,1,ie), 
-     +                     file_num_chi_ie,file_num_eps_ie)  
-         close(file_num_eps_ie)
-        enddo!ie 
-!$OMP END PARALLEL DO
-        tfk(4)=MPI_Wtime()!fork
-!--
-!chiqw 
-!       write(file_num_chi)(((chiqw(ig,jg,ie),ig=1,NG_for_eps)
-!     +                            ,jg=1,NG_for_eps),ie=1,nen)   
-!--
-!OPEN(600,W,FILE='epsqw',FORM='unformatted') 
-        file_num_eps=file_num_eps_start 
-        write(filename,'("dat.epsqw.",i3.3)')file_num_eps  
-        OPEN(file_num_eps,FILE=filename,FORM='unformatted') 
-        rewind(file_num_eps)
-        write(file_num_eps)(((epsqw(ig,jg,ie),ig=1,NG_for_eps)
-     +                             ,jg=1,NG_for_eps),ie=1,nen) 
-        close(file_num_eps) 
-        tfk(5)=MPI_Wtime()!fork
-        write(6,'(a,6f9.2)')' fork: time (s) chi / reduce / '//
-     +   'prep / eps inversion / write eps / q total',tfk(1)-tfk(0),
-     +   tfk(2)-tfk(1),tfk(3)-tfk(2),tfk(4)-tfk(3),tfk(5)-tfk(4),
-     +   tfk(5)-tfk(0)
-!--
-!OPEN(400,W,FILE='dat.log') 
-        file_num_log=file_num_log_start 
-        write(filename,'("dat.log.",i3.3)')file_num_log 
-        OPEN(file_num_log,FILE=filename) 
-        rewind(file_num_log)
-        write(file_num_log,*)'#'
-        write(file_num_log,*)'#finish chi0 evaluation for',qnum!iq 
-        write(file_num_log,*)'#' 
-        close(file_num_log) 
-        !--
-        deallocate(epsqw,eps_rpa,chi0)
-        ierr=CHDIR("../..")!2017413  
-        call system('pwd') 
+        write(6,'(a,2f9.2)')' fork: time (s) chi / reduce',
+     +   tfk(1)-tfk(0),tfk(2)-tfk(1)
+        call eps_post_q(pchiqw,NTG,NG_for_eps,nen,LG0(1,1,iq),
+     +   q1,q2,q3,b1,b2,b3,tpi,VOLUME,qnum,
+     +   file_num_eps_base_start,file_num_eps_start,
+     +   file_num_log_start,flg_async_eps==1)
        endif 
-       deallocate(chiqw,pchiqw,i_for_pair,j_for_pair) 
+       if(allocated(pchiqw)) deallocate(pchiqw)
+       deallocate(i_for_pair,j_for_pair) 
 !--
 !q.eq.0 
       elseif(q1==0.0d0.and.q2==0.0d0.and.q3==0.0d0)then 
@@ -2081,6 +2022,7 @@
       call MPI_REDUCE(pwpl,wpl,3,MPI_DOUBLE_COMPLEX,MPI_SUM,0,comm,ierr)
 !--
 !output 
+      call eps_post_wait()!fork: no CHDIR while m_eps_async writes
       if(myrank.eq.0)then 
        chiqwgm(:,:,:,:)=chiqwgm(:,:,:,:)/VOLUME 
 !--
@@ -2201,6 +2143,7 @@
       !--
       endif!q=0 or q/=0
       enddo!iq 
+      call eps_post_wait()!fork: last q point of m_eps_async
 !--
 !     CLOSE(file_num_chi)
 !     CLOSE(file_num_eps)
