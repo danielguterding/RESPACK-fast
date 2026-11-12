@@ -13,6 +13,7 @@ holds the changes. Every change can be switched off at run time, which restores 
 | `calc_chiqw` | optional GPU path (`src/chiqw/chi_gpu.cu`) for NVIDIA (CUDA) and AMD (ROCm/HIP) GPUs, see “GPU path” | `flg_gpu` (default 0), build with `-DRESPACK_CUDA=ON` or `-DRESPACK_HIP=ON` |
 | `calc_chiqw` | wave-function rotation: index map and phase factors of `make_C0` once per k point instead of once per band (`make_C0_map`); results identical to ≤ 10⁻¹⁵ | used by `flg_fast=1` |
 | `calc_chiqw` | ε(ω) built and inverted for all frequencies in parallel (OpenMP); each inversion uses single-threaded LAPACK as before (results identical to ≤ 10⁻¹⁵; SrVO₃, NG = 1963: 88 → 51 s per q) | always on |
+| `calc_chiqw` | post-processing of a q point (ε, ε⁻¹, files of `dir-eps/qNNN`) in `m_eps_async`, optionally in a background thread while the next q point is computed; MPI sum of χ in place (one array of NG²·N_ω less) | `flg_async_eps` in `&param_chiqw` (default −1 = auto: off in the CPU build) |
 | `calc_w3d`, `calc_j3d` | cached real-space Wannier functions + FFTW, ZGEMM contractions (`src/calc_int/int_fast.f90`) | `flg_fast` in `&param_calc_int` (default 1) |
 | `calc_w3d`, `calc_j3d` | `make_LG0` loops limited to the cutoff sphere; `exp(-iq.R)` tables | always on; gives numerically identical results |
 
@@ -88,8 +89,9 @@ budget means larger tiles and fewer backward FFTs.
 | `src/chiqw/chi_fast.f90` | new | restructured band-pair loop (module `m_chi_fast`) |
 | `src/chiqw/m_tetrahedron_fast.F` | new (derived from `m_tetrahedron_20170325.F`) | vectorised log ratios, fused ± pass, fused normal tetrahedra |
 | `src/chiqw/chiqw_sub.F` | modified | new `make_C0_map` (per-k rotation map; `make_C0` unchanged) |
+| `src/chiqw/eps_async.f90`, `thread_util.c` | new | module `m_eps_async` (q ≠ 0 post-processing, background thread via pthreads) |
 | `src/chiqw/chiqw.F` | modified | calls `m_chi_fast` for `flg_fast=1`, original loops kept for `flg_fast=0`; frequency loops of the ε inversion parallel (OpenMP) |
-| `src/chiqw/m_rdinput.f90` | modified | inputs `flg_fast`, `fast_mem_mb` |
+| `src/chiqw/m_rdinput.f90` | modified | inputs `flg_fast`, `fast_mem_mb`, `flg_async_eps` |
 | `src/chiqw/CMakeLists.txt` | modified | FFTW3, new sources |
 | `src/calc_int/int_fast.f90` | new | module `m_int_fast` |
 | `src/calc_int/calc_intW.F`, `calc_intJ.F` | modified | call `m_int_fast` for `flg_fast=1`; original loops kept; exp(−iq·R) table in `calc_intW.F` |
