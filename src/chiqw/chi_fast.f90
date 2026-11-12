@@ -528,7 +528,7 @@ contains
     ! GPU phase C: single-precision CGEMM blocks into the double-precision chi on the device
     subroutine phase_c_gpu()
       integer :: kc, ie, ix
-      kc = NTK*max(1, 8192/NTK)
+      kc = 2048                ! rows per single-precision CGEMM block (accuracy: SrVO3 eps^-1 4.7e-7 vs 6.9e-6 at 8192)
       if (lq0) then
         rcg = chi_gpu_gemm(W, V, kc)
         call gpu_check(rcg, 'chi_gpu_gemm')
