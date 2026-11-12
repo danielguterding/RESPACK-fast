@@ -25,6 +25,7 @@
 #endif
 #include <hip/hip_runtime.h>
 #include <hip/hip_complex.h>
+#include <hip/hip_fp16.h>
 #include <hipfft/hipfft.h>
 #include <hipblas/hipblas.h>
 
@@ -98,6 +99,11 @@
 #define cublasSetStream hipblasSetStream
 #define cublasCgemm hipblasCgemm
 #define cublasZgemv hipblasZgemv
+#define cublasGemmEx hipblasGemmEx
+#define CUBLAS_COMPUTE_32F HIPBLAS_COMPUTE_32F
+#define CUBLAS_GEMM_DEFAULT HIPBLAS_GEMM_DEFAULT
+#define CUDA_R_16F HIP_R_16F
+#define CUDA_R_32F HIP_R_32F
 
 #else
 
@@ -105,6 +111,7 @@
 #include <cufft.h>
 #include <cublas_v2.h>
 #include <cuComplex.h>
+#include <cuda_fp16.h>
 
 #define GPU_RT_NAME "CUDA"
 #define GPU_FFT_NAME "cuFFT"

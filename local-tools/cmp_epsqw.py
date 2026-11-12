@@ -7,12 +7,19 @@ import os, sys
 import numpy as np
 
 def read_rec(path):
+    """First record of a gfortran unformatted sequential file. Records over 2 GiB are split into
+    subrecords; a negative leading marker means that the record continues in the next subrecord."""
+    parts = []
     with open(path, 'rb') as f:
-        n = np.fromfile(f, dtype=np.int32, count=1)[0]
-        data = np.fromfile(f, dtype=np.complex128, count=n // 16)
-        n2 = np.fromfile(f, dtype=np.int32, count=1)[0]
-    assert n == n2, 'bad record markers'
-    return data
+        while True:
+            m = int(np.fromfile(f, dtype=np.int32, count=1)[0])
+            parts.append(f.read(abs(m)))
+            m2 = int(np.fromfile(f, dtype=np.int32, count=1)[0])
+            assert abs(m2) == abs(m), 'bad record markers'
+            if m >= 0:
+                break
+    buf = parts[0] if len(parts) == 1 else b''.join(parts)
+    return np.frombuffer(buf, dtype=np.complex128)
 
 a, b = sys.argv[1], sys.argv[2]
 worst = 0.0

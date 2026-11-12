@@ -21,6 +21,10 @@
 //   Storage is transposed, At(G, row) with row = ik + NTK*(p-1), so that gathers are coalesced.
 // * chi: single-precision CGEMM blocks (K <= kc rows), each block added to a double-precision chi
 //   kept on the device -- identical precision model to the validated CPU fast_gemm_sp=1 path.
+// * experimental (RESPACK_GPU_GEMM=fp16): the chi products on the matrix units (tensor cores / WMMA)
+//   with FP16 inputs and FP32 accumulation. Each factor is scaled by an exact power of two and split
+//   into FP16 hi + lo parts; hi*hi + hi*lo + lo*hi are evaluated in one GEMM of the real block form
+//   (see chi_gpu_gemm_mp). Same accumulation into the double-precision chi.
 // * q=0: Y(G) += sum_r conj(A_rG) w_r v_r, Z(G) += sum_r A_rG w_r conj(v_r) in double precision
 //   (ZGEMV); the host assembles the head/wing-replaced chi from chi, Y, Z (and D on the CPU).
 // Conventions as cuFFT/FFTW: inverse (backward) unnormalised exp(+i...), forward exp(-i...).
@@ -30,6 +34,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
   fprintf(stderr, "chi_gpu: " GPU_RT_NAME " error '%s' at %s:%d\n", cudaGetErrorString(e_), __FILE__, __LINE__); return -1; } } while (0)
@@ -40,6 +45,7 @@
 
 typedef cuDoubleComplex zc;
 typedef cuComplex cc;
+typedef __half hf;
 
 static struct {
   int init, dev, verbose;
@@ -74,6 +80,14 @@ static struct {
   zc *tmp; size_t tmp_cap;       // NG
   cc *Bt; size_t Bt_cap;         // NG*kc
   cc *T4; size_t T4_cap;         // NG*NG
+  // RESPACK_GPU_GEMM=fp16 (gemm_mp)
+  int gemm_mp;
+  int fp16_chunk;                // K columns per hi*hi GemmEx call (0: one call for all three products)
+  hf *Xh; size_t Xh_cap;         // 2NG*6kc
+  hf *Yh; size_t Yh_cap;         // NG*6kc
+  float *Tf; size_t Tf_cap;      // 2NG*NG
+  unsigned int *amax;            // max |component| of At (float bits)
+  double *mW; size_t mW_cap;     // host: max |component| of W(:, ie)
 } g;
 
 static int grid1(size_t n) {
@@ -184,6 +198,68 @@ __global__ void k_addconj(size_t n, const zc *__restrict__ x, zc *__restrict__ y
     y[t] = cuCadd(y[t], cuConj(x[t]));
 }
 
+// --- RESPACK_GPU_GEMM=fp16 -----------------------------------------------------------------------
+// max over x of max(|Re|, |Im|), as float bits (non-negative floats order like unsigned ints)
+__global__ void k_absmax(size_t n, const zc *__restrict__ x, unsigned int *out) {
+  __shared__ float s[256];
+  float m = 0.f;
+  for (size_t t = blockIdx.x * (size_t)blockDim.x + threadIdx.x; t < n; t += (size_t)gridDim.x * blockDim.x)
+    m = fmaxf(m, fmaxf(fabsf((float)cuCreal(x[t])), fabsf((float)cuCimag(x[t]))));
+  s[threadIdx.x] = m;
+  __syncthreads();
+  for (int o = 128; o > 0; o >>= 1) {
+    if ((int)threadIdx.x < o) s[threadIdx.x] = fmaxf(s[threadIdx.x], s[threadIdx.x + o]);
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) atomicMax(out, __float_as_uint(s[0]));
+}
+
+__device__ __forceinline__ void split_h(float x, hf &h, hf &l) {
+  h = __float2half_rn(x);
+  l = __float2half_rn(x - __half2float(h));   // the difference is exact in float
+}
+
+// Yhat(NG, 6K), ld NG, K-blocks [h(Re) | h(Im) | l(Re) | l(Im) | h(Re) | h(Im)] of Y = At(:, r0:r0+K-1) * sY
+__global__ void k_packY(size_t n, int NG, int K, const zc *__restrict__ At, int r0, double sY, hf *__restrict__ Yh) {
+  const size_t B = (size_t)NG * K;
+  for (size_t t = blockIdx.x * (size_t)blockDim.x + threadIdx.x; t < n; t += (size_t)gridDim.x * blockDim.x) {
+    size_t r = t / NG, gg = t - r * NG;
+    zc a = At[gg + (size_t)NG * (r0 + r)];
+    hf hr, lr, hi, li;
+    split_h((float)(cuCreal(a) * sY), hr, lr);
+    split_h((float)(cuCimag(a) * sY), hi, li);
+    size_t c = (size_t)NG * r + gg;
+    Yh[c] = hr; Yh[B + c] = hi; Yh[2 * B + c] = lr; Yh[3 * B + c] = li; Yh[4 * B + c] = hr; Yh[5 * B + c] = hi;
+  }
+}
+
+// Xhat(2NG, 6K), ld 2NG: three copies [h | h | l] of the real block form Xt = [[Xr, -Xi], [Xi, Xr]] (2NG x 2K)
+// of X(G, r) = conj(At(G, r0+r)) * W(r0+r) * sX
+__global__ void k_packX(size_t n, int NG, int K, const zc *__restrict__ At, int r0, const zc *__restrict__ Wcol,
+                        double sX, hf *__restrict__ Xh) {
+  const size_t L = 2 * (size_t)NG, B = L * 2 * K;
+  for (size_t t = blockIdx.x * (size_t)blockDim.x + threadIdx.x; t < n; t += (size_t)gridDim.x * blockDim.x) {
+    size_t r = t / NG, gg = t - r * NG;
+    zc x = cuCmul(cuConj(At[gg + (size_t)NG * (r0 + r)]), Wcol[r0 + r]);
+    hf hr, lr, hi, li;
+    split_h((float)(cuCreal(x) * sX), hr, lr);
+    split_h((float)(cuCimag(x) * sX), hi, li);
+    size_t p00 = gg + L * r, p01 = gg + L * (K + r), p10 = NG + gg + L * r, p11 = NG + gg + L * (K + r);
+    hf nhi = __hneg(hi), nli = __hneg(li);
+    Xh[p00] = hr; Xh[p01] = nhi; Xh[p10] = hi; Xh[p11] = hr;
+    Xh[B + p00] = hr; Xh[B + p01] = nhi; Xh[B + p10] = hi; Xh[B + p11] = hr;
+    Xh[2 * B + p00] = lr; Xh[2 * B + p01] = nli; Xh[2 * B + p10] = li; Xh[2 * B + p11] = lr;
+  }
+}
+
+// chi(G, G') += (T(G, G') + i T(NG+G, G')) * inv, T(2NG, NG) in FP32
+__global__ void k_accmp(size_t n, int NG, const float *__restrict__ T, double inv, zc *__restrict__ chie) {
+  for (size_t t = blockIdx.x * (size_t)blockDim.x + threadIdx.x; t < n; t += (size_t)gridDim.x * blockDim.x) {
+    size_t gp = t / NG, gg = t - gp * NG, o = gg + 2 * (size_t)NG * gp;
+    chie[t] = make_cuDoubleComplex(cuCreal(chie[t]) + (double)T[o] * inv, cuCimag(chie[t]) + (double)T[o + NG] * inv);
+  }
+}
+
 //------------------------------------------------------------------------------------------------
 static int local_rank(void) {
   const char *v[] = {"OMPI_COMM_WORLD_LOCAL_RANK", "MPI_LOCALRANKID", "SLURM_LOCALID", "MV2_COMM_WORLD_LOCAL_RANK"};
@@ -223,12 +299,18 @@ extern "C" int chi_gpu_init(int n1, int n2, int n3, int fbatch, int verbose, int
   } else {
     CK(cudaMalloc((void **)&g.f, g.ngrid * g.fbatch * sizeof(zc)));
   }
+  { const char *e = getenv("RESPACK_GPU_GEMM"); g.gemm_mp = (e && strcmp(e, "fp16") == 0); }
+  { const char *e = getenv("RESPACK_GPU_FP16_CHUNK"); g.fp16_chunk = (e && *e) ? atoi(e) : 512; }
+  CK(cudaMalloc((void **)&g.amax, sizeof(unsigned int)));
   g.init = 1;
   if (verbose) {
     cudaDeviceProp pr;
     CK(cudaGetDeviceProperties(&pr, g.dev));
     printf(" chi_gpu: local rank %d -> device %d (%s, %.1f GB), grid %d %d %d, FFT batch %d, %s FFTs\n", local_rank(),
            g.dev, pr.name, pr.totalGlobalMem / 1073741824.0, n1, n2, n3, g.fbatch, fft_sp ? "single-precision" : "double-precision");
+    if (g.gemm_mp)
+      printf(" chi_gpu: RESPACK_GPU_GEMM=fp16: chi products with FP16 hi/lo split, FP32 accumulation, hi*hi in K chunks of %d"
+             " (experimental)\n", g.fp16_chunk);
     fflush(stdout);
   }
   return 0;
@@ -328,35 +410,114 @@ extern "C" int chi_gpu_pairs(int ik0, int NTK, int ubJ, int ubI, double scl) {
   return 0;
 }
 
+// RESPACK_GPU_GEMM=fp16: chi(:,:,ie) += sum_r conj(A_rG) W_r,ie A_rG' with FP16 inputs on the matrix units.
+// Real block form T(2NG, NG) = Xt(2NG, 2K) Yt(NG, 2K)^T with Xt = [[Xr, -Xi], [Xi, Xr]], Yt = [Yr, Yi];
+// hi/lo split: T = Xt_h Yt_h^T + Xt_h Yt_l^T + Xt_l Yt_h^T (lo*lo dropped, ~2^-22).
+// The matrix units accumulate inside one GEMM call with a bias toward zero (truncation; measured on RDNA4,
+// reported for NVIDIA tensor cores): the error grows linearly with K for same-sign sums. The output step
+// C = AB + beta*C rounds to nearest. Hence: the small corrections (hi*lo + lo*hi, 2^-11 smaller) in one call
+// (beta = 0), then hi*hi in K chunks of fp16_chunk columns, each continued with beta = 1.
+// fp16_chunk = 0: all three products in one call with K' = 6K (biased; for comparison).
+// Scales: |Y| <= mA, |Xr|, |Xi| <= 2 mA mW(ie); powers of two such that the scaled maxima stay below 2^13.
+static int gemm_mp(const zc *W, int kc) {
+  const int NG = g.NG, nen = g.nen, rows = g.rows;
+  const size_t nA = (size_t)NG * rows;
+  CK(cudaMemsetAsync(g.amax, 0, sizeof(unsigned int), g.st));
+  int nbl = grid1(nA) < 1024 ? grid1(nA) : 1024;
+  k_absmax<<<nbl, 256, 0, g.st>>>(nA, g.At, g.amax);
+  CK(cudaGetLastError());
+  unsigned int ua = 0;
+  CK(cudaMemcpyAsync(&ua, g.amax, sizeof(ua), cudaMemcpyDeviceToHost, g.st));
+  CK(cudaStreamSynchronize(g.st));
+  float fa;
+  memcpy(&fa, &ua, sizeof(fa));
+  const double mA = fa;
+  if (!(mA > 0.0)) return 0;
+  if ((size_t)nen > g.mW_cap) {
+    free(g.mW);
+    g.mW = (double *)malloc((size_t)nen * sizeof(double));
+    if (!g.mW) return -1;
+    g.mW_cap = nen;
+  }
+  for (int ie = 0; ie < nen; ie++) {
+    double m = 0.;
+    const zc *w = W + (size_t)rows * ie;
+    for (int r = 0; r < rows; r++) m = fmax(m, fmax(fabs(cuCreal(w[r])), fabs(cuCimag(w[r]))));
+    g.mW[ie] = m;
+  }
+  int ex;
+  frexp(mA, &ex);
+  const double sY = ldexp(1.0, 13 - ex);
+  if (ensure(&g.Xh, &g.Xh_cap, (size_t)2 * NG * 6 * kc)) return -1;
+  if (ensure(&g.Yh, &g.Yh_cap, (size_t)NG * 6 * kc)) return -1;
+  if (ensure(&g.Tf, &g.Tf_cap, (size_t)2 * NG * NG)) return -1;
+  const float one = 1.f, zero = 0.f;
+  for (int r0 = 0; r0 < rows; r0 += kc) {
+    const int nr = rows - r0 < kc ? rows - r0 : kc;
+    const size_t nb = (size_t)NG * nr;
+    k_packY<<<grid1(nb), 256, 0, g.st>>>(nb, NG, nr, g.At, r0, sY, g.Yh);
+    for (int ie = 0; ie < nen; ie++) {
+      if (!(g.mW[ie] > 0.0)) continue;
+      frexp(2.0 * mA * g.mW[ie], &ex);
+      const double sX = ldexp(1.0, 13 - ex);
+      k_packX<<<grid1(nb), 256, 0, g.st>>>(nb, NG, nr, g.At, r0, g.W + (size_t)rows * ie, sX, g.Xh);
+      if (g.fp16_chunk <= 0) {
+        CB(cublasGemmEx(g.blas, CUBLAS_OP_N, CUBLAS_OP_T, 2 * NG, NG, 6 * nr, &one, g.Xh, CUDA_R_16F, 2 * NG, g.Yh,
+                        CUDA_R_16F, NG, &zero, g.Tf, CUDA_R_32F, 2 * NG, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+      } else {
+        // corrections: columns 2nr .. 6nr-1 = [Xt_h | Xt_l] [Yt_l | Yt_h]^T
+        CB(cublasGemmEx(g.blas, CUBLAS_OP_N, CUBLAS_OP_T, 2 * NG, NG, 4 * nr, &one, g.Xh + (size_t)2 * NG * 2 * nr,
+                        CUDA_R_16F, 2 * NG, g.Yh + (size_t)NG * 2 * nr, CUDA_R_16F, NG, &zero, g.Tf, CUDA_R_32F, 2 * NG,
+                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        // hi*hi: columns 0 .. 2nr-1 in chunks, each added with beta = 1 (round to nearest)
+        for (int k0 = 0; k0 < 2 * nr; k0 += g.fp16_chunk) {
+          const int kk = 2 * nr - k0 < g.fp16_chunk ? 2 * nr - k0 : g.fp16_chunk;
+          CB(cublasGemmEx(g.blas, CUBLAS_OP_N, CUBLAS_OP_T, 2 * NG, NG, kk, &one, g.Xh + (size_t)2 * NG * k0, CUDA_R_16F,
+                          2 * NG, g.Yh + (size_t)NG * k0, CUDA_R_16F, NG, &one, g.Tf, CUDA_R_32F, 2 * NG,
+                          CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        }
+      }
+      k_accmp<<<grid1((size_t)NG * NG), 256, 0, g.st>>>((size_t)NG * NG, NG, g.Tf, 1.0 / (sX * sY),
+                                                        g.chi + (size_t)NG * NG * ie);
+    }
+  }
+  CK(cudaGetLastError());
+  return 0;
+}
+
 // phase C: W(rows, nen) and (q=0) V(rows, 3) from the host; kc = rows per CGEMM block
 extern "C" int chi_gpu_gemm(const zc *W, const zc *V, int kc) {
   const int NG = g.NG, nen = g.nen, rows = g.rows;
   size_t nA = (size_t)NG * rows, nW = (size_t)rows * nen;
 #ifdef GPU_KC_MAX
-  if (kc > GPU_KC_MAX) kc = GPU_KC_MAX;   // HIP: shorter blocks for rocBLAS, see gpu_api.h
+  if (!g.gemm_mp && kc > GPU_KC_MAX) kc = GPU_KC_MAX;   // HIP CGEMM: shorter blocks for rocBLAS, see gpu_api.h
 #endif
   { const char *e = getenv("RESPACK_GPU_KC"); if (e && atoi(e) > 0) kc = atoi(e); }   // rows per CGEMM block (testing)
   if (kc < 1 || kc > rows) kc = rows;
-  if (ensure(&g.A4, &g.A4_cap, nA)) return -1;
   if (ensure(&g.W, &g.W_cap, nW)) return -1;
-  if (ensure(&g.W4, &g.W4_cap, nW)) return -1;
-  if (ensure(&g.Bt, &g.Bt_cap, (size_t)NG * kc)) return -1;
-  if (ensure(&g.T4, &g.T4_cap, (size_t)NG * NG)) return -1;
   CK(cudaMemcpyAsync(g.W, W, nW * sizeof(zc), cudaMemcpyHostToDevice, g.st));
-  k_d2f<<<grid1(nA), 256, 0, g.st>>>(nA, g.At, g.A4);
-  k_d2f<<<grid1(nW), 256, 0, g.st>>>(nW, g.W, g.W4);
-  CK(cudaGetLastError());
-  const cc one = make_cuComplex(1.f, 0.f), zero = make_cuComplex(0.f, 0.f);
-  for (int ie = 0; ie < nen; ie++) {
-    const cc *W4col = g.W4 + (size_t)rows * ie;
-    zc *chie = g.chi + (size_t)NG * NG * ie;
-    for (int r0 = 0; r0 < rows; r0 += kc) {
-      int nr = rows - r0 < kc ? rows - r0 : kc;
-      size_t nb = (size_t)NG * nr;
-      k_bt<<<grid1(nb), 256, 0, g.st>>>(nb, NG, g.A4, W4col, r0, g.Bt);
-      CB(cublasCgemm(g.blas, CUBLAS_OP_N, CUBLAS_OP_T, NG, NG, nr, &one, g.Bt, NG,
-                     g.A4 + (size_t)NG * r0, NG, &zero, g.T4, NG));
-      k_addf2d<<<grid1((size_t)NG * NG), 256, 0, g.st>>>((size_t)NG * NG, g.T4, chie);
+  if (g.gemm_mp) {
+    if (gemm_mp(W, kc)) return -1;
+  } else {
+    if (ensure(&g.A4, &g.A4_cap, nA)) return -1;
+    if (ensure(&g.W4, &g.W4_cap, nW)) return -1;
+    if (ensure(&g.Bt, &g.Bt_cap, (size_t)NG * kc)) return -1;
+    if (ensure(&g.T4, &g.T4_cap, (size_t)NG * NG)) return -1;
+    k_d2f<<<grid1(nA), 256, 0, g.st>>>(nA, g.At, g.A4);
+    k_d2f<<<grid1(nW), 256, 0, g.st>>>(nW, g.W, g.W4);
+    CK(cudaGetLastError());
+    const cc one = make_cuComplex(1.f, 0.f), zero = make_cuComplex(0.f, 0.f);
+    for (int ie = 0; ie < nen; ie++) {
+      const cc *W4col = g.W4 + (size_t)rows * ie;
+      zc *chie = g.chi + (size_t)NG * NG * ie;
+      for (int r0 = 0; r0 < rows; r0 += kc) {
+        int nr = rows - r0 < kc ? rows - r0 : kc;
+        size_t nb = (size_t)NG * nr;
+        k_bt<<<grid1(nb), 256, 0, g.st>>>(nb, NG, g.A4, W4col, r0, g.Bt);
+        CB(cublasCgemm(g.blas, CUBLAS_OP_N, CUBLAS_OP_T, NG, NG, nr, &one, g.Bt, NG,
+                       g.A4 + (size_t)NG * r0, NG, &zero, g.T4, NG));
+        k_addf2d<<<grid1((size_t)NG * NG), 256, 0, g.st>>>((size_t)NG * NG, g.T4, chie);
+      }
     }
   }
   CK(cudaGetLastError());

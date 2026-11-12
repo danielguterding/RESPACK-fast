@@ -209,6 +209,99 @@ U, U′, J agree to all printed digits.
 
 The test machine was also running another job on 16 cores, so the timings above are not a benchmark.
 
+### χ⁰ products on the matrix units: FP16 split (experimental, `RESPACK_GPU_GEMM=fp16`)
+
+**Motivation.** On the RX 9060 XT the CGEMM reaches only 5–6 TFLOP/s. RDNA4's matrix units (WMMA) do not
+support FP32, but they run FP16 or BF16 inputs with FP32 accumulation about 10× faster. A GEMM microbenchmark
+for the χ⁰ product T = Bt·Aᵀ (block length K; TFLOP/s of complex-equivalent work) gives:
+
+| RX 9060 XT, ROCm 7.2.1 | NG 583, K 512 | NG 2150, K 512 | NG 2150, K 2048 |
+|---|---|---|---|
+| CGEMM (default path) | 5.3 | 5.6 | 6.1 |
+| CGEMM, all ω in one strided-batched call | 5.5 | 6.0 | – |
+| real form as one SGEMM (`[Xr −Xi; Xi Xr]`) | 2.0 | 3.0 | 2.5 |
+| 3M (3 SGEMMs) | 2.0 | 3.9 | 4.1 |
+| FP16 inputs, FP32 accumulation, one pass | 15.4 | 49.6 | 68.3 |
+| BF16 inputs, FP32 accumulation, one pass | 14.3 | 46.1 | 57.3 |
+
+**Method.** One pass in FP16 is too inaccurate (11-bit mantissa), so each factor is split, x = x_hi + x_lo
+with x_hi = fp16(x) and x_lo = fp16(x − x_hi), about 22 bits together. The product is evaluated as
+hi·hi + hi·lo + lo·hi (lo·lo, of order 2⁻²², is dropped). All three terms of the real block form
+`[[Xr, −Xi], [Xi, Xr]]·[Yr, Yi]ᵀ` are computed in one `GemmEx` call with K′ = 6K, FP16 inputs and FP32
+accumulation. That is three times the work of one pass, so at large NG (≈ 2000) the expected gain over CGEMM is
+3–4×; at NG ≈ 600 there is little gain.
+
+FP16 covers only 6×10⁻⁵ to 65504. The pair densities and the weights are therefore scaled by exact powers of
+two before the split, so that their bounds lie below 2¹³. The pair densities use one factor per tile, the
+weights one per frequency. The factors are removed exactly in double precision when T is added to χ.
+Elements far below the largest lose relative precision in the FP16 lo part, but their contribution to χ is
+correspondingly small.
+
+**Accumulation inside the matrix units is biased.** A first version computed all three products in one call
+(K′ = 6K). Its ε⁻¹ deviation was 1.1×10⁻⁵ (SrVO₃) and 3.4×10⁻⁵ (Si), and it grew strictly in proportion to the
+block length. A microbenchmark (`accerr.cpp`) shows why. Its inputs are exactly representable in FP16, so all
+products are exact, and the reference is an exact double-precision sum. Errors are in units of the FP32
+rounding unit ε, relative to Σ|x·y|, for same-sign data:
+
+| method | rms, K = 512 | K = 2048 | K = 16384 | mean (bias), K = 16384 |
+|---|---|---|---|---|
+| CPU OpenBLAS SGEMM | 2.9 | 1.9 | 2.0 | 0.0 |
+| rocBLAS SGEMM / CGEMM (FP32) | 5.6 | 11.3 | 32 | ≈ 0 |
+| FP16 matrix units, one call | 5.2 | 37 | 360 | −360 |
+| FP16, K in chunks of 256, continued with β = 1 | 1.7 | 1.2 | 2.1 | −0.5 |
+| FP16, K in chunks of 64, continued with β = 1 | 0.9 | 1.5 | 4.0 | 0.0 |
+
+- **rocBLAS FP32 rounds to nearest.** There is no bias, and the error grows as √K.
+- **The matrix units truncate.** Inside one call they accumulate with a bias toward zero: the error equals
+  the bias and grows linearly with K, about one biased rounding per 16-term matrix operation.
+- **Effect on χ.** In χ, sums dominated by one sign, such as the diagonal χ(G,G), add this bias up over all
+  blocks.
+- **Sign-mixed data** shows small, unbiased errors for all methods.
+- **The output step `C = A·B + β·C` rounds to nearest.** K chunks continued with β = 1 therefore keep the bias
+  bounded.
+
+**Chunked accumulation (current implementation):**
+- The small corrections hi·lo + lo·hi (2¹¹ smaller) go into one call with β = 0.
+- hi·hi follows in K chunks of `RESPACK_GPU_FP16_CHUNK` columns (default 512; 0 = all three products in one
+  call), each continued with β = 1.
+- The FP32 result of a block is then added into the double-precision χ. The FP16 path keeps the
+  2048-row blocks; the 512-row cap applies only to rocBLAS's CGEMM.
+
+**Usage:** `RESPACK_GPU_GEMM=fp16` in the environment of `calc_chiqw` with `flg_gpu=1`. The input file is
+unchanged, and the CGEMM path stays the default. The code is shared by the CUDA and HIP builds
+(`cublasGemmEx` / `hipblasGemmEx`).
+
+**Results** (RX 9060 XT; ε⁻¹ against CPU double precision of the same build):
+
+| | SrVO₃ chain | Si chain | NG = 1963, one q: ε⁻¹ | χ⁰ products | total |
+|---|---|---|---|---|---|
+| CGEMM (default path) | 8.4×10⁻⁷ | 9.8×10⁻⁷ | 4.4×10⁻⁷ | 82.7 s | 139.4 s |
+| FP16, one call, 512-row blocks | 1.1×10⁻⁵ | 3.4×10⁻⁵ | 3.5×10⁻⁶ | 37.0 s | 93.8 s |
+| FP16, chunks of 1024 | 2.3×10⁻⁶ | – | 2.1×10⁻⁶ | 32.2 s | 90.1 s |
+| FP16, chunks of 512 (default) | 1.1×10⁻⁶ | 3.5×10⁻⁶ | 1.1×10⁻⁶ | 33.9 s | 92.0 s |
+| FP16, chunks of 256 | 5.5×10⁻⁷ | 1.8×10⁻⁶ | 7.2×10⁻⁷ | 36.7 s | 93.5 s |
+| CPU double precision, 9950X3D, 16 threads | – | – | – | 265.8 s | 326.8 s |
+
+The NG = 1963 case is SrVO₃ with `Ecut_for_eps` = 45 Ry, q #2, 805 pairs, 216 k, 70 ω and `fast_fft_sp=1`.
+Unless noted, the FP16 runs use 2048-row blocks. U(ω), J(ω) deviate by at most 2–4×10⁻⁵ eV with chunks
+(7×10⁻⁴ eV without chunks at 2048 rows). The static U agrees to all digits for SrVO₃; for Si it differs by 1 in
+the last printed digit.
+
+The remaining error is proportional to the chunk length (the truncation inside each chunk). With chunking it
+no longer depends on the block length: SrVO₃ gives 1.147×10⁻⁶ with 512-row and 1.148×10⁻⁶ with 2048-row
+blocks. At NG = 1963 the FP16 path is 2.4–2.6× faster than CGEMM in the χ⁰ products and 1.5× faster in
+total. The CPU part (ε inversion, writing ε⁻¹, setup) is about 55 s of the total.
+
+**Status:** under evaluation on the RX 9060 XT. Next steps: a kernel profile to separate the GEMM compute time
+from the overhead (packing, chunk outputs, accumulation into χ), and longer blocks.
+
+**To do: evaluate the FP16 tensor cores on the L40S** (CUDA build, same switch). Measure accuracy against CPU
+double precision and speed against the CGEMM path (≈ 31 TFLOP/s) at SrVO₃ size and at large NG. If accurate,
+the FP16 tensor-core rate should give at least a 2× gain there as well. NVIDIA tensor cores are reported to
+truncate in their internal accumulation too (Fasi, Higham, Mikaitis, Pranesh, PeerJ Comput. Sci. 7, e330
+(2021)). So first run `accerr.cpp` (CUDA port) on the L40S and choose the chunk length from it. Not yet
+compiled or run with CUDA.
+
 ### Validation (GPU vs CPU double precision; L40S, CUDA 13.0)
 
 | test | ε⁻¹ (all q) | U(ω), J(ω) | static U, U′, J |
@@ -251,7 +344,7 @@ N_pair ≈ 10⁵, N_k = 64, N_grid ≈ 3×10⁵, 70 ω) from the measured rates,
 
 | part | where | projected cost per q | assessment |
 |---|---|---|---|
-| χ⁰ products (CGEMM) | GPU | ≈ 9 min | done |
+| χ⁰ products (CGEMM) | GPU | ≈ 9 min | done; FP16 split on the matrix units under evaluation (RX 9060 XT), L40S to do |
 | pair-density FFTs (`fast_fft_sp=1`) | GPU | ≈ 3–5 min | done |
 | **wave-function rotation (`make_C0`) + uploads** | **CPU, serial with the GPU** | **≈ 2.5–4 min** | **next candidate** |
 | tetrahedron weights | CPU | ≈ 1 min (8 cores) | overlap with GPU work rather than port |
