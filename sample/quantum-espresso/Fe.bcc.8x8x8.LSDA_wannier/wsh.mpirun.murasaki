@@ -1,0 +1,67 @@
+#!/bin/bash
+#PBS -l nodes=1:ppn=28:GroupC 
+
+cd   $PBS_O_WORKDIR
+echo $PBS_O_WORKDIR
+echo $PBS_NODEFILE
+cat  $PBS_NODEFILE | sort | uniq > $PWD/ooo
+NPROCS=`wc -l < $PWD/ooo`
+echo $NPROCS
+cat $PWD/ooo
+echo $HOSTNAME
+echo =============================
+date
+echo =============================
+date                                > out.sub
+echo ============================= >> out.sub
+OMP_STACKSIZE=36g 
+OMP_NUM_THREADS=1 #28 #1 #8 #16 
+MKL_NUM_THREADS=1 #28 #1 #8 #16  
+export OMP_STACKSIZE 
+export OMP_NUM_THREADS
+export MKL_NUM_THREADS
+
+####
+#qe#
+####
+#qehome=/home/kazuma/qe/bin_6.8 
+#NPOOL=2 
+#
+#exe=pw.x ; prefix=scf
+#mpirun -genv I_MPI_FABRICS shm:tcp -bootstrap rsh -f $PWD/ooo -perhost 1 -np 28 ${qehome}/${exe} -nk $NPOOL < ${prefix}.in > ${prefix}.out
+#rm -rf ./tmp/band ; cp -r ./tmp/scf ./tmp/band && sleep 1
+#exe=pw.x; prefix=band
+#mpirun -genv I_MPI_FABRICS shm:tcp -bootstrap rsh -f $PWD/ooo -perhost 1 -np 28 ${qehome}/${exe} -nk $NPOOL < ${prefix}.in > ${prefix}.out
+#rm bandplot.in 
+#ln -s Fe.bands.up.in bandplot.in 
+#exe=bands.x; prefix=bandplot
+#mpirun -genv I_MPI_FABRICS shm:tcp -bootstrap rsh -f $PWD/ooo -perhost 1 -np 1 ${qehome}/${exe} < ${prefix}.in > ${prefix}.up.out
+#mv Fe.band.gnu Fe.band.gnu.up
+#rm bandplot.in 
+#ln -s Fe.bands.dn.in bandplot.in 
+#exe=bands.x; prefix=bandplot
+#mpirun -genv I_MPI_FABRICS shm:tcp -bootstrap rsh -f $PWD/ooo -perhost 1 -np 1 ${qehome}/${exe} < ${prefix}.in > ${prefix}.dn.out
+#mv Fe.band.gnu Fe.band.gnu.dn 
+
+############
+#qe2respack#
+############
+#rehome=/home/kazuma/RESPACK-20240126/build/bin 
+#python ${rehome}/qe2respack.py ./tmp/scf/Fe.save 
+
+#########
+#respack#
+#########
+#rehome=/home/kazuma/RESPACK-20240126/build/bin 
+#rm input.in 
+#ln -s input.in.up input.in 
+#mpirun -genv I_MPI_FABRICS shm:tcp -bootstrap rsh -f $PWD/ooo -perhost 1 -np 1 ${rehome}/calc_wannier < input.in > LOG.WAN.up
+#rm input.in 
+#ln -s input.in.dn input.in 
+#mpirun -genv I_MPI_FABRICS shm:tcp -bootstrap rsh -f $PWD/ooo -perhost 1 -np 1 ${rehome}/calc_wannier < input.in > LOG.WAN.dn 
+
+echo ============================= >> out.sub
+date                               >> out.sub
+echo =============================
+date
+echo =============================

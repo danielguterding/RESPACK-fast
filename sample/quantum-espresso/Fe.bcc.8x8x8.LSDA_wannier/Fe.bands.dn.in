@@ -1,0 +1,6 @@
+&bands
+   outdir='./tmp/band/'
+   prefix='Fe',
+   filband='Fe.band',
+   spin_component=2, !1 or 2
+/

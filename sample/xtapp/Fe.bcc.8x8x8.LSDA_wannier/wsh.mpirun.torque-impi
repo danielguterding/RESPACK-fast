@@ -1,0 +1,68 @@
+#!/bin/bash
+#PBS -l nodes=1:ppn=28:GroupC 
+
+cd   $PBS_O_WORKDIR
+echo $PBS_O_WORKDIR
+echo $PBS_NODEFILE
+cat  $PBS_NODEFILE | sort | uniq > $PWD/ooo
+NPROCS=`wc -l < $PWD/ooo`
+echo $NPROCS
+cat $PWD/ooo
+echo $HOSTNAME
+echo =============================
+date
+echo =============================
+date                                > out.sub
+echo ============================= >> out.sub
+OMP_STACKSIZE=36g 
+OMP_NUM_THREADS=28
+MKL_NUM_THREADS=28 
+export OMP_STACKSIZE 
+export OMP_NUM_THREADS
+export MKL_NUM_THREADS
+
+#######
+#xtapp# 
+#######
+#xtapphome=/home/kazuma/xTAPP_180420/bin 
+#rm fort.10
+#ln -s Fe.cg fort.10
+#mpirun -genv I_MPI_FABRICS shm:tcp -bootstrap rsh -f $PWD/ooo -perhost 1 -np 1 ${xtapphome}/inipot > LOG.INIPOT 
+#mpirun -genv I_MPI_FABRICS shm:tcp -bootstrap rsh -f $PWD/ooo -perhost 1 -np 4 ${xtapphome}/cgmrpt > LOG.CGMRPT 
+
+###############
+#xtapp2respack# 
+###############
+#rehome=/home/kazuma/RESPACK-20240126/build/bin 
+#${rehome}/xtapp2respack.sh -b ${rehome}/wfn2respack -s ${rehome}/strconv Fe 
+
+#######
+#xtapp# 
+#######
+#rm fort.10
+#ln -s Fe.vb fort.10
+#mpirun -genv I_MPI_FABRICS shm:tcp -bootstrap rsh -f $PWD/ooo -perhost 1 -np 1 ${xtapphome}/inipot > LOG.INIPOT.VBPEF
+#mpirun -genv I_MPI_FABRICS shm:tcp -bootstrap rsh -f $PWD/ooo -perhost 1 -np 4 ${xtapphome}/vbpef > LOG.VBPEF 
+#${xtapphome}/vbpef2gp-lsda Fe.band 
+
+#########
+#respack#
+#########
+#rehome=/home/kazuma/RESPACK-20240126/build/bin 
+#ln -s input.in.up input.in 
+#mpirun -genv I_MPI_FABRICS shm:tcp -bootstrap rsh -f $PWD/ooo -perhost 1 -np 1 ${rehome}/calc_wannier < input.in > LOG.WAN.up
+#rm input.in 
+#ln -s input.in.dn input.in 
+#mpirun -genv I_MPI_FABRICS shm:tcp -bootstrap rsh -f $PWD/ooo -perhost 1 -np 1 ${rehome}/calc_wannier < input.in > LOG.WAN.dn 
+#rm input.in 
+
+echo ============================= >> out.sub
+date                               >> out.sub
+echo =============================
+
+echo ============================= >> out.sub
+date                               >> out.sub
+echo =============================
+date
+echo =============================
+

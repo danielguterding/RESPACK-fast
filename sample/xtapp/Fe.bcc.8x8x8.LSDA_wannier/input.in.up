@@ -1,0 +1,29 @@
+&param_wannier 
+N_wannier=5, !Total number of considerd band in wannier calc 
+SET_INNER_WINDOW=F,
+UPPER_INNER_WINDOW=11.000000000000000E+000,
+LOWER_INNER_WINDOW=10.000000000000000E+000,
+Lower_energy_window=4.0d0, !4.0d0(dn),  4.0d0(up), ! 7.0d0(para),!LOWER BOUND OF ENERGY WINDOW (eV)
+Upper_energy_window=14.0d0,!17.0d0(dn), 14.0d0(up),!17.0d0(para),!UPPER BOUND OF ENERGY WINDOW (eV)      
+N_initial_guess=5,         !TOTAL NUMBER OF INITIAL GUESS GAUSSIAN       
+flg_spin_polarization=1,   !2(dn), 1(up), 0(para) 
+/
+dxy 0.5d0  0.00d0  0.00d0  0.00d0  
+dyz 0.5d0  0.00d0  0.00d0  0.00d0  
+dz2 0.5d0  0.00d0  0.00d0  0.00d0  
+dzx 0.5d0  0.00d0  0.00d0  0.00d0  
+dx2 0.5d0  0.00d0  0.00d0  0.00d0  
+
+&param_interpolation   
+N_sym_points=6,!The total number of symmetry points 
+/        
+0.00d0  0.00d0  0.00d0 !G
+0.50d0 -0.50d0  0.50d0 !H
+0.00d0  0.00d0  0.50d0 !N 
+0.25d0  0.25d0  0.25d0 !P 
+0.00d0  0.00d0  0.00d0 !G 
+0.00d0  0.00d0  0.50d0 !N 
+
+&param_visualization   
+/
+

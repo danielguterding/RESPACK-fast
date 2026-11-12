@@ -1,0 +1,51 @@
+ &control
+    calculation='bands'
+    prefix='Fe'
+    tstress = .true.
+    tprnfor = .true.
+    disk_io='low', 
+    pseudo_dir = './PP/' 
+    outdir = './tmp/band/' 
+ /
+ &system
+    ibrav=0,
+    nat= 1,
+    ntyp= 1,
+    celldm(1) = 1.88972612545782819321,
+    ecutwfc=106,
+    ecutrho=424, 
+    occupations='smearing',
+    smearing = 'mp',
+    degauss=0.02, 
+    nbnd=20
+    nspin = 2,
+    starting_magnetization(1) = 1.0, 
+    !noncolin = .true.
+    !lspinorb = .true.
+ /
+ &electrons
+    diagonalization = 'cg',
+    conv_thr =  1.0d-11
+    mixing_beta = 0.30,
+    electron_maxstep = 200
+ /
+
+ATOMIC_SPECIES
+Fe  55.845  Fe_ONCV_PBE-1.0.upf
+
+K_POINTS {crystal_b}
+ 6 
+0.00d0  0.00d0  0.00d0 20 !G
+0.50d0 -0.50d0  0.50d0 20 !H
+0.00d0  0.00d0  0.50d0 20 !N 
+0.25d0  0.25d0  0.25d0 20 !P 
+0.00d0  0.00d0  0.00d0 20 !G 
+0.00d0  0.00d0  0.50d0 20 !N 
+
+CELL_PARAMETERS alat
+  -1.419088759   1.419088759   1.419088759
+   1.419088759  -1.419088759   1.419088759
+   1.419088759   1.419088759  -1.419088759
+
+ATOMIC_POSITIONS (crystal)
+Fe     0.000000000         0.000000000         0.000000000
