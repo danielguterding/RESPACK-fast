@@ -1573,17 +1573,21 @@
      +   '#1:q+G [au], 2:Re(eps-1), 3:Im(eps-1)'
         enddo!ie 
         !--
+! fork: the frequencies in parallel (OpenMP), each inverted with
+! single-threaded LAPACK as before. chiqw is not needed afterwards and
+! is used in place (calc_eps_rpa doubles it); eps goes to epsqw.
+!$OMP PARALLEL DO DEFAULT(SHARED) SCHEDULE(DYNAMIC,1)
+!$OMP&            PRIVATE(ie,file_num_chi_ie,file_num_eps_ie)
         do ie=1,nen 
          file_num_chi_ie=0!file_num_chi_base+ie-1
          file_num_eps_ie=file_num_eps_base+ie!-1 
-         chi0(:,:)=chiqw(:,:,ie)
          call calc_eps_rpa(NTG,NG_for_eps,LG0(1,1,iq),
      +                     q1,q2,q3,b1(1),b2(1),b3(1),
-     +                     chi0(1,1),tpi,eps_rpa(1,1), 
+     +                     chiqw(1,1,ie),tpi,epsqw(1,1,ie), 
      +                     file_num_chi_ie,file_num_eps_ie)  
-         epsqw(:,:,ie)=eps_rpa(:,:)
          close(file_num_eps_ie)
         enddo!ie 
+!$OMP END PARALLEL DO
 !--
 !chiqw 
 !       write(file_num_chi)(((chiqw(ig,jg,ie),ig=1,NG_for_eps)
@@ -2110,21 +2114,25 @@
         enddo!ie 
        enddo!ix
        !--
+! fork: the 3 x nen inversions in parallel (OpenMP), single-threaded
+! LAPACK each; chiqwgm is used in place, eps goes to epsqwgm.
+!$OMP PARALLEL DO DEFAULT(SHARED) SCHEDULE(DYNAMIC,1) COLLAPSE(2)
+!$OMP&            PRIVATE(ix,ie,file_num_chi_ie,file_num_eps_ie)
        do ix=1,3
-        file_num_eps_base=file_num_eps_base_start+(ix-1)*1000   
         do ie=1,nen 
          file_num_chi_ie=0 
-         file_num_eps_ie=file_num_eps_base+ie!-1 
-         chi0(:,:)=chiqwgm(:,:,ie,ix)
+         file_num_eps_ie=file_num_eps_base_start+(ix-1)*1000+ie
          call calc_eps_rpa_q_0(NTG,NG_for_eps,LG0(1,1,iq),
      +                     q1,q2,q3,b1(1),b2(1),b3(1),
-     +                     chi0(1,1),tpi,No_G_0,eps_rpa(1,1),
+     +                     chiqwgm(1,1,ie,ix),tpi,No_G_0,
+     +                     epsqwgm(1,1,ie,ix),
      +                     wd(ix),delt,em(ie),     
      +                     file_num_chi_ie,file_num_eps_ie)  
-         epsqwgm(:,:,ie,ix)=eps_rpa(:,:)
          close(file_num_eps_ie)
         enddo!ie
        enddo!ix 
+!$OMP END PARALLEL DO
+       file_num_eps_base=file_num_eps_base_start+2*1000
 !--
 !chiqw 
 !      write(file_num_chi)(((chiqw(ig,jg,ie),ig=1,NG_for_eps)
