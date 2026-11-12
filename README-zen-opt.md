@@ -54,6 +54,17 @@ CPUs and is the precision model for a GPU port.
 
 These deviations are about 200× smaller than the method's own rounding noise.
 
+`fast_fft_sp` (default 0): if 1, the pair densities are computed with single-precision FFTs (`fftwf`)
+and stored in double precision. The q = 0 k·p terms stay in double precision. This needs `libfftw3f`.
+
+| test (with `fast_gemm_sp=1`) | ε⁻¹ vs double precision | U(ω), J(ω) | static U, U′, J |
+|---|---|---|---|
+| SrVO₃ cRPA | 1.8×10⁻⁶ relative | ≤ 2×10⁻⁵ eV | identical |
+| Si cRPA | 2.8×10⁻⁷ relative | ≤ 1×10⁻⁵ eV | identical |
+
+On a CPU this gives about 1.3× for the pair densities on small grids that fit in cache. The large gain
+is on GPUs.
+
 `fast_mem_mb` (default 4096) is the memory budget for one tile of pair densities and weights. A larger
 budget means larger tiles and fewer backward FFTs.
 
