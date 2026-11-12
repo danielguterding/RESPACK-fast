@@ -261,6 +261,49 @@
       RETURN  
       END 
 !--
+      subroutine make_C0_map(NTG,itrs,NG,KGtmp,RWtmp,rginvtmp,pgtmp,
+     +           nnp,L1,L2,L3,packtmp,jgmap,pfmap) 
+! fork: index map and phase factors of make_C0 for one k point and
+! symmetry operation. They do not depend on the band, so the fast path
+! computes them once per k point; make_C0 = OCC(jgmap)*pfmap (conjugated
+! for itrs=-1). Same arithmetic as make_C0, so the results are identical.
+      implicit none 
+      integer::NTG,L1,L2,L3,nnp  
+      integer::itrs 
+      integer::NG
+      integer::KGtmp(3,NTG) 
+      integer::RWtmp(3) 
+      real(8)::rginvtmp(3,3) 
+      integer::pgtmp(3) 
+      integer::packtmp(-L1:L1,-L2:L2,-L3:L3) 
+      integer::jgmap(NTG) 
+      complex(8)::pfmap(NTG) 
+      integer::ig,i1,i2,i3,j1,j2,j3,k1,k2,k3,isg 
+      real(8)::phase 
+      real(8),parameter::pi=dacos(-1.0d0)
+      real(8),parameter::tpi=2.0d0*pi 
+      complex(8),parameter::ci=(0.0D0,1.0D0) 
+!--
+      isg=1 
+      if(itrs==-1) isg=-1 
+      do ig=1,NG 
+       i1=isg*KGtmp(1,ig); j1=isg*KGtmp(2,ig); k1=isg*KGtmp(3,ig) 
+       i2=i1+RWtmp(1); j2=j1+RWtmp(2); k2=k1+RWtmp(3) 
+       i3=int(rginvtmp(1,1))*i2+int(rginvtmp(1,2))*j2 
+     +   +int(rginvtmp(1,3))*k2 
+       j3=int(rginvtmp(2,1))*i2+int(rginvtmp(2,2))*j2 
+     +   +int(rginvtmp(2,3))*k2 
+       k3=int(rginvtmp(3,1))*i2+int(rginvtmp(3,2))*j2 
+     +   +int(rginvtmp(3,3))*k2 
+       jgmap(ig)=packtmp(i3,j3,k3) 
+       phase=tpi*(dble(i1)*dble(pgtmp(1))
+     +           +dble(j1)*dble(pgtmp(2))
+     +           +dble(k1)*dble(pgtmp(3))) 
+       pfmap(ig)=exp(-ci*phase/dble(nnp)) 
+      enddo!ig 
+      return 
+      end 
+!---
       subroutine make_C0(NTG,itrs,NG,KGtmp,RWtmp,rginvtmp,pgtmp,
      +           nnp,L1,L2,L3,packtmp,OCCtmp,C0_K) 
       implicit none 
