@@ -26,7 +26,7 @@
 module m_chi_fast
   use, intrinsic :: iso_c_binding
   use omp_lib
-  use m_tetrahedron, only: ttrhdrn_chi0
+  use m_tetrahedron_fast, only: ttrhdrn_chi0_pm
   implicit none
   include 'fftw3.f03'
   private
@@ -333,7 +333,7 @@ contains
     end subroutine phase_a
 
     !------------------------------------------------------------------------------------------
-    ! phase B: tetrahedron weights x_pk(w), times cRPA factor and 1/NTK -> W(ik+NTK*(p-1), w)
+    ! phase B: tetrahedron weights x_pk(w) (same formulas, log ratios via vectorised log/atan2), times cRPA factor and 1/NTK -> W(ik+NTK*(p-1), w)
     subroutine phase_b()
       !$omp parallel default(shared)
       block
@@ -349,11 +349,10 @@ contains
             e1(k3d(ik)) = cmplx(E_OCC(jb, numirr(ik)), 0d0, 8)
             e2(k3d(ik)) = cmplx(E_VIR(ib, numirr(kpq(ik))), 0d0, 8)
           end do
+          ! both signs (dsgn=+1,-1) in one pass, vectorised log ratios (m_tetrahedron_fast)
           xow = zzero
           ca1 = zzero
-          call ttrhdrn_chi0(dmna, dmnr, nkb1, nkb2, nkb3, imt1, e1, e2, Ef, Ef, delt, 1d0, nen, em, ca1, xow)
-          ca1 = zzero
-          call ttrhdrn_chi0(dmna, dmnr, nkb1, nkb2, nkb3, imt1, e1, e2, Ef, Ef, delt, -1d0, nen, em, ca1, xow)
+          call ttrhdrn_chi0_pm(dmna, dmnr, nkb1, nkb2, nkb3, imt1, e1, e2, Ef, Ef, delt, nen, em, ca1, xow)
           do ik = 1, NTK
             ikq = kpq(ik)
             row = ik + NTK*(lp - 1)
