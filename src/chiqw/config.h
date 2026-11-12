@@ -154,6 +154,7 @@
       integer::irot!,rcnt,scnt,rotrank
       integer::ncomp 
       real(8)::start_time,end_time,diff_time 
+      real(8)::tfk(0:5)!fork: phase timers of one q point
 !split comm
       integer::comm,myrank,nproc,dest,source
       integer::id_sub
