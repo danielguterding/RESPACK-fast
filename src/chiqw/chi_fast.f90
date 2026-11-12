@@ -569,10 +569,12 @@ contains
     !------------------------------------------------------------------------------------------
     ! GPU phase A: wave-function rotation on the CPU, grid/FFT/pair-density work on the GPU
     subroutine phase_a_gpu()
-      complex(8), allocatable :: cJ(:, :), cI(:, :)
+      complex(8), allocatable :: cJ(:, :), cI(:, :), pmapJ(:), pmapI(:)
       integer(c_int), allocatable :: idxJ(:), idxI(:), pj0(:), pi0(:)
+      integer, allocatable :: jmapJ(:), jmapI(:)
       integer :: ik, ikq, ikir, iop, ikirq, iopq, jl, il, ig, lp
       allocate(cJ(NTG, ntj), cI(NTG, nti), idxJ(NTG), idxI(NTG), pj0(np), pi0(np))
+      allocate(pmapJ(NTG), pmapI(NTG), jmapJ(NTG), jmapI(NTG))
       pj0 = pjl(1:np) - 1
       pi0 = pil(1:np) - 1
       rcg = chi_gpu_tile_begin(rows, ntj + nti, np, pj0, pi0)
@@ -581,16 +583,19 @@ contains
         ikq = kpq(ik)
         ikir = numirr(ik); iop = numrot(ik)
         ikirq = numirr(ikq); iopq = numrot(ikq)
-        !$omp parallel do schedule(dynamic,1)
+        ! rotation maps and phase factors once per k point, then per band only gather and multiply
+        call make_C0_map(NTG, trs(ik), NG0(ik), KG0(1, 1, ik), RW(1, ik), rginv(1, 1, iop), pg(1, iop), &
+             nnp, L1, L2, L3, packing(-L1, -L2, -L3, ikir), jmapJ, pmapJ)
+        call make_C0_map(NTG, trs(ikq), NG0(ikq), KG0(1, 1, ikq), RW(1, ikq), rginv(1, 1, iopq), pg(1, iopq), &
+             nnp, L1, L2, L3, packing(-L1, -L2, -L3, ikirq), jmapI, pmapI)
+        !$omp parallel do schedule(static)
         do jl = 1, ntj
-          call make_C0(NTG, trs(ik), NG0(ik), KG0(1, 1, ik), RW(1, ik), rginv(1, 1, iop), pg(1, iop), &
-               nnp, L1, L2, L3, packing(-L1, -L2, -L3, ikir), OCC(1, tj(jl), ikir), cJ(1, jl))
+          call c0_apply(NG0(ik), trs(ik), jmapJ, pmapJ, OCC(1, tj(jl), ikir), cJ(1, jl))
         end do
         !$omp end parallel do
-        !$omp parallel do schedule(dynamic,1)
+        !$omp parallel do schedule(static)
         do il = 1, nti
-          call make_C0(NTG, trs(ikq), NG0(ikq), KG0(1, 1, ikq), RW(1, ikq), rginv(1, 1, iopq), pg(1, iopq), &
-               nnp, L1, L2, L3, packing(-L1, -L2, -L3, ikirq), VIR(1, ti(il), ikirq), cI(1, il))
+          call c0_apply(NG0(ikq), trs(ikq), jmapI, pmapI, VIR(1, ti(il), ikirq), cI(1, il))
         end do
         !$omp end parallel do
         do ig = 1, NG0(ik)
@@ -634,7 +639,7 @@ contains
         rcg = chi_gpu_pairs(ik - 1, NTK, 0, ntj, scl)
         call gpu_check(rcg, 'chi_gpu_pairs')
       end do
-      deallocate(cJ, cI, idxJ, idxI, pj0, pi0)
+      deallocate(cJ, cI, idxJ, idxI, pj0, pi0, pmapJ, pmapI, jmapJ, jmapI)
     end subroutine phase_a_gpu
 
     !------------------------------------------------------------------------------------------
