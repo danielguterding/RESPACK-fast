@@ -36,6 +36,7 @@ option(RESPACK_NATIVE "Optimise for the build machine (-march=native / -xHost)" 
 set(RESPACK_ARCH "" CACHE STRING "Target CPU for -march/-mtune with GNU compilers (e.g. znver3); empty: compiler default")
 option(RESPACK_LTO "Link-time (interprocedural) optimisation" OFF)
 option(RESPACK_BUILD_XTAPP "Build the xTAPP converters (strconv, wfn2respack)" ON)
+option(RESPACK_CUDA "Build the CUDA path of calc_chiqw (flg_gpu=1; needs CUDA toolkit with cuBLAS/cuFFT)" OFF)
 
 #-----------------------------------------------------------------------------------------------------
 # Dependencies
@@ -46,6 +47,15 @@ find_package(OpenMP REQUIRED COMPONENTS Fortran)
 find_package(MPI REQUIRED COMPONENTS Fortran)
 find_package(LAPACK REQUIRED)
 find_package(FFTW3 REQUIRED)
+if(RESPACK_CUDA)
+  # default: all major GPU architectures (portable); e.g. -DCMAKE_CUDA_ARCHITECTURES=89 for L40S only
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES all-major)
+  endif()
+  enable_language(CUDA)
+  find_package(CUDAToolkit REQUIRED)
+  message(STATUS "CUDA: ${CMAKE_CUDA_COMPILER_VERSION}, architectures ${CMAKE_CUDA_ARCHITECTURES}")
+endif()
 
 #-----------------------------------------------------------------------------------------------------
 # Common compile settings for all RESPACK targets

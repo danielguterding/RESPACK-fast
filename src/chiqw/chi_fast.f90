@@ -47,16 +47,58 @@ module m_chi_fast
   real(8), save :: mem_budget_mb = 4096d0
   logical, save :: verbose = .false.
   logical, save :: gemm_sp = .false.   ! fast_gemm_sp=1: single-precision CGEMM blocks, double-precision accumulation
+  logical, save :: use_gpu = .false.   ! flg_gpu=1: CUDA path (chi_gpu.cu)
+
+  interface
+    integer(c_int) function chi_gpu_available() bind(C, name='chi_gpu_available')
+      import :: c_int
+    end function chi_gpu_available
+    integer(c_int) function chi_gpu_init(n1, n2, n3, fbatch, verbose) bind(C, name='chi_gpu_init')
+      import :: c_int
+      integer(c_int), value :: n1, n2, n3, fbatch, verbose
+    end function chi_gpu_init
+    integer(c_int) function chi_gpu_q_begin(NG, nen, lq0, ext) bind(C, name='chi_gpu_q_begin')
+      import :: c_int
+      integer(c_int), value :: NG, nen, lq0
+      integer(c_int), intent(in) :: ext(*)
+    end function chi_gpu_q_begin
+    integer(c_int) function chi_gpu_tile_begin(rows, nu, np, pj, pi) bind(C, name='chi_gpu_tile_begin')
+      import :: c_int
+      integer(c_int), value :: rows, nu, np
+      integer(c_int), intent(in) :: pj(*), pi(*)
+    end function chi_gpu_tile_begin
+    integer(c_int) function chi_gpu_bands(nb, ldc, coef, ncoef, idx, ubase) bind(C, name='chi_gpu_bands')
+      import :: c_int, c_double_complex
+      integer(c_int), value :: nb, ldc, ncoef, ubase
+      complex(c_double_complex), intent(in) :: coef(*)
+      integer(c_int), intent(in) :: idx(*)
+    end function chi_gpu_bands
+    integer(c_int) function chi_gpu_pairs(ik0, NTK, ubJ, ubI, scl) bind(C, name='chi_gpu_pairs')
+      import :: c_int, c_double
+      integer(c_int), value :: ik0, NTK, ubJ, ubI
+      real(c_double), value :: scl
+    end function chi_gpu_pairs
+    integer(c_int) function chi_gpu_gemm(W, V, kc) bind(C, name='chi_gpu_gemm')
+      import :: c_int, c_double_complex
+      complex(c_double_complex), intent(in) :: W(*), V(*)
+      integer(c_int), value :: kc
+    end function chi_gpu_gemm
+    integer(c_int) function chi_gpu_q_end(chi, Y, Z) bind(C, name='chi_gpu_q_end')
+      import :: c_int, c_double_complex
+      complex(c_double_complex) :: chi(*), Y(*), Z(*)
+    end function chi_gpu_q_end
+  end interface
 
   complex(8), parameter :: zone = (1d0, 0d0), zzero = (0d0, 0d0), zimag = (0d0, 1d0)
 
 contains
 
   !---------------------------------------------------------------------------------------------
-  subroutine chi_fast_init(nx, ny, nz, mem_mb, lverbose, lgemm_sp)
+  subroutine chi_fast_init(nx, ny, nz, mem_mb, lverbose, lgemm_sp, lgpu)
     integer, intent(in) :: nx, ny, nz
     real(8), intent(in) :: mem_mb
-    logical, intent(in) :: lverbose, lgemm_sp
+    logical, intent(in) :: lverbose, lgemm_sp, lgpu
+    integer(c_int) :: rc
     type(c_ptr) :: p
     complex(c_double_complex), pointer :: buf(:)
 
@@ -77,6 +119,17 @@ contains
     end if
     if (verbose) write(6,'(a,3i5,a,f10.1,a,l2)') ' chi_fast: FFTW grid ', n1, n2, n3, ' ; memory budget (MB) ', &
          mem_budget_mb, ' ; single-precision GEMM:', gemm_sp
+    use_gpu = lgpu
+    if (use_gpu) then
+      if (chi_gpu_available() /= 1) then
+        write(6,*) 'flg_gpu=1, but calc_chiqw was built without CUDA (cmake -DRESPACK_CUDA=ON)'; stop
+      end if
+      rc = chi_gpu_init(nx, ny, nz, 16, merge(1, 0, lverbose))
+      if (rc /= 0) then
+        write(6,*) 'chi_gpu_init failed, code ', rc; stop
+      end if
+      if (verbose) write(6,'(a)') ' chi_fast: GPU path (pair densities and chi0 on the GPU, single-precision GEMM blocks)'
+    end if
   end subroutine chi_fast_init
 
   !---------------------------------------------------------------------------------------------
@@ -127,6 +180,9 @@ contains
     integer(8) :: npmax
     complex(8), allocatable :: A(:, :), W(:, :), V(:, :)
     complex(4), allocatable :: A4(:, :)
+    complex(8), allocatable :: chiT(:, :, :), Yh(:, :, :), Zh(:, :, :), Dacc(:, :)
+    integer, allocatable :: ext0(:)
+    integer(c_int) :: rcg
     integer, allocatable :: tj(:), ti(:), pjl(:), pil(:)
     integer :: ntj, nti
     real(8) :: t0, tA, tB, tC
@@ -218,6 +274,16 @@ contains
 
     tA = 0d0; tB = 0d0; tC = 0d0
     allocate(tj(bj), ti(bi))
+    if (use_gpu) then
+      allocate(ext0(NGeps))
+      ext0 = ext - 1
+      rcg = chi_gpu_q_begin(NGeps, nen, merge(1, 0, lq0), ext0)
+      call gpu_check(rcg, 'chi_gpu_q_begin')
+      if (lq0) then
+        allocate(Dacc(nen, 3))
+        Dacc = zzero
+      end if
+    end if
     do it = 1, ntile
       np = tcount(it)
       if (np == 0) cycle
@@ -237,7 +303,11 @@ contains
         end do
       end block
 
-      allocate(A(rows, NGeps), W(rows, nen))
+      if (use_gpu) then
+        allocate(A(1, 1), W(rows, nen))         ! pair densities live on the GPU
+      else
+        allocate(A(rows, NGeps), W(rows, nen))
+      end if
       if (lq0) then
         allocate(V(rows, 3))
       else
@@ -245,17 +315,54 @@ contains
       end if
 
       t0 = omp_get_wtime()
-      call phase_a()
+      if (use_gpu) then
+        call phase_a_gpu()
+      else
+        call phase_a()
+      end if
       tA = tA + omp_get_wtime() - t0
       t0 = omp_get_wtime()
       call phase_b()
       tB = tB + omp_get_wtime() - t0
       t0 = omp_get_wtime()
-      call phase_c()
+      if (use_gpu) then
+        call phase_c_gpu()
+      else
+        call phase_c()
+      end if
       tC = tC + omp_get_wtime() - t0
 
       deallocate(A, W, V, pjl, pil)
     end do
+    if (use_gpu) then
+      if (lq0) then
+        allocate(chiT(NGeps, NGeps, nen), Yh(NGeps, 3, nen), Zh(NGeps, 3, nen))
+        rcg = chi_gpu_q_end(chiT, Yh, Zh)
+        call gpu_check(rcg, 'chi_gpu_q_end')
+        ! same assembly as the CPU path, with chi, y, z, d summed over all tiles
+        block
+          integer :: ie, ix, G0
+          G0 = No_G_0
+          do ie = 1, nen
+            do ix = 1, 3
+              pchigm(:, :, ie, ix) = pchigm(:, :, ie, ix) + chiT(:, :, ie)
+              pchigm(:, G0, ie, ix) = pchigm(:, G0, ie, ix) + Yh(:, ix, ie) - chiT(:, G0, ie)
+              pchigm(G0, :, ie, ix) = pchigm(G0, :, ie, ix) + Zh(:, ix, ie) - chiT(G0, :, ie)
+              pchigm(G0, G0, ie, ix) = pchigm(G0, G0, ie, ix) + Dacc(ie, ix) - Yh(G0, ix, ie) - Zh(G0, ix, ie) &
+                   + chiT(G0, G0, ie)
+            end do
+          end do
+        end block
+        deallocate(chiT, Yh, Zh, Dacc)
+      else
+        block
+          complex(8) :: dmy(1)
+          rcg = chi_gpu_q_end(pchi, dmy, dmy)
+        end block
+        call gpu_check(rcg, 'chi_gpu_q_end')
+      end if
+      deallocate(ext0)
+    end if
     if (verbose) write(6,'(a,3f10.2)') ' chi_fast: time (s) pair densities / tetrahedron / zgemm ', tA, tB, tC
 
   contains
@@ -345,6 +452,105 @@ contains
       end block
       !$omp end parallel
     end subroutine phase_a
+
+    !------------------------------------------------------------------------------------------
+    ! GPU phase A: wave-function rotation on the CPU, grid/FFT/pair-density work on the GPU
+    subroutine phase_a_gpu()
+      complex(8), allocatable :: cJ(:, :), cI(:, :)
+      integer(c_int), allocatable :: idxJ(:), idxI(:), pj0(:), pi0(:)
+      integer :: ik, ikq, ikir, iop, ikirq, iopq, jl, il, ig, lp
+      allocate(cJ(NTG, ntj), cI(NTG, nti), idxJ(NTG), idxI(NTG), pj0(np), pi0(np))
+      pj0 = pjl(1:np) - 1
+      pi0 = pil(1:np) - 1
+      rcg = chi_gpu_tile_begin(rows, ntj + nti, np, pj0, pi0)
+      call gpu_check(rcg, 'chi_gpu_tile_begin')
+      do ik = 1, NTK
+        ikq = kpq(ik)
+        ikir = numirr(ik); iop = numrot(ik)
+        ikirq = numirr(ikq); iopq = numrot(ikq)
+        !$omp parallel do schedule(dynamic,1)
+        do jl = 1, ntj
+          call make_C0(NTG, trs(ik), NG0(ik), KG0(1, 1, ik), RW(1, ik), rginv(1, 1, iop), pg(1, iop), &
+               nnp, L1, L2, L3, packing(-L1, -L2, -L3, ikir), OCC(1, tj(jl), ikir), cJ(1, jl))
+        end do
+        !$omp end parallel do
+        !$omp parallel do schedule(dynamic,1)
+        do il = 1, nti
+          call make_C0(NTG, trs(ikq), NG0(ikq), KG0(1, 1, ikq), RW(1, ikq), rginv(1, 1, iopq), pg(1, iopq), &
+               nnp, L1, L2, L3, packing(-L1, -L2, -L3, ikirq), VIR(1, ti(il), ikirq), cI(1, il))
+        end do
+        !$omp end parallel do
+        do ig = 1, NG0(ik)
+          idxJ(ig) = gidx(KG0(1, ig, ik), KG0(2, ig, ik), KG0(3, ig, ik)) - 1
+        end do
+        do ig = 1, NG0(ikq)
+          idxI(ig) = gidx(KG0(1, ig, ikq) - shG(1, ik), KG0(2, ig, ikq) - shG(2, ik), KG0(3, ig, ikq) - shG(3, ik)) - 1
+        end do
+        rcg = chi_gpu_bands(ntj, NTG, cJ, NG0(ik), idxJ, 0)
+        call gpu_check(rcg, 'chi_gpu_bands (occ)')
+        rcg = chi_gpu_bands(nti, NTG, cI, NG0(ikq), idxI, ntj)
+        call gpu_check(rcg, 'chi_gpu_bands (vir)')
+        if (lq0) then
+          ! k.p G=0 elements, exactly as in the CPU phase A
+          !$omp parallel do schedule(dynamic,16)
+          do lp = 1, np
+            block
+              integer :: jb, ib, ix, row, igg
+              complex(8) :: sumv(3), vm(3), nlvm(3)
+              real(8) :: gv(3), del
+              jb = tj(pjl(lp)); ib = ti(pil(lp))
+              row = ik + NTK*(lp - 1)
+              sumv = zzero
+              do igg = 1, NG0(ik)
+                gv(:) = dble(KG0(1, igg, ik))*b1(:) + dble(KG0(2, igg, ik))*b2(:) + dble(KG0(3, igg, ik))*b3(:)
+                sumv(:) = sumv(:) + gv(:)*conjg(cI(igg, pil(lp)))*cJ(igg, pjl(lp))
+              end do
+              vm(:) = sumv(:)*zimag
+              del = E_VIR(ib, numirr(ikq)) - E_OCC(jb, numirr(ik))
+              if (abs(del) < delt) del = delt
+              nlvm(:) = MAT_NL(:, ib + off_v, jb + off_o, numirr(ik))
+              vm(:) = -zimag*(vm(:) - nlvm(:))/del
+              do ix = 1, 3
+                V(row, ix) = vm(ix)
+                if (abs(del) <= delt) V(row, ix) = zzero
+              end do
+            end block
+          end do
+          !$omp end parallel do
+        end if
+        rcg = chi_gpu_pairs(ik - 1, NTK, 0, ntj, scl)
+        call gpu_check(rcg, 'chi_gpu_pairs')
+      end do
+      deallocate(cJ, cI, idxJ, idxI, pj0, pi0)
+    end subroutine phase_a_gpu
+
+    !------------------------------------------------------------------------------------------
+    ! GPU phase C: single-precision CGEMM blocks into the double-precision chi on the device
+    subroutine phase_c_gpu()
+      integer :: kc, ie, ix
+      kc = NTK*max(1, 8192/NTK)
+      if (lq0) then
+        rcg = chi_gpu_gemm(W, V, kc)
+        call gpu_check(rcg, 'chi_gpu_gemm')
+        do ie = 1, nen
+          do ix = 1, 3
+            Dacc(ie, ix) = Dacc(ie, ix) + sum(conjg(V(:, ix))*W(:, ie)*V(:, ix))
+          end do
+        end do
+      else
+        rcg = chi_gpu_gemm(W, W, kc)
+        call gpu_check(rcg, 'chi_gpu_gemm')
+      end if
+    end subroutine phase_c_gpu
+
+    subroutine gpu_check(rc, where)
+      integer(c_int), intent(in) :: rc
+      character(*), intent(in) :: where
+      if (rc /= 0) then
+        write(6,*) 'chi_fast: GPU error in ', where, ', code ', rc
+        stop
+      end if
+    end subroutine gpu_check
 
     !------------------------------------------------------------------------------------------
     ! phase B: tetrahedron weights x_pk(w) (same formulas, log ratios via vectorised log/atan2), times cRPA factor and 1/NTK -> W(ik+NTK*(p-1), w)
