@@ -8,7 +8,7 @@
 # input.in and the dir-intW/dir-intJ results of calc_w3d/calc_j3d.
 # Runs calc_chiqw for one q point and calc_w3d/calc_j3d on a copy of the reference dir-eps.
 set -euo pipefail
-BIN=$(readlink -f "$1"); REF=$(readlink -f "$2"); W=$3; Q=${4:-2}
+BIN=$(readlink -f "$1"); REF=$(readlink -f "$2"); W=$(realpath -m "$3"); Q=${4:-2}
 TOOLS=$(cd "$(dirname "$0")" && pwd)
 ulimit -s unlimited
 export OMP_STACKSIZE=512M OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=${OMP_NUM_THREADS:-8}
