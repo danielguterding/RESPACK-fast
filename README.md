@@ -19,9 +19,6 @@
 >   `flg_fast=0` for your own system before production use.
 > - **Branches:** `upstream` contains the unmodified release tarball (RESPACK-20240804.tar.gz) and
 >   `zen-opt` the modifications.
-> - **Incomplete download:** the official tarball download ended prematurely in its last directory
->   (`src/calc_w4`). All files listed in the build system are present, but trailing files of the
->   original archive may be missing.
 > - **License:** RESPACK is distributed under GPLv3 (see `GPL/`), and so is this fork. The
 >   generalized-tetrahedron routines carry their own citation condition, or alternatively the MIT
 >   license; see the header of `src/chiqw/m_tetrahedron_20170325.F`.
