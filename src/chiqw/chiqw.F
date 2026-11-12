@@ -65,6 +65,7 @@
       call MPI_Bcast(flg_fast,1,MPI_INTEGER,0,comm_glb,ierr)
       call MPI_Bcast(fast_mem_mb,1,MPI_DOUBLE_PRECISION,0,
      +               comm_glb,ierr)
+      call MPI_Bcast(fast_gemm_sp,1,MPI_INTEGER,0,comm_glb,ierr)
 !--
 !      call MPI_FINALIZE(ierr)
 !      stop
@@ -431,7 +432,7 @@
 !fork: FFTW plans for m_chi_fast
       if(flg_fast==1)then
        call chi_fast_init(nwx2,nwy2,nwz2,fast_mem_mb,
-     +                    myrank_glb.eq.MPI_io_rank)
+     +                    myrank_glb.eq.MPI_io_rank,fast_gemm_sp==1)
       endif
 !--
 !20180302  

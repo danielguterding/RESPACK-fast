@@ -46,16 +46,17 @@ module m_chi_fast
   type(c_ptr), save :: plan_bw = c_null_ptr, plan_fw = c_null_ptr
   real(8), save :: mem_budget_mb = 4096d0
   logical, save :: verbose = .false.
+  logical, save :: gemm_sp = .false.   ! fast_gemm_sp=1: single-precision CGEMM blocks, double-precision accumulation
 
   complex(8), parameter :: zone = (1d0, 0d0), zzero = (0d0, 0d0), zimag = (0d0, 1d0)
 
 contains
 
   !---------------------------------------------------------------------------------------------
-  subroutine chi_fast_init(nx, ny, nz, mem_mb, lverbose)
+  subroutine chi_fast_init(nx, ny, nz, mem_mb, lverbose, lgemm_sp)
     integer, intent(in) :: nx, ny, nz
     real(8), intent(in) :: mem_mb
-    logical, intent(in) :: lverbose
+    logical, intent(in) :: lverbose, lgemm_sp
     type(c_ptr) :: p
     complex(c_double_complex), pointer :: buf(:)
 
@@ -64,6 +65,7 @@ contains
     ldg = ((ngrid + 7)/8)*8        ! column stride: multiple of 128 bytes -> all columns keep the planning alignment
     if (mem_mb > 0d0) mem_budget_mb = mem_mb
     verbose = lverbose
+    gemm_sp = lgemm_sp
     p = fftw_alloc_complex(int(ldg, c_size_t))
     call c_f_pointer(p, buf, [ldg])
     ! Fortran array u(n1,n2,n3) <-> FFTW row-major (n3,n2,n1)
@@ -73,7 +75,8 @@ contains
     if (.not. c_associated(plan_bw) .or. .not. c_associated(plan_fw)) then
       write(6,*) 'chi_fast_init: FFTW planning failed'; stop
     end if
-    if (verbose) write(6,'(a,3i5,a,f10.1)') ' chi_fast: FFTW grid ', n1, n2, n3, ' ; memory budget (MB) ', mem_budget_mb
+    if (verbose) write(6,'(a,3i5,a,f10.1,a,l2)') ' chi_fast: FFTW grid ', n1, n2, n3, ' ; memory budget (MB) ', &
+         mem_budget_mb, ' ; single-precision GEMM:', gemm_sp
   end subroutine chi_fast_init
 
   !---------------------------------------------------------------------------------------------
@@ -123,6 +126,7 @@ contains
     real(8) :: bytes_pair, bytes_thrA, budget, scl
     integer(8) :: npmax
     complex(8), allocatable :: A(:, :), W(:, :), V(:, :)
+    complex(4), allocatable :: A4(:, :)
     integer, allocatable :: tj(:), ti(:), pjl(:), pil(:)
     integer :: ntj, nti
     real(8) :: t0, tA, tB, tC
@@ -380,13 +384,22 @@ contains
     ! phase C: chi(:,:,w) += A^H diag(W(:,w)) A, parallel over w (each thread owns whole w slices)
     subroutine phase_c()
       integer :: chunk
-      chunk = max(1, min(np, 4096/NTK))          ! pairs per ZGEMM block (K = NTK*chunk rows)
+      chunk = max(1, min(np, 4096/NTK))          ! pairs per GEMM block (K = NTK*chunk rows)
+      if (gemm_sp) then
+        allocate(A4(rows, NGeps))
+        A4 = cmplx(A, kind=4)
+      end if
       !$omp parallel default(shared)
       block
         complex(8), allocatable :: Bc(:, :), T(:, :), wv(:), wcv(:), y(:), z(:)
+        complex(4), allocatable :: Bc4(:, :), T4(:, :)
         complex(8) :: d
         integer :: ie, p0, p1, r0, nr, g, ix, G0
-        allocate(Bc(NTK*chunk, NGeps))
+        if (gemm_sp) then
+          allocate(Bc4(NTK*chunk, NGeps), T4(NGeps, NGeps))
+        else
+          allocate(Bc(NTK*chunk, NGeps))
+        end if
         if (lq0) allocate(T(NGeps, NGeps), wv(rows), wcv(rows), y(NGeps), z(NGeps))
         G0 = No_G_0
         !$omp do schedule(dynamic,1)
@@ -396,14 +409,28 @@ contains
             p1 = min(np, p0 + chunk - 1)
             r0 = NTK*(p0 - 1) + 1
             nr = NTK*(p1 - p0 + 1)
-            do g = 1, NGeps
-              Bc(1:nr, g) = A(r0:r0 + nr - 1, g)*W(r0:r0 + nr - 1, ie)
-            end do
-            if (lq0) then
-              call zgemm('C', 'N', NGeps, NGeps, nr, zone, A(r0, 1), rows, Bc, NTK*chunk, zone, T, NGeps)
+            if (gemm_sp) then
+              ! single-precision block product, accumulated in double precision
+              do g = 1, NGeps
+                Bc4(1:nr, g) = A4(r0:r0 + nr - 1, g)*cmplx(W(r0:r0 + nr - 1, ie), kind=4)
+              end do
+              call cgemm('C', 'N', NGeps, NGeps, nr, (1.0, 0.0), A4(r0, 1), rows, Bc4, NTK*chunk, (0.0, 0.0), &
+                   T4, NGeps)
+              if (lq0) then
+                T = T + cmplx(T4, kind=8)
+              else
+                pchi(:, :, ie) = pchi(:, :, ie) + cmplx(T4, kind=8)
+              end if
             else
-              call zgemm('C', 'N', NGeps, NGeps, nr, zone, A(r0, 1), rows, Bc, NTK*chunk, zone, &
-                   pchi(:, :, ie), NGeps)
+              do g = 1, NGeps
+                Bc(1:nr, g) = A(r0:r0 + nr - 1, g)*W(r0:r0 + nr - 1, ie)
+              end do
+              if (lq0) then
+                call zgemm('C', 'N', NGeps, NGeps, nr, zone, A(r0, 1), rows, Bc, NTK*chunk, zone, T, NGeps)
+              else
+                call zgemm('C', 'N', NGeps, NGeps, nr, zone, A(r0, 1), rows, Bc, NTK*chunk, zone, &
+                     pchi(:, :, ie), NGeps)
+              end if
             end if
           end do
           if (lq0) then
@@ -422,10 +449,15 @@ contains
           end if
         end do
         !$omp end do
-        deallocate(Bc)
+        if (gemm_sp) then
+          deallocate(Bc4, T4)
+        else
+          deallocate(Bc)
+        end if
         if (lq0) deallocate(T, wv, wcv, y, z)
       end block
       !$omp end parallel
+      if (gemm_sp) deallocate(A4)
     end subroutine phase_c
 
   end subroutine chi_fast_pairs

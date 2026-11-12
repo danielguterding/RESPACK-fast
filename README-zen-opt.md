@@ -43,6 +43,17 @@ The fork computes the same quantity this way:
    - Non-degenerate tetrahedra use a fused kernel: 6 instead of 12 logarithms, frequency-independent
      denominators inverted once, and powers as explicit products.
 
+`fast_gemm_sp` (default 0): if 1, the χ⁰ accumulation runs as single-precision CGEMM blocks of
+about 4096 rows, and each block result is added to a double-precision χ. This halves the GEMM time on
+CPUs and is the precision model for a GPU port.
+
+| test | ε⁻¹ vs `fast_gemm_sp=0` | U(ω), J(ω) | static U, U′, J |
+|---|---|---|---|
+| SrVO₃ cRPA | 4×10⁻⁷ relative | ≤ 1×10⁻⁵ eV | identical |
+| Si RPA, Si cRPA | ≤ 4×10⁻⁷ relative | ≤ 1×10⁻⁵ eV | identical |
+
+These deviations are about 200× smaller than the method's own rounding noise.
+
 `fast_mem_mb` (default 4096) is the memory budget for one tile of pair densities and weights. A larger
 budget means larger tiles and fewer backward FFTs.
 
@@ -165,6 +176,7 @@ per-directory Makefiles are unchanged but don't know about the fork's new files;
 | file | purpose |
 |---|---|
 | `local-tools/build.sh` | configure, build and install with a preset |
+| `local-tools/validate_sp_gemm.sh` | accuracy of `fast_gemm_sp=1` vs double precision (full chains) |
 | `local-tools/check_build.sh` | quick numerical check of a build against a reference run (one q of `calc_chiqw`, `calc_w3d`/`calc_j3d`) |
 | `local-tools/cmp_epsqw.py` | compare `dir-eps/qNNN/dat.epsqw.600` of two runs |
 | `local-tools/bench_tetra.f90`, `acc_tetra_quad.f90` | tetrahedron speed, and accuracy vs quad precision |
