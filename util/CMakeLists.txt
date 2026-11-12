@@ -1,14 +1,5 @@
-if(${CMAKE_PROJECT_NAME} STREQUAL "Project")
-  message(FATAL_ERROR "cmake should be executed not for 'src' subdirectory, but for the top directory of RESPACK.")
-endif(${CMAKE_PROJECT_NAME} STREQUAL "Project")
-install(FILES qe2respack/qe2respack.py DESTINATION bin
-        PERMISSIONS 
-        OWNER_READ OWNER_WRITE OWNER_EXECUTE 
-        GROUP_READ GROUP_EXECUTE 
-        WORLD_READ WORLD_EXECUTE)
-install(FILES transfer_analysis/tr.py DESTINATION bin
-        PERMISSIONS 
-        OWNER_READ OWNER_WRITE OWNER_EXECUTE 
-        GROUP_READ GROUP_EXECUTE 
-        WORLD_READ WORLD_EXECUTE)
-add_subdirectory(xtapp2respack)
+# zen-opt fork: target-based CMake (modernised from the upstream CMake 2.8 file)
+install(PROGRAMS qe2respack/qe2respack.py transfer_analysis/tr.py DESTINATION ${CMAKE_INSTALL_BINDIR})
+if(RESPACK_BUILD_XTAPP)
+  add_subdirectory(xtapp2respack)
+endif()

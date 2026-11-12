@@ -1,13 +1,7 @@
-if(${CMAKE_PROJECT_NAME} STREQUAL "Project")
-  message(FATAL_ERROR "cmake should be executed not for 'src' subdirectory, but for the top directory of RESPACK.")
-endif(${CMAKE_PROJECT_NAME} STREQUAL "Project")
-
+# zen-opt fork: target-based CMake (modernised from the upstream CMake 2.8 file)
 add_executable(strconv strconv.F90 subr_fmtconv.F90 subr_readstr.F90)
 add_executable(wfn2respack wfn2respack.F90)
-install(TARGETS strconv wfn2respack RUNTIME DESTINATION bin)
-
-install(FILES xtapp2respack.sh DESTINATION bin
-        PERMISSIONS
-        OWNER_READ OWNER_WRITE OWNER_EXECUTE
-        GROUP_READ GROUP_EXECUTE
-        WORLD_READ WORLD_EXECUTE)
+target_link_libraries(strconv PRIVATE respack_options)
+target_link_libraries(wfn2respack PRIVATE respack_options)
+install(TARGETS strconv wfn2respack RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(PROGRAMS xtapp2respack.sh DESTINATION ${CMAKE_INSTALL_BINDIR})

@@ -1,0 +1,50 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "default",
+      "displayName": "Release, portable (system BLAS/LAPACK, FFTW3, MPI)",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "native",
+      "inherits": "default",
+      "displayName": "Release, optimised for this machine (-march=native, LTO)",
+      "cacheVariables": {
+        "RESPACK_NATIVE": "ON",
+        "RESPACK_LTO": "ON"
+      }
+    },
+    {
+      "name": "zen3",
+      "inherits": "default",
+      "displayName": "AMD Zen 3 (znver3, LTO, static OpenBLAS); set OPENBLAS_LIB_DIR and FFTW3_ROOT",
+      "cacheVariables": {
+        "RESPACK_ARCH": "znver3",
+        "RESPACK_LTO": "ON",
+        "BLA_VENDOR": "OpenBLAS",
+        "BLA_STATIC": "ON",
+        "CMAKE_LIBRARY_PATH": "$env{OPENBLAS_LIB_DIR}",
+        "FFTW3_ROOT": "$env{FFTW3_ROOT}"
+      }
+    },
+    {
+      "name": "debug",
+      "inherits": "default",
+      "displayName": "Debug (-O0 -g)",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "default", "configurePreset": "default" },
+    { "name": "native", "configurePreset": "native" },
+    { "name": "zen3", "configurePreset": "zen3" },
+    { "name": "debug", "configurePreset": "debug" }
+  ]
+}

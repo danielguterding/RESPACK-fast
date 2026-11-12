@@ -13,7 +13,8 @@
 > - **Turning it off:** all changes can be switched off with `flg_fast=0` in `&param_chiqw` and
 >   `&param_calc_int`.
 > - **Details:** see [README-zen-opt.md](README-zen-opt.md): the modified files, validation against the
->   unmodified code, and performance.
+>   unmodified code, performance, and the **build** (modernised CMake: `cmake --preset default &&
+>   cmake --build --preset default`; works with CMake 3.18 to 4.x).
 >
 > - **Validation scope:** checked on SrVO₃ (cRPA) and Si (RPA/cRPA) only. Please compare against
 >   `flg_fast=0` for your own system before production use.

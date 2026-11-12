@@ -69,6 +69,8 @@ budget means larger tiles and fewer backward FFTs.
 | `src/calc_int/calc_intW.F`, `calc_intJ.F` | modified | call `m_int_fast` for `flg_fast=1`; original loops kept; exp(−iq·R) table in `calc_intW.F` |
 | `src/calc_int/calc_int_sub.F` | modified | `make_LG0` loop bounds (identical G lists) |
 | `src/calc_int/m_rdinput.f90`, `config_w3d.h`, `config_j3d.h`, `CMakeLists.txt` | modified | inputs, declarations, FFTW3 |
+| `CMakeLists.txt` (top level and all subdirectories) | modified | modern target-based CMake (3.18 to 4.x): imported MPI/OpenMP/LAPACK/FFTW3 targets, CPU and LTO options |
+| `cmake/FindFFTW3.cmake`, `CMakePresets.json` | new | FFTW3 finder, build presets |
 | `local-tools/*`, `README-zen-opt.md` | new | build script, validation and benchmark tools, this document |
 
 All changed places in modified files are marked with `fork` comments. The full diff is
@@ -103,13 +105,67 @@ ZGEMM 51 s. Use 1 MPI process × 8 OpenMP threads (2 × 4 is ≈ 10 % slower; re
 
 ## Build
 
-    local-tools/build-zen3.sh [prefix]      # needs FFTW3 (FFTW3_ROOT) and BLAS/LAPACK
+**Requirements:**
+- a Fortran and C compiler (tested: GNU 13);
+- CMake ≥ 3.18 (presets need ≥ 3.21; tested with 3.28 and 4.4);
+- MPI with Fortran bindings;
+- BLAS/LAPACK;
+- FFTW3 (double precision, with the Fortran interface file `fftw3.f03`).
+
+For example:
+
+    # Debian/Ubuntu
+    sudo apt install gfortran cmake libopenmpi-dev libopenblas-dev libfftw3-dev
+    # Fedora
+    sudo dnf install gcc-gfortran cmake openmpi-devel openblas-devel fftw-devel
+
+**With presets** (`CMakePresets.json`):
+
+    cmake --preset default             # portable Release build with the system libraries
+    cmake --build --preset default
+    cmake --install build/default --prefix $HOME/.local/respack-zen-opt
+    # or in one go:  local-tools/build.sh [preset] [prefix]
+
+| preset | what |
+|---|---|
+| `default` | Release (-O3), compiler-default target CPU, system BLAS/LAPACK, FFTW3, MPI |
+| `native` | adds `-march=native` and link-time optimization |
+| `zen3` | AMD Zen 3: `-march=znver3`, LTO, static OpenBLAS. Reads `OPENBLAS_LIB_DIR` (directory containing `libopenblas.a`) and `FFTW3_ROOT` from the environment. |
+| `debug` | -O0 -g |
+
+**Without presets:**
+
+    cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+          [-DRESPACK_NATIVE=ON | -DRESPACK_ARCH=znver3] [-DRESPACK_LTO=ON] \
+          [-DFFTW3_ROOT=/path/to/fftw] [-DBLA_VENDOR=OpenBLAS|Intel10_64lp_seq|...] [-DBLA_STATIC=ON]
+    cmake --build build -j
+    cmake --install build --prefix <dir>
+
+**Options:**
+- `RESPACK_NATIVE`, `RESPACK_ARCH`: CPU tuning.
+- `RESPACK_LTO`: link-time optimization.
+- `RESPACK_BUILD_XTAPP`: also build the xTAPP converters (default ON).
+
+Libraries are found through CMake's standard `FindMPI`, `FindOpenMP` and `FindLAPACK` (use `BLA_VENDOR`
+to choose) and `cmake/FindFFTW3.cmake` (`FFTW3_ROOT`, pkg-config, system paths; `FFTW3_USE_STATIC=ON`
+prefers `libfftw3.a`). The upstream route `-DCONFIG=gcc` (`config/*.cmake`) still works. The original
+per-directory Makefiles are unchanged but don't know about the fork's new files; use CMake.
+
+**Notes:**
+- **Single-threaded BLAS:** BLAS is called inside OpenMP regions. Use a single-threaded BLAS, or set
+  `OPENBLAS_NUM_THREADS=1` (or `MKL_NUM_THREADS=1`) at run time.
+- **FFTW built with LTO:** if your FFTW was itself built with LTO-only objects, enable `RESPACK_LTO` too.
+- **Other compilers:** the GNU toolchain is tested. Intel/ifx get `-xHost` with `RESPACK_NATIVE`;
+  other compilers use their defaults.
+- **Validated builds:** the `zen3` and `default` builds were both checked against the reference results
+  with `local-tools/check_build.sh` (ε⁻¹ within 4×10⁻¹⁶ and 1×10⁻⁵ respectively; U, J identical).
 
 ## Tools
 
 | file | purpose |
 |---|---|
-| `local-tools/build-zen3.sh` | build and install |
+| `local-tools/build.sh` | configure, build and install with a preset |
+| `local-tools/check_build.sh` | quick numerical check of a build against a reference run (one q of `calc_chiqw`, `calc_w3d`/`calc_j3d`) |
 | `local-tools/cmp_epsqw.py` | compare `dir-eps/qNNN/dat.epsqw.600` of two runs |
 | `local-tools/bench_tetra.f90`, `acc_tetra_quad.f90` | tetrahedron speed, and accuracy vs quad precision |
 | `local-tools/eps_freq_dev.py` | deviation of ε⁻¹ per frequency |
