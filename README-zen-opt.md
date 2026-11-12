@@ -169,6 +169,11 @@ list is `all-major`.
 
   A `mpirun` started from an `salloc` shell sees all GPUs of the node.
 - **BLAS threads:** keep `OPENBLAS_NUM_THREADS=1`.
+- **ε inversion in the background:** with `flg_gpu=1`, `flg_async_eps` defaults to on (auto). The inversion of
+  ε(ω) and the output of a q point run on the CPU while the GPU computes χ⁰ of the next q point. Only the last
+  q point's inversion stays visible. Measured on an RX 9060 XT (SrVO₃, NG = 1963, 3 q points, 8 threads): the
+  run takes 116.5 s instead of 137.1 s, and the results are identical (ε⁻¹ bitwise). Set `flg_async_eps=0` to
+  switch it off.
 
 ### AMD GPUs (ROCm/HIP, branch `gpu-hip`)
 
