@@ -267,6 +267,7 @@ extern "C" int chi_gpu_pairs(int ik0, int NTK, int ubJ, int ubI, double scl) {
 extern "C" int chi_gpu_gemm(const zc *W, const zc *V, int kc) {
   const int NG = g.NG, nen = g.nen, rows = g.rows;
   size_t nA = (size_t)NG * rows, nW = (size_t)rows * nen;
+  { const char *e = getenv("RESPACK_GPU_KC"); if (e && atoi(e) > 0) kc = atoi(e); }   // rows per CGEMM block (testing)
   if (kc < 1 || kc > rows) kc = rows;
   if (ensure(&g.A4, &g.A4_cap, nA)) return -1;
   if (ensure(&g.W, &g.W_cap, nW)) return -1;
