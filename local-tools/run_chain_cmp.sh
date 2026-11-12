@@ -7,7 +7,9 @@
 #   run_chain_cmp.sh <bin-dir> <reference-run-dir> <work-dir> [entry ...]      e.g.  flg_gpu=1
 # <bin-dir> contains calc_chiqw, calc_w3d, calc_j3d (or is a build tree: build/<preset>/src).
 # The reference directory must contain dir-wfn, dir-wan, dir-model, input.in and its results.
-# Environment: NP (MPI ranks, default 1), OMP_NUM_THREADS (default 8).
+# Environment: NP (MPI ranks, default 1), OMP_NUM_THREADS (default 8), MPIRUN_ARGS (extra mpirun options).
+# Under Slurm, run this inside an srun step / batch job so that CUDA_VISIBLE_DEVICES confines the GPUs
+# (e.g. srun -c 8 --gres=gpu:2 env NP=2 MPIRUN_ARGS=--oversubscribe run_chain_cmp.sh ...).
 set -euo pipefail
 BIN=$(readlink -f "$1"); REF=$(readlink -f "$2"); W=$(realpath -m "$3"); shift 3
 TOOLS=$(cd "$(dirname "$0")" && pwd)
@@ -29,7 +31,7 @@ for l in open(sys.argv[1]).read().split('\n'):
     out.append(l)
 print('\n'.join(out))
 PY
-t0=$(date +%s.%N); mpirun -np ${NP:-1} --bind-to none "$CQ" < input.in > log.chiqw 2>&1; t1=$(date +%s.%N)
+t0=$(date +%s.%N); mpirun -np ${NP:-1} ${MPIRUN_ARGS:-} --bind-to none "$CQ" < input.in > log.chiqw 2>&1; t1=$(date +%s.%N)
 "$CW" < input.in > log.calc_w3d 2>&1; t2=$(date +%s.%N)
 "$CJ" < input.in > log.calc_j3d 2>&1; t3=$(date +%s.%N)
 printf "chiqw %.1f s  w3d %.1f s  j3d %.1f s\n" "$(echo "$t1-$t0" | bc)" "$(echo "$t2-$t1" | bc)" "$(echo "$t3-$t2" | bc)"
