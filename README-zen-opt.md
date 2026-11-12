@@ -202,10 +202,10 @@ CPU double-precision run of the same build:
 | Si cRPA | 9.8×10⁻⁷ | ≤ 1×10⁻⁵ eV | identical |
 | Si cRPA, `fast_fft_sp=1` | 8.9×10⁻⁷ | ≤ 1×10⁻⁵ eV | identical |
 
-Compare with the CPU build of another machine, not of the same build. The CPU double-precision runs on this
-machine (`-march=native` on Zen 5, Ubuntu's gfortran/glibc/OpenBLAS) and on the Ryzen 7 PRO 6850U
-(`-march=znver3`, LTO, static OpenBLAS) already differ by 3.4×10⁻⁵ in ε⁻¹ (SrVO₃; Si: 3.9×10⁻⁶). The
-tetrahedron weights cause this, and it is below the method's rounding level of 7×10⁻⁵ (see above). The static
+Compare with a CPU run of the same build. Builds with and without LTO differ by 3.4×10⁻⁵ in ε⁻¹ for SrVO₃
+(Si: 3.9×10⁻⁶), even on the same machine. `zen-opt` without LTO and `gpu-hip` (no LTO) agree to 1×10⁻¹⁵,
+while `zen-opt` with LTO differs from both by 3.4×10⁻⁵. The tetrahedron weights are this sensitive to compiler
+optimisation (inlining, FMA contraction). It is below the method's rounding level of 7×10⁻⁵ (see above). The static
 U, U′, J agree to all printed digits.
 
 The test machine was also running another job on 16 cores, so the timings above are not a benchmark.
