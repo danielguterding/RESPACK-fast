@@ -76,6 +76,13 @@ if(RESPACK_LTO)
   if(_respack_ipo)
     set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
     message(STATUS "Link-time optimisation: ON")
+    if(CMAKE_Fortran_COMPILER_ID STREQUAL "GNU")
+      # The LTO code generator does not inherit gfortran's rules for complex multiplication and
+      # division (-fcx-fortran-rules, set by the Fortran front end): it applies the C rules and calls
+      # __muldc3/__divdc3 for every complex product and quotient, which also prevents vectorisation
+      # (tetrahedron weights 2-3x slower, and eps^-1 changes by ~3e-5). Pass it to the link step.
+      add_link_options("$<$<LINK_LANGUAGE:Fortran>:-fcx-fortran-rules>")
+    endif()
   else()
     message(WARNING "RESPACK_LTO requested but not supported: ${_respack_ipo_msg}")
   endif()
