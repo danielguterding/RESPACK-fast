@@ -51,9 +51,7 @@ static struct {
   int init, dev, verbose;
   int n1, n2, n3, fbatch;
   size_t ngrid;
-  cufftHandle plan_b, plan_f;
   int fft_sp;                    // fast_fft_sp=1: single-precision FFTs/products (C2C)
-  cufftHandle plan_b4, plan_f4;
   cc *u4; size_t u4_cap;
   cc *f4;
   cublasHandle_t blas;
@@ -104,6 +102,41 @@ static int ensure(T **p, size_t *cap, size_t n) {
   *p = NULL; *cap = 0;
   CK(cudaMalloc((void **)p, n * sizeof(T)));
   *cap = n;
+  return 0;
+}
+
+// batched 3D FFT plans (backward and forward share a plan) for the batch sizes that occur
+static struct { int batch, sp; cufftHandle h; } pcache[32];
+static int npcache = 0;
+static int get_plan(int batch, int sp, cufftHandle *h) {
+  for (int i = 0; i < npcache; i++)
+    if (pcache[i].batch == batch && pcache[i].sp == sp) { *h = pcache[i].h; return 0; }
+  int dims[3] = {g.n3, g.n2, g.n1};
+  cufftHandle p;
+  CF(cufftPlanMany(&p, 3, dims, NULL, 1, (int)g.ngrid, NULL, 1, (int)g.ngrid, sp ? CUFFT_C2C : CUFFT_Z2Z, batch));
+  CF(cufftSetStream(p, g.st));
+  if (npcache < 32) {
+    pcache[npcache].batch = batch; pcache[npcache].sp = sp; pcache[npcache].h = p; npcache++;
+  }
+  *h = p;
+  return 0;
+}
+
+// m in-place 3D FFTs of consecutive grids: batches of fbatch, the remainder as powers of two
+// (at most ~12 distinct plans per precision)
+static int fft_many(void *data, int m, int sp, int dir) {
+  const size_t es = sp ? sizeof(cc) : sizeof(zc);
+  char *d = (char *)data;
+  while (m > 0) {
+    int b = g.fbatch;
+    if (m < g.fbatch) { b = 1; while (2 * b <= m) b *= 2; }
+    cufftHandle p;
+    if (get_plan(b, sp, &p)) return -2;
+    if (sp) { CF(cufftExecC2C(p, (cc *)d, (cc *)d, dir)); }
+    else { CF(cufftExecZ2Z(p, (zc *)d, (zc *)d, dir)); }
+    d += (size_t)b * g.ngrid * es;
+    m -= b;
+  }
   return 0;
 }
 
@@ -278,23 +311,27 @@ extern "C" int chi_gpu_init(int n1, int n2, int n3, int fbatch, int verbose, int
   if (ndev < 1) { fprintf(stderr, "chi_gpu: no " GPU_RT_NAME " device\n"); return -10; }
   g.dev = local_rank() % ndev;
   CK(cudaSetDevice(g.dev));
-  g.n1 = n1; g.n2 = n2; g.n3 = n3; g.fbatch = fbatch > 0 ? fbatch : 16;
+  g.n1 = n1; g.n2 = n2; g.n3 = n3;
   g.ngrid = (size_t)n1 * n2 * n3;
+  // grids per batched FFT (bands and pair products): fbatch > 0 from the caller, RESPACK_GPU_FBATCH, or
+  // automatic from a 256 MB budget (16 .. 1024); small grids need large batches to amortise the launches
+  {
+    const char *e = getenv("RESPACK_GPU_FBATCH");
+    if (e && atoi(e) > 0) fbatch = atoi(e);
+    if (fbatch <= 0) {
+      size_t per = g.ngrid * (fft_sp ? sizeof(cc) : sizeof(zc));
+      size_t fb = ((size_t)256 << 20) / per;
+      fbatch = (int)(fb < 16 ? 16 : (fb > 1024 ? 1024 : fb));
+    }
+    g.fbatch = fbatch;
+  }
   g.verbose = verbose;
   CK(cudaStreamCreate(&g.st));
   CB(cublasCreate(&g.blas));
   CB(cublasSetStream(g.blas, g.st));
-  int dims[3] = {n3, n2, n1};
-  CF(cufftPlanMany(&g.plan_b, 3, dims, NULL, 1, (int)g.ngrid, NULL, 1, (int)g.ngrid, CUFFT_Z2Z, 1));
-  CF(cufftPlanMany(&g.plan_f, 3, dims, NULL, 1, (int)g.ngrid, NULL, 1, (int)g.ngrid, CUFFT_Z2Z, g.fbatch));
-  CF(cufftSetStream(g.plan_b, g.st));
-  CF(cufftSetStream(g.plan_f, g.st));
   g.fft_sp = fft_sp;
+  { cufftHandle p; if (get_plan(g.fbatch, fft_sp, &p)) return -2; }   // plan of the full batch
   if (fft_sp) {
-    CF(cufftPlanMany(&g.plan_b4, 3, dims, NULL, 1, (int)g.ngrid, NULL, 1, (int)g.ngrid, CUFFT_C2C, 1));
-    CF(cufftPlanMany(&g.plan_f4, 3, dims, NULL, 1, (int)g.ngrid, NULL, 1, (int)g.ngrid, CUFFT_C2C, g.fbatch));
-    CF(cufftSetStream(g.plan_b4, g.st));
-    CF(cufftSetStream(g.plan_f4, g.st));
     CK(cudaMalloc((void **)&g.f4, g.ngrid * g.fbatch * sizeof(cc)));
   } else {
     CK(cudaMalloc((void **)&g.f, g.ngrid * g.fbatch * sizeof(zc)));
@@ -369,19 +406,13 @@ extern "C" int chi_gpu_bands(int nb, int ldc, const zc *coef, int ncoef, const i
     CK(cudaMemsetAsync(u0, 0, g.ngrid * nb * sizeof(cc), g.st));
     k_scatter4<<<grid1(n), 256, 0, g.st>>>(n, ncoef, g.coef, g.idx, u0, g.ngrid);
     CK(cudaGetLastError());
-    for (int b = 0; b < nb; b++) {
-      cc *ub = u0 + (size_t)b * g.ngrid;
-      CF(cufftExecC2C(g.plan_b4, ub, ub, CUFFT_INVERSE));
-    }
+    if (fft_many(u0, nb, 1, CUFFT_INVERSE)) return -2;   // batched backward FFTs of the bands
   } else {
     zc *u0 = g.u + (size_t)ubase * g.ngrid;
     CK(cudaMemsetAsync(u0, 0, g.ngrid * nb * sizeof(zc), g.st));
     k_scatter<<<grid1(n), 256, 0, g.st>>>(n, ncoef, g.coef, g.idx, u0, g.ngrid);
     CK(cudaGetLastError());
-    for (int b = 0; b < nb; b++) {
-      zc *ub = u0 + (size_t)b * g.ngrid;
-      CF(cufftExecZ2Z(g.plan_b, ub, ub, CUFFT_INVERSE));
-    }
+    if (fft_many(u0, nb, 0, CUFFT_INVERSE)) return -2;   // batched backward FFTs of the bands
   }
   // the host buffers (coef, idx) are reused by the caller for the next call
   CK(cudaStreamSynchronize(g.st));
@@ -397,12 +428,12 @@ extern "C" int chi_gpu_pairs(int ik0, int NTK, int ubJ, int ubI, double scl) {
     if (g.fft_sp) {
       k_products4<<<grid1(n), 256, 0, g.st>>>(n, g.ngrid, p0, g.pj, g.pi, g.u4, ubJ, ubI, g.f4);
       CK(cudaGetLastError());
-      CF(cufftExecC2C(g.plan_f4, g.f4, g.f4, CUFFT_FORWARD));   // full batch; unused slots ignored
+      if (fft_many(g.f4, m, 1, CUFFT_FORWARD)) return -2;
       k_gather4<<<grid1(ng), 256, 0, g.st>>>(ng, g.NG, g.ngrid, p0, g.ext, g.f4, g.At, ik0, NTK, scl);
     } else {
       k_products<<<grid1(n), 256, 0, g.st>>>(n, g.ngrid, p0, g.pj, g.pi, g.u, ubJ, ubI, g.f);
       CK(cudaGetLastError());
-      CF(cufftExecZ2Z(g.plan_f, g.f, g.f, CUFFT_FORWARD));   // full batch; unused slots ignored
+      if (fft_many(g.f, m, 0, CUFFT_FORWARD)) return -2;
       k_gather<<<grid1(ng), 256, 0, g.st>>>(ng, g.NG, g.ngrid, p0, g.ext, g.f, g.At, ik0, NTK, scl);
     }
     CK(cudaGetLastError());
