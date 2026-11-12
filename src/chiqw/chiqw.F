@@ -1299,6 +1299,7 @@
       do iq=1,pnq 
        q1=SQ(1,iq);q2=SQ(2,iq);q3=SQ(3,iq)
        NG_for_eps=NGQ(iq) 
+       tfk(0)=MPI_Wtime()!fork
        if(myrank.eq.0)then!master 
         write(6,'(i5,3f15.8)') iq,q1,q2,q3 
        endif 
@@ -1532,8 +1533,10 @@
        if(myrank.eq.0)write(6,*)'#MPI end' 
        enddo!irot 
        !--
+       tfk(1)=MPI_Wtime()!fork
        call MPI_REDUCE(pchiqw,chiqw,NG_for_eps*NG_for_eps*nen,
      +      MPI_DOUBLE_COMPLEX,MPI_SUM,0,comm,ierr)
+       tfk(2)=MPI_Wtime()!fork
 !--
 !output 
        if(myrank.eq.0)then 
@@ -1576,6 +1579,7 @@
      +   '#1:q+G [au], 2:Re(eps-1), 3:Im(eps-1)'
         enddo!ie 
         !--
+        tfk(3)=MPI_Wtime()!fork
 ! fork: the frequencies in parallel (OpenMP), each inverted with
 ! single-threaded LAPACK as before. chiqw is not needed afterwards and
 ! is used in place (calc_eps_rpa doubles it); eps goes to epsqw.
@@ -1591,6 +1595,7 @@
          close(file_num_eps_ie)
         enddo!ie 
 !$OMP END PARALLEL DO
+        tfk(4)=MPI_Wtime()!fork
 !--
 !chiqw 
 !       write(file_num_chi)(((chiqw(ig,jg,ie),ig=1,NG_for_eps)
@@ -1604,6 +1609,11 @@
         write(file_num_eps)(((epsqw(ig,jg,ie),ig=1,NG_for_eps)
      +                             ,jg=1,NG_for_eps),ie=1,nen) 
         close(file_num_eps) 
+        tfk(5)=MPI_Wtime()!fork
+        write(6,'(a,6f9.2)')' fork: time (s) chi / reduce / '//
+     +   'prep / eps inversion / write eps / q total',tfk(1)-tfk(0),
+     +   tfk(2)-tfk(1),tfk(3)-tfk(2),tfk(4)-tfk(3),tfk(5)-tfk(4),
+     +   tfk(5)-tfk(0)
 !--
 !OPEN(400,W,FILE='dat.log') 
         file_num_log=file_num_log_start 
@@ -2063,8 +2073,10 @@
        if(myrank.eq.0) write(6,*)'#MPI end' 
       enddo!irot 
       !--
+      tfk(1)=MPI_Wtime()!fork
       call MPI_REDUCE(pchiqwgm,chiqwgm,NG_for_eps*NG_for_eps*nen*3,
      +     MPI_DOUBLE_COMPLEX,MPI_SUM,0,comm,ierr)
+      tfk(2)=MPI_Wtime()!fork
       call MPI_REDUCE(pwpl,wpl,3,MPI_DOUBLE_COMPLEX,MPI_SUM,0,comm,ierr)
 !--
 !output 
@@ -2117,6 +2129,7 @@
         enddo!ie 
        enddo!ix
        !--
+       tfk(3)=MPI_Wtime()!fork
 ! fork: the 3 x nen inversions in parallel (OpenMP), single-threaded
 ! LAPACK each; chiqwgm is used in place, eps goes to epsqwgm.
 !$OMP PARALLEL DO DEFAULT(SHARED) SCHEDULE(DYNAMIC,1) COLLAPSE(2)
@@ -2136,6 +2149,7 @@
        enddo!ix 
 !$OMP END PARALLEL DO
        file_num_eps_base=file_num_eps_base_start+2*1000
+       tfk(4)=MPI_Wtime()!fork
 !--
 !chiqw 
 !      write(file_num_chi)(((chiqw(ig,jg,ie),ig=1,NG_for_eps)
@@ -2151,6 +2165,11 @@
      +                               ,jg=1,NG_for_eps),ie=1,nen) 
         close(file_num_eps)
        enddo 
+       tfk(5)=MPI_Wtime()!fork
+       write(6,'(a,6f9.2)')' fork: time (s) chi / reduce / '//
+     +   'prep / eps inversion / write eps / q total',tfk(1)-tfk(0),
+     +   tfk(2)-tfk(1),tfk(3)-tfk(2),tfk(4)-tfk(3),tfk(5)-tfk(4),
+     +   tfk(5)-tfk(0)
 !--
 !OPEN(400,W,FILE='dat.log') 
        file_num_log=file_num_log_start 
