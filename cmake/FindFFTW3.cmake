@@ -10,7 +10,10 @@
 #   FFTW3_USE_STATIC  prefer libfftw3.a over the shared library
 # pkg-config (module fftw3) is used as a further hint when available.
 #
-# Result: FFTW3_FOUND, FFTW3_INCLUDE_DIR, FFTW3_LIBRARY and the imported target FFTW3::fftw3.
+# Also finds the single-precision library libfftw3f (used by fast_fft_sp=1); hint FFTW3F_ROOT.
+#
+# Result: FFTW3_FOUND, FFTW3_INCLUDE_DIR, FFTW3_LIBRARY, FFTW3F_LIBRARY and the imported targets
+# FFTW3::fftw3 and FFTW3::fftw3f.
 
 find_package(PkgConfig QUIET)
 if(PKG_CONFIG_FOUND)
@@ -31,11 +34,20 @@ find_library(FFTW3_LIBRARY
   HINTS ${FFTW3_ROOT} ENV FFTW3_ROOT ${PC_FFTW3_LIBDIR} ${PC_FFTW3_LIBRARY_DIRS}
   PATH_SUFFIXES lib lib64)
 unset(_fftw3_names)
+set(_fftw3f_names fftw3f)
+if(FFTW3_USE_STATIC OR "$ENV{FFTW3_USE_STATIC}")
+  set(_fftw3f_names libfftw3f.a fftw3f)
+endif()
+find_library(FFTW3F_LIBRARY
+  NAMES ${_fftw3f_names}
+  HINTS ${FFTW3F_ROOT} ENV FFTW3F_ROOT ${FFTW3_ROOT} ENV FFTW3_ROOT ${PC_FFTW3_LIBDIR} ${PC_FFTW3_LIBRARY_DIRS}
+  PATH_SUFFIXES lib lib64)
+unset(_fftw3f_names)
 
 include(FindPackageHandleStandardArgs)
 find_package_handle_standard_args(FFTW3
-  REQUIRED_VARS FFTW3_LIBRARY FFTW3_INCLUDE_DIR
-  FAIL_MESSAGE "FFTW3 (double precision, with fftw3.f03) not found: set FFTW3_ROOT to its installation prefix")
+  REQUIRED_VARS FFTW3_LIBRARY FFTW3F_LIBRARY FFTW3_INCLUDE_DIR
+  FAIL_MESSAGE "FFTW3 (double and single precision, with fftw3.f03) not found: set FFTW3_ROOT (and FFTW3F_ROOT)")
 
 if(FFTW3_FOUND AND NOT TARGET FFTW3::fftw3)
   add_library(FFTW3::fftw3 UNKNOWN IMPORTED)
@@ -47,4 +59,13 @@ if(FFTW3_FOUND AND NOT TARGET FFTW3::fftw3)
     set_property(TARGET FFTW3::fftw3 APPEND PROPERTY INTERFACE_LINK_LIBRARIES m)
   endif()
 endif()
-mark_as_advanced(FFTW3_INCLUDE_DIR FFTW3_LIBRARY)
+if(FFTW3_FOUND AND NOT TARGET FFTW3::fftw3f)
+  add_library(FFTW3::fftw3f UNKNOWN IMPORTED)
+  set_target_properties(FFTW3::fftw3f PROPERTIES
+    IMPORTED_LOCATION "${FFTW3F_LIBRARY}"
+    INTERFACE_INCLUDE_DIRECTORIES "${FFTW3_INCLUDE_DIR}")
+  if(FFTW3F_LIBRARY MATCHES "\\.a$")
+    set_property(TARGET FFTW3::fftw3f APPEND PROPERTY INTERFACE_LINK_LIBRARIES m)
+  endif()
+endif()
+mark_as_advanced(FFTW3_INCLUDE_DIR FFTW3_LIBRARY FFTW3F_LIBRARY)

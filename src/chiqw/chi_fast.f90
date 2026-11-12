@@ -44,6 +44,8 @@ module m_chi_fast
 
   integer, save :: n1 = 0, n2 = 0, n3 = 0, ngrid = 0, ldg = 0
   type(c_ptr), save :: plan_bw = c_null_ptr, plan_fw = c_null_ptr
+  type(c_ptr), save :: plan_bw4 = c_null_ptr, plan_fw4 = c_null_ptr   ! fast_fft_sp=1 (fftwf)
+  logical, save :: fft_sp = .false.
   real(8), save :: mem_budget_mb = 4096d0
   logical, save :: verbose = .false.
   logical, save :: gemm_sp = .false.   ! fast_gemm_sp=1: single-precision CGEMM blocks, double-precision accumulation
@@ -53,10 +55,11 @@ module m_chi_fast
 contains
 
   !---------------------------------------------------------------------------------------------
-  subroutine chi_fast_init(nx, ny, nz, mem_mb, lverbose, lgemm_sp)
+  subroutine chi_fast_init(nx, ny, nz, mem_mb, lverbose, lgemm_sp, lfft_sp)
     integer, intent(in) :: nx, ny, nz
     real(8), intent(in) :: mem_mb
-    logical, intent(in) :: lverbose, lgemm_sp
+    logical, intent(in) :: lverbose, lgemm_sp, lfft_sp
+    complex(c_float_complex), pointer :: buf4(:)
     type(c_ptr) :: p
     complex(c_double_complex), pointer :: buf(:)
 
@@ -72,11 +75,22 @@ contains
     plan_bw = fftw_plan_dft_3d(n3, n2, n1, buf, buf, FFTW_BACKWARD, FFTW_MEASURE)
     plan_fw = fftw_plan_dft_3d(n3, n2, n1, buf, buf, FFTW_FORWARD, FFTW_MEASURE)
     call fftw_free(p)
+    fft_sp = lfft_sp
+    if (fft_sp) then
+      p = fftwf_alloc_complex(int(ldg, c_size_t))
+      call c_f_pointer(p, buf4, [ldg])
+      plan_bw4 = fftwf_plan_dft_3d(n3, n2, n1, buf4, buf4, FFTW_BACKWARD, FFTW_MEASURE)
+      plan_fw4 = fftwf_plan_dft_3d(n3, n2, n1, buf4, buf4, FFTW_FORWARD, FFTW_MEASURE)
+      call fftwf_free(p)
+      if (.not. c_associated(plan_bw4) .or. .not. c_associated(plan_fw4)) then
+        write(6,*) 'chi_fast_init: FFTW (single precision) planning failed'; stop
+      end if
+    end if
     if (.not. c_associated(plan_bw) .or. .not. c_associated(plan_fw)) then
       write(6,*) 'chi_fast_init: FFTW planning failed'; stop
     end if
-    if (verbose) write(6,'(a,3i5,a,f10.1,a,l2)') ' chi_fast: FFTW grid ', n1, n2, n3, ' ; memory budget (MB) ', &
-         mem_budget_mb, ' ; single-precision GEMM:', gemm_sp
+    if (verbose) write(6,'(a,3i5,a,f10.1,a,l2,a,l2)') ' chi_fast: FFTW grid ', n1, n2, n3, ' ; memory budget (MB) ', &
+         mem_budget_mb, ' ; single-precision GEMM:', gemm_sp, ' ; single-precision FFT:', fft_sp
   end subroutine chi_fast_init
 
   !---------------------------------------------------------------------------------------------
@@ -245,7 +259,11 @@ contains
       end if
 
       t0 = omp_get_wtime()
-      call phase_a()
+      if (fft_sp) then
+        call phase_a_sp()
+      else
+        call phase_a()
+      end if
       tA = tA + omp_get_wtime() - t0
       t0 = omp_get_wtime()
       call phase_b()
@@ -345,6 +363,90 @@ contains
       end block
       !$omp end parallel
     end subroutine phase_a
+
+    subroutine phase_a_sp()   ! as phase_a, grid functions/FFTs in single precision (fast_fft_sp=1)
+      !$omp parallel default(shared)
+      block
+        type(c_ptr) :: pbuf
+        complex(c_float_complex), pointer :: ubuf(:, :)
+        complex(8), allocatable :: cbuf(:), cJ(:, :), cI(:, :)
+        integer :: ik, ikq, ikir, iop, ikirq, iopq, jl, il, ig, lp, row, jb, ib, ix, g
+        complex(8) :: sumv(3), vm(3), nlvm(3)
+        real(8) :: gv(3), del
+
+        pbuf = fftwf_alloc_complex(int(ldg, c_size_t)*int(bj + bi + 1, c_size_t))
+        call c_f_pointer(pbuf, ubuf, [ldg, bj + bi + 1])     ! columns 1..ntj: occ, bj+1..bj+nti: vir, last: product
+        allocate(cbuf(NTG))
+        if (lq0) then
+          allocate(cJ(NTG, bj), cI(NTG, bi))
+        end if
+
+        !$omp do schedule(dynamic,1)
+        do ik = 1, NTK
+          ikq = kpq(ik)
+          ikir = numirr(ik); iop = numrot(ik)
+          do jl = 1, ntj
+            jb = tj(jl)
+            cbuf = zzero
+            call make_C0(NTG, trs(ik), NG0(ik), KG0(1, 1, ik), RW(1, ik), rginv(1, 1, iop), pg(1, iop), &
+                 nnp, L1, L2, L3, packing(-L1, -L2, -L3, ikir), OCC(1, jb, ikir), cbuf)
+            ubuf(:, jl) = (0.0, 0.0)
+            do ig = 1, NG0(ik)
+              ubuf(gidx(KG0(1, ig, ik), KG0(2, ig, ik), KG0(3, ig, ik)), jl) = cmplx(cbuf(ig), kind=4)
+            end do
+            call fftwf_execute_dft(plan_bw4, ubuf(:, jl), ubuf(:, jl))
+            if (lq0) cJ(1:NG0(ik), jl) = cbuf(1:NG0(ik))
+          end do
+          ikirq = numirr(ikq); iopq = numrot(ikq)
+          do il = 1, nti
+            ib = ti(il)
+            cbuf = zzero
+            call make_C0(NTG, trs(ikq), NG0(ikq), KG0(1, 1, ikq), RW(1, ikq), rginv(1, 1, iopq), pg(1, iopq), &
+                 nnp, L1, L2, L3, packing(-L1, -L2, -L3, ikirq), VIR(1, ib, ikirq), cbuf)
+            ubuf(:, bj + il) = (0.0, 0.0)
+            do ig = 1, NG0(ikq)
+              ubuf(gidx(KG0(1, ig, ikq) - shG(1, ik), KG0(2, ig, ikq) - shG(2, ik), &
+                        KG0(3, ig, ikq) - shG(3, ik)), bj + il) = cmplx(cbuf(ig), kind=4)
+            end do
+            call fftwf_execute_dft(plan_bw4, ubuf(:, bj + il), ubuf(:, bj + il))
+            if (lq0) cI(1:NG0(ikq), il) = cbuf(1:NG0(ikq))
+          end do
+          do lp = 1, np
+            jl = pjl(lp); il = pil(lp)
+            row = ik + NTK*(lp - 1)
+            ubuf(1:ngrid, bj + bi + 1) = conjg(ubuf(1:ngrid, bj + il))*ubuf(1:ngrid, jl)
+            call fftwf_execute_dft(plan_fw4, ubuf(:, bj + bi + 1), ubuf(:, bj + bi + 1))
+            do g = 1, NGeps
+              A(row, g) = cmplx(ubuf(ext(g), bj + bi + 1), kind=8)*scl
+            end do
+            if (lq0) then
+              ! calc_VMab (ikq=ik at q=0) + non-local correction + energy denominator, as in chiqw.F
+              jb = tj(jl); ib = ti(il)
+              sumv = zzero
+              do ig = 1, NG0(ik)
+                gv(:) = dble(KG0(1, ig, ik))*b1(:) + dble(KG0(2, ig, ik))*b2(:) + dble(KG0(3, ig, ik))*b3(:)
+                sumv(:) = sumv(:) + gv(:)*conjg(cI(ig, il))*cJ(ig, jl)
+              end do
+              vm(:) = sumv(:)*zimag
+              del = E_VIR(ib, numirr(ikq)) - E_OCC(jb, numirr(ik))
+              if (abs(del) < delt) del = delt
+              nlvm(:) = MAT_NL(:, ib + off_v, jb + off_o, numirr(ik))
+              vm(:) = -zimag*(vm(:) - nlvm(:))/del
+              do ix = 1, 3
+                V(row, ix) = vm(ix)
+                if (abs(del) <= delt) V(row, ix) = zzero
+              end do
+            end if
+          end do
+        end do
+        !$omp end do
+
+        deallocate(cbuf)
+        if (lq0) deallocate(cJ, cI)
+        call fftwf_free(pbuf)
+      end block
+      !$omp end parallel
+    end subroutine phase_a_sp
 
     !------------------------------------------------------------------------------------------
     ! phase B: tetrahedron weights x_pk(w) (same formulas, log ratios via vectorised log/atan2), times cRPA factor and 1/NTK -> W(ik+NTK*(p-1), w)

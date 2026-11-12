@@ -4,7 +4,7 @@ add_library(chiqw_com STATIC
   m_tetrahedron_20170325.F chiqw_sub.F wrt_optical_property.f90
   m_tetrahedron_fast.F chi_fast.f90)
 respack_no_lto(chi_fast.f90)
-target_link_libraries(chiqw_com PUBLIC respack_options FFTW3::fftw3 LAPACK::LAPACK MPI::MPI_Fortran m)
+target_link_libraries(chiqw_com PUBLIC respack_options FFTW3::fftw3 FFTW3::fftw3f LAPACK::LAPACK MPI::MPI_Fortran m)
 add_executable(calc_chiqw chiqw.F)
 target_link_libraries(calc_chiqw PRIVATE chiqw_com)
 install(TARGETS calc_chiqw RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
