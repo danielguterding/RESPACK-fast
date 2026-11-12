@@ -492,6 +492,7 @@ extern "C" int chi_gpu_gemm(const zc *W, const zc *V, int kc) {
 #ifdef GPU_KC_MAX
   if (!g.gemm_mp && kc > GPU_KC_MAX) kc = GPU_KC_MAX;   // HIP CGEMM: shorter blocks for rocBLAS, see gpu_api.h
 #endif
+  if (g.gemm_mp) kc = 8192;   // FP16 path: accuracy set by the chunk length, longer blocks = fewer chi updates
   { const char *e = getenv("RESPACK_GPU_KC"); if (e && atoi(e) > 0) kc = atoi(e); }   // rows per CGEMM block (testing)
   if (kc < 1 || kc > rows) kc = rows;
   if (ensure(&g.W, &g.W_cap, nW)) return -1;

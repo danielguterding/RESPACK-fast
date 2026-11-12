@@ -261,11 +261,35 @@ rounding unit ε, relative to Σ|x·y|, for same-sign data:
   bounded.
 
 **Chunked accumulation (current implementation):**
-- The small corrections hi·lo + lo·hi (2¹¹ smaller) go into one call with β = 0.
-- hi·hi follows in K chunks of `RESPACK_GPU_FP16_CHUNK` columns (default 512; 0 = all three products in one
-  call), each continued with β = 1.
-- The FP32 result of a block is then added into the double-precision χ. The FP16 path keeps the
-  2048-row blocks; the 512-row cap applies only to rocBLAS's CGEMM.
+- **Corrections.** The small corrections hi·lo + lo·hi (2¹¹ smaller) are computed in one call per block
+  (β = 0). Their bias is negligible relative to χ.
+- **hi·hi in chunks.** hi·hi follows in K chunks of `RESPACK_GPU_FP16_CHUNK` columns (default 512; 0 = all
+  three products in one call), each continued with β = 1, so the chunk results are combined with rounding to
+  nearest.
+- **Blocks of 8192 rows.** The FP16 path uses blocks of 8192 rows (`RESPACK_GPU_KC` overrides). The accuracy
+  depends on the chunk length only: at NG = 1963, 2048-row blocks give 1.14×10⁻⁶ and 8192-row blocks
+  1.07×10⁻⁶. Longer blocks mean fewer updates of the double-precision χ.
+
+**Profile** (`rocprofv3`, NG = 1963, one q, chunk 512, 2048-row blocks; GEMM phase 34 s, no idle time on the
+GPU):
+
+| kernel | calls | time | rate |
+|---|---|---|---|
+| corrections, K′ = 8192, β = 0 | 6090 | 14.1 s | 55 TFLOP/s |
+| hi·hi chunks, K′ = 512, β = 1 | 47460 | 13.1 s | 29 TFLOP/s |
+| `k_packX` | 6090 | 3.1 s | memory bound |
+| `k_accmp` (FP32 → double χ) | 6090 | 3.1 s | memory bound |
+
+**Why the chunks are slow.** Each β = 1 call reads and writes the whole FP32 output (62 MB at NG = 1963). In
+rocBLAS this traffic does not overlap with the compute: a call costs about compute time + 0.19 ms. The cost
+of chunking is therefore set by the number of β = 1 calls (total inner length ÷ chunk), not by their
+arithmetic intensity.
+
+**Tried and rejected: interleaving.** The corrections were put in the same calls ahead of each hi·hi chunk
+(K = 3 × chunk per call, no separate correction call). It was not faster: at NG = 1963 and chunk 512 the GEMM
+phase took 33.4 s, and the calls ran at 39 TFLOP/s, which is compute plus the same 0.19 ms each. It was also
+2–4× less accurate (4.6×10⁻⁶ instead of 1.1×10⁻⁶), for reasons not understood (the internal accumulation
+order of the kernel). It was reverted.
 
 **Usage:** `RESPACK_GPU_GEMM=fp16` in the environment of `calc_chiqw` with `flg_gpu=1`. The input file is
 unchanged, and the CGEMM path stays the default. The code is shared by the CUDA and HIP builds
@@ -278,7 +302,8 @@ unchanged, and the CGEMM path stays the default. The code is shared by the CUDA 
 | CGEMM (default path) | 8.4×10⁻⁷ | 9.8×10⁻⁷ | 4.4×10⁻⁷ | 82.7 s | 139.4 s |
 | FP16, one call, 512-row blocks | 1.1×10⁻⁵ | 3.4×10⁻⁵ | 3.5×10⁻⁶ | 37.0 s | 93.8 s |
 | FP16, chunks of 1024 | 2.3×10⁻⁶ | – | 2.1×10⁻⁶ | 32.2 s | 90.1 s |
-| FP16, chunks of 512 (default) | 1.1×10⁻⁶ | 3.5×10⁻⁶ | 1.1×10⁻⁶ | 33.9 s | 92.0 s |
+| FP16, chunks of 512 | 1.1×10⁻⁶ | 3.5×10⁻⁶ | 1.1×10⁻⁶ | 33.9 s | 92.0 s |
+| FP16, chunks of 512, 8192-row blocks (default) | – | – | 1.07×10⁻⁶ | 31.8 s | 88.2 s |
 | FP16, chunks of 256 | 5.5×10⁻⁷ | 1.8×10⁻⁶ | 7.2×10⁻⁷ | 36.7 s | 93.5 s |
 | CPU double precision, 9950X3D, 16 threads | – | – | – | 265.8 s | 326.8 s |
 
@@ -292,8 +317,10 @@ no longer depends on the block length: SrVO₃ gives 1.147×10⁻⁶ with 512-ro
 blocks. At NG = 1963 the FP16 path is 2.4–2.6× faster than CGEMM in the χ⁰ products and 1.5× faster in
 total. The CPU part (ε inversion, writing ε⁻¹, setup) is about 55 s of the total.
 
-**Status:** under evaluation on the RX 9060 XT. Next steps: a kernel profile to separate the GEMM compute time
-from the overhead (packing, chunk outputs, accumulation into χ), and longer blocks.
+**Status:** experimental, validated on the RX 9060 XT. At NG ≈ 2000 the χ⁰ products are 2.6× faster than
+with CGEMM, at CGEMM-level accuracy. The remaining overhead is the output traffic of the β = 1 chunk calls
+(about 9 s at NG = 1963) plus packing and accumulation (about 4 s). A custom kernel with two-level
+accumulation in registers would remove most of it; the upper bound is about 35 % of the GEMM phase.
 
 **To do: evaluate the FP16 tensor cores on the L40S** (CUDA build, same switch). Measure accuracy against CPU
 double precision and speed against the CGEMM path (≈ 31 TFLOP/s) at SrVO₃ size and at large NG. If accurate,
