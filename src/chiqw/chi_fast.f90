@@ -53,9 +53,9 @@ module m_chi_fast
     integer(c_int) function chi_gpu_available() bind(C, name='chi_gpu_available')
       import :: c_int
     end function chi_gpu_available
-    integer(c_int) function chi_gpu_init(n1, n2, n3, fbatch, verbose) bind(C, name='chi_gpu_init')
+    integer(c_int) function chi_gpu_init(n1, n2, n3, fbatch, verbose, fft_sp) bind(C, name='chi_gpu_init')
       import :: c_int
-      integer(c_int), value :: n1, n2, n3, fbatch, verbose
+      integer(c_int), value :: n1, n2, n3, fbatch, verbose, fft_sp
     end function chi_gpu_init
     integer(c_int) function chi_gpu_q_begin(NG, nen, lq0, ext) bind(C, name='chi_gpu_q_begin')
       import :: c_int
@@ -94,10 +94,10 @@ module m_chi_fast
 contains
 
   !---------------------------------------------------------------------------------------------
-  subroutine chi_fast_init(nx, ny, nz, mem_mb, lverbose, lgemm_sp, lgpu)
+  subroutine chi_fast_init(nx, ny, nz, mem_mb, lverbose, lgemm_sp, lgpu, lfft_sp)
     integer, intent(in) :: nx, ny, nz
     real(8), intent(in) :: mem_mb
-    logical, intent(in) :: lverbose, lgemm_sp, lgpu
+    logical, intent(in) :: lverbose, lgemm_sp, lgpu, lfft_sp
     integer(c_int) :: rc
     type(c_ptr) :: p
     complex(c_double_complex), pointer :: buf(:)
@@ -124,7 +124,7 @@ contains
       if (chi_gpu_available() /= 1) then
         write(6,*) 'flg_gpu=1, but calc_chiqw was built without CUDA (cmake -DRESPACK_CUDA=ON)'; stop
       end if
-      rc = chi_gpu_init(nx, ny, nz, 16, merge(1, 0, lverbose))
+      rc = chi_gpu_init(nx, ny, nz, 16, merge(1, 0, lverbose), merge(1, 0, lfft_sp))
       if (rc /= 0) then
         write(6,*) 'chi_gpu_init failed, code ', rc; stop
       end if

@@ -46,6 +46,10 @@ static struct {
   int n1, n2, n3, fbatch;
   size_t ngrid;
   cufftHandle plan_b, plan_f;
+  int fft_sp;                    // fast_fft_sp=1: single-precision FFTs/products (C2C)
+  cufftHandle plan_b4, plan_f4;
+  cc *u4; size_t u4_cap;
+  cc *f4;
   cublasHandle_t blas;
   cudaStream_t st;
   zc *u; size_t u_cap;           // band functions on the grid, ngrid each
@@ -119,6 +123,36 @@ __global__ void k_gather(size_t n, int NG, size_t ngrid, int p0, const int *__re
   }
 }
 
+// single-precision FFT variants (fast_fft_sp=1)
+__global__ void k_scatter4(size_t n, int ncoef, const zc *__restrict__ coef, const int *__restrict__ idx,
+                           cc *__restrict__ u, size_t ngrid) {
+  for (size_t t = blockIdx.x * (size_t)blockDim.x + threadIdx.x; t < n; t += (size_t)gridDim.x * blockDim.x) {
+    size_t b = t / ncoef, i = t - b * ncoef;
+    u[b * ngrid + idx[i]] = make_cuComplex((float)cuCreal(coef[t]), (float)cuCimag(coef[t]));
+  }
+}
+
+__global__ void k_products4(size_t n, size_t ngrid, int p0, const int *__restrict__ pj, const int *__restrict__ pi,
+                            const cc *__restrict__ u, int ubJ, int ubI, cc *__restrict__ f) {
+  for (size_t t = blockIdx.x * (size_t)blockDim.x + threadIdx.x; t < n; t += (size_t)gridDim.x * blockDim.x) {
+    size_t b = t / ngrid, r = t - b * ngrid;
+    int p = p0 + (int)b;
+    cc a = u[(size_t)(ubI + pi[p]) * ngrid + r];
+    cc c = u[(size_t)(ubJ + pj[p]) * ngrid + r];
+    f[t] = cuCmulf(cuConjf(a), c);
+  }
+}
+
+__global__ void k_gather4(size_t n, int NG, size_t ngrid, int p0, const int *__restrict__ ext,
+                          const cc *__restrict__ f, zc *__restrict__ At, int ik0, int NTK, double scl) {
+  for (size_t t = blockIdx.x * (size_t)blockDim.x + threadIdx.x; t < n; t += (size_t)gridDim.x * blockDim.x) {
+    size_t b = t / NG, gg = t - b * NG;
+    size_t row = (size_t)ik0 + (size_t)NTK * (size_t)(p0 + b);
+    cc v = f[b * ngrid + ext[gg]];
+    At[gg + (size_t)NG * row] = make_cuDoubleComplex((double)cuCrealf(v) * scl, (double)cuCimagf(v) * scl);
+  }
+}
+
 __global__ void k_d2f(size_t n, const zc *__restrict__ x, cc *__restrict__ y) {
   for (size_t t = blockIdx.x * (size_t)blockDim.x + threadIdx.x; t < n; t += (size_t)gridDim.x * blockDim.x)
     y[t] = make_cuComplex((float)cuCreal(x[t]), (float)cuCimag(x[t]));
@@ -160,7 +194,7 @@ static int local_rank(void) {
   return 0;
 }
 
-extern "C" int chi_gpu_init(int n1, int n2, int n3, int fbatch, int verbose) {
+extern "C" int chi_gpu_init(int n1, int n2, int n3, int fbatch, int verbose, int fft_sp) {
   if (g.init) return 0;
   memset(&g, 0, sizeof(g));
   int ndev = 0;
@@ -179,13 +213,22 @@ extern "C" int chi_gpu_init(int n1, int n2, int n3, int fbatch, int verbose) {
   CF(cufftPlanMany(&g.plan_f, 3, dims, NULL, 1, (int)g.ngrid, NULL, 1, (int)g.ngrid, CUFFT_Z2Z, g.fbatch));
   CF(cufftSetStream(g.plan_b, g.st));
   CF(cufftSetStream(g.plan_f, g.st));
-  CK(cudaMalloc((void **)&g.f, g.ngrid * g.fbatch * sizeof(zc)));
+  g.fft_sp = fft_sp;
+  if (fft_sp) {
+    CF(cufftPlanMany(&g.plan_b4, 3, dims, NULL, 1, (int)g.ngrid, NULL, 1, (int)g.ngrid, CUFFT_C2C, 1));
+    CF(cufftPlanMany(&g.plan_f4, 3, dims, NULL, 1, (int)g.ngrid, NULL, 1, (int)g.ngrid, CUFFT_C2C, g.fbatch));
+    CF(cufftSetStream(g.plan_b4, g.st));
+    CF(cufftSetStream(g.plan_f4, g.st));
+    CK(cudaMalloc((void **)&g.f4, g.ngrid * g.fbatch * sizeof(cc)));
+  } else {
+    CK(cudaMalloc((void **)&g.f, g.ngrid * g.fbatch * sizeof(zc)));
+  }
   g.init = 1;
   if (verbose) {
     cudaDeviceProp pr;
     CK(cudaGetDeviceProperties(&pr, g.dev));
-    printf(" chi_gpu: local rank %d -> device %d (%s, %.1f GB), grid %d %d %d, FFT batch %d\n", local_rank(), g.dev,
-           pr.name, pr.totalGlobalMem / 1073741824.0, n1, n2, n3, g.fbatch);
+    printf(" chi_gpu: local rank %d -> device %d (%s, %.1f GB), grid %d %d %d, FFT batch %d, %s FFTs\n", local_rank(),
+           g.dev, pr.name, pr.totalGlobalMem / 1073741824.0, n1, n2, n3, g.fbatch, fft_sp ? "single-precision" : "double-precision");
     fflush(stdout);
   }
   return 0;
@@ -216,7 +259,11 @@ extern "C" int chi_gpu_q_begin(int NG, int nen, int lq0, const int *ext) {
 extern "C" int chi_gpu_tile_begin(int rows, int nu, int np, const int *pj, const int *pi) {
   g.rows = rows; g.np = np;
   if (ensure(&g.At, &g.At_cap, (size_t)g.NG * rows)) return -1;
-  if (ensure(&g.u, &g.u_cap, g.ngrid * (size_t)nu)) return -1;
+  if (g.fft_sp) {
+    if (ensure(&g.u4, &g.u4_cap, g.ngrid * (size_t)nu)) return -1;
+  } else {
+    if (ensure(&g.u, &g.u_cap, g.ngrid * (size_t)nu)) return -1;
+  }
   if (ensure(&g.pj, &g.pj_cap, (size_t)np)) return -1;
   if (ensure(&g.pi, &g.pi_cap, (size_t)np)) return -1;
   CK(cudaMemcpyAsync(g.pj, pj, np * sizeof(int), cudaMemcpyHostToDevice, g.st));
@@ -234,14 +281,25 @@ extern "C" int chi_gpu_bands(int nb, int ldc, const zc *coef, int ncoef, const i
   CK(cudaMemcpy2DAsync(g.coef, ncoef * sizeof(zc), coef, (size_t)ldc * sizeof(zc), ncoef * sizeof(zc), nb,
                        cudaMemcpyHostToDevice, g.st));
   CK(cudaMemcpyAsync(g.idx, idx, ncoef * sizeof(int), cudaMemcpyHostToDevice, g.st));
-  zc *u0 = g.u + (size_t)ubase * g.ngrid;
-  CK(cudaMemsetAsync(u0, 0, g.ngrid * nb * sizeof(zc), g.st));
   size_t n = (size_t)ncoef * nb;
-  k_scatter<<<grid1(n), 256, 0, g.st>>>(n, ncoef, g.coef, g.idx, u0, g.ngrid);
-  CK(cudaGetLastError());
-  for (int b = 0; b < nb; b++) {
-    zc *ub = u0 + (size_t)b * g.ngrid;
-    CF(cufftExecZ2Z(g.plan_b, ub, ub, CUFFT_INVERSE));
+  if (g.fft_sp) {
+    cc *u0 = g.u4 + (size_t)ubase * g.ngrid;
+    CK(cudaMemsetAsync(u0, 0, g.ngrid * nb * sizeof(cc), g.st));
+    k_scatter4<<<grid1(n), 256, 0, g.st>>>(n, ncoef, g.coef, g.idx, u0, g.ngrid);
+    CK(cudaGetLastError());
+    for (int b = 0; b < nb; b++) {
+      cc *ub = u0 + (size_t)b * g.ngrid;
+      CF(cufftExecC2C(g.plan_b4, ub, ub, CUFFT_INVERSE));
+    }
+  } else {
+    zc *u0 = g.u + (size_t)ubase * g.ngrid;
+    CK(cudaMemsetAsync(u0, 0, g.ngrid * nb * sizeof(zc), g.st));
+    k_scatter<<<grid1(n), 256, 0, g.st>>>(n, ncoef, g.coef, g.idx, u0, g.ngrid);
+    CK(cudaGetLastError());
+    for (int b = 0; b < nb; b++) {
+      zc *ub = u0 + (size_t)b * g.ngrid;
+      CF(cufftExecZ2Z(g.plan_b, ub, ub, CUFFT_INVERSE));
+    }
   }
   // the host buffers (coef, idx) are reused by the caller for the next call
   CK(cudaStreamSynchronize(g.st));
@@ -253,11 +311,18 @@ extern "C" int chi_gpu_pairs(int ik0, int NTK, int ubJ, int ubI, double scl) {
   for (int p0 = 0; p0 < g.np; p0 += g.fbatch) {
     int m = g.np - p0 < g.fbatch ? g.np - p0 : g.fbatch;
     size_t n = (size_t)m * g.ngrid;
-    k_products<<<grid1(n), 256, 0, g.st>>>(n, g.ngrid, p0, g.pj, g.pi, g.u, ubJ, ubI, g.f);
-    CK(cudaGetLastError());
-    CF(cufftExecZ2Z(g.plan_f, g.f, g.f, CUFFT_FORWARD));   // full batch; unused slots ignored
     size_t ng = (size_t)m * g.NG;
-    k_gather<<<grid1(ng), 256, 0, g.st>>>(ng, g.NG, g.ngrid, p0, g.ext, g.f, g.At, ik0, NTK, scl);
+    if (g.fft_sp) {
+      k_products4<<<grid1(n), 256, 0, g.st>>>(n, g.ngrid, p0, g.pj, g.pi, g.u4, ubJ, ubI, g.f4);
+      CK(cudaGetLastError());
+      CF(cufftExecC2C(g.plan_f4, g.f4, g.f4, CUFFT_FORWARD));   // full batch; unused slots ignored
+      k_gather4<<<grid1(ng), 256, 0, g.st>>>(ng, g.NG, g.ngrid, p0, g.ext, g.f4, g.At, ik0, NTK, scl);
+    } else {
+      k_products<<<grid1(n), 256, 0, g.st>>>(n, g.ngrid, p0, g.pj, g.pi, g.u, ubJ, ubI, g.f);
+      CK(cudaGetLastError());
+      CF(cufftExecZ2Z(g.plan_f, g.f, g.f, CUFFT_FORWARD));   // full batch; unused slots ignored
+      k_gather<<<grid1(ng), 256, 0, g.st>>>(ng, g.NG, g.ngrid, p0, g.ext, g.f, g.At, ik0, NTK, scl);
+    }
     CK(cudaGetLastError());
   }
   return 0;

@@ -67,6 +67,7 @@
      +               comm_glb,ierr)
       call MPI_Bcast(fast_gemm_sp,1,MPI_INTEGER,0,comm_glb,ierr)
       call MPI_Bcast(flg_gpu,1,MPI_INTEGER,0,comm_glb,ierr)
+      call MPI_Bcast(fast_fft_sp,1,MPI_INTEGER,0,comm_glb,ierr)
 !--
 !      call MPI_FINALIZE(ierr)
 !      stop
@@ -434,7 +435,7 @@
       if(flg_fast==1)then
        call chi_fast_init(nwx2,nwy2,nwz2,fast_mem_mb,
      +                    myrank_glb.eq.MPI_io_rank,fast_gemm_sp==1,
-     +                    flg_gpu==1)
+     +                    flg_gpu==1,fast_fft_sp==1)
       endif
 !--
 !20180302  
