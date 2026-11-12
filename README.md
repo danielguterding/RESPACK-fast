@@ -1,3 +1,33 @@
+# RESPACK — zen-opt fork (unofficial)
+
+> **This is an unofficial, modified version of RESPACK 20240804.** It is not endorsed by or affiliated
+> with the RESPACK developers. The original code and documentation are at
+> <https://sites.google.com/view/kazuma7k6r>. Please cite the RESPACK paper:
+> K. Nakamura *et al.*, Comput. Phys. Commun. **258**, 107781 (2021).
+>
+> **Modified by Daniel Guterding, November 2026.**
+> - **`calc_chiqw`:** the band-pair loop is restructured: tiles, FFTW, one ZGEMM per frequency into a
+>   shared χ. The generalized-tetrahedron weights are faster.
+> - **`calc_w3d` / `calc_j3d`:** a real-space Wannier-function cache, FFTW, and ZGEMM contractions.
+> - **Result:** about 5–8× faster on the test systems, and χ(G,G′,ω) is no longer duplicated per thread.
+> - **Turning it off:** all changes can be switched off with `flg_fast=0` in `&param_chiqw` and
+>   `&param_calc_int`.
+> - **Details:** see [README-zen-opt.md](README-zen-opt.md): the modified files, validation against the
+>   unmodified code, and performance.
+>
+> - **Validation scope:** checked on SrVO₃ (cRPA) and Si (RPA/cRPA) only. Please compare against
+>   `flg_fast=0` for your own system before production use.
+> - **Branches:** `upstream` contains the unmodified release tarball (RESPACK-20240804.tar.gz) and
+>   `zen-opt` the modifications.
+> - **Incomplete download:** the official tarball download ended prematurely in its last directory
+>   (`src/calc_w4`). All files listed in the build system are present, but trailing files of the
+>   original archive may be missing.
+> - **License:** RESPACK is distributed under GPLv3 (see `GPL/`), and so is this fork. The
+>   generalized-tetrahedron routines carry their own citation condition, or alternatively the MIT
+>   license; see the header of `src/chiqw/m_tetrahedron_20170325.F`.
+
+---
+
 ## RESPACK
 
 ## License

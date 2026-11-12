@@ -1,6 +1,6 @@
 # RESPACK 20240804 — `zen-opt` fork
 
-Local fork of [RESPACK](https://sites.google.com/view/kazuma7k6r) 20240804 (GPLv3) with a restructured
+Unofficial fork of [RESPACK](https://sites.google.com/view/kazuma7k6r) 20240804 (GPLv3) with a restructured
 polarization and interaction code. Branch `upstream` holds the unmodified release; branch `zen-opt`
 holds the changes. Every change can be switched off at run time, which restores the original code paths.
 
@@ -55,6 +55,24 @@ budget means larger tiles and fewer backward FFTs.
   are computed once per q for all requested R. The original recomputed every FFT for each R.
 - **ZGEMM contractions.** ρᵀ ε⁻¹ ρ* is evaluated as ZGEMMs instead of scalar quadruple loops, which matters
   for large NG and many Wannier functions.
+
+## Modified files (GPLv3 §5a; modifications by Daniel Guterding, November 2026)
+
+| file | status | change |
+|---|---|---|
+| `src/chiqw/chi_fast.f90` | new | restructured band-pair loop (module `m_chi_fast`) |
+| `src/chiqw/m_tetrahedron_fast.F` | new (derived from `m_tetrahedron_20170325.F`) | vectorised log ratios, fused ± pass, fused normal tetrahedra |
+| `src/chiqw/chiqw.F` | modified | calls `m_chi_fast` for `flg_fast=1`; original loops kept for `flg_fast=0` |
+| `src/chiqw/m_rdinput.f90` | modified | inputs `flg_fast`, `fast_mem_mb` |
+| `src/chiqw/CMakeLists.txt` | modified | FFTW3, new sources |
+| `src/calc_int/int_fast.f90` | new | module `m_int_fast` |
+| `src/calc_int/calc_intW.F`, `calc_intJ.F` | modified | call `m_int_fast` for `flg_fast=1`; original loops kept; exp(−iq·R) table in `calc_intW.F` |
+| `src/calc_int/calc_int_sub.F` | modified | `make_LG0` loop bounds (identical G lists) |
+| `src/calc_int/m_rdinput.f90`, `config_w3d.h`, `config_j3d.h`, `CMakeLists.txt` | modified | inputs, declarations, FFTW3 |
+| `local-tools/*`, `README-zen-opt.md` | new | build script, validation and benchmark tools, this document |
+
+All changed places in modified files are marked with `fork` comments. The full diff is
+`git diff upstream zen-opt`.
 
 ## Validation (against the unmodified code, same compiler flags)
 

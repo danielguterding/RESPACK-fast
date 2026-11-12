@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Part of the zen-opt fork of RESPACK. Copyright (C) 2026 Daniel Guterding.
+# GNU General Public License, version 3 (see GPL/GPLv3.txt).
 """Compare RESPACK binary dir-eps/qNNN/dat.epsqw.600 files (one Fortran record, complex128 NG*NG*nen).
 usage: cmp_epsqw.py <dir-eps-a> <dir-eps-b>   (compares all common qNNN subdirectories)"""
 import os, sys

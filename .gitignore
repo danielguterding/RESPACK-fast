@@ -1,0 +1,5 @@
+build-zen3/
+build/
+*.o
+*.mod
+__pycache__/

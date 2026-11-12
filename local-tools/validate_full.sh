@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Example of the validation reported in README-zen-opt.md. Directory layout (B, test runs of the
+# unmodified build) is specific to the machine it was run on -- adapt the variables below.
+# Part of the zen-opt fork of RESPACK. Copyright (C) 2026 Daniel Guterding.
+# GNU General Public License, version 3 (see GPL/GPLv3.txt).
 # Final validation of the zen-opt fork against the original RESPACK 20240804 (opt build).
 #  A: SrVO3 cRPA full chain (chiqw+w3d+j3d) fork vs original
 #  B: SrVO3 fork chiqw with 2 MPI x 4 OMP vs 1 MPI x 8 OMP
@@ -9,7 +13,7 @@ T=$B/test-SrVO3; S=$B/test-Si
 ORIG=$HOME/local/respack/bin
 FORK=$HOME/local/build/respack-fork-zen3/src
 CMPE=$HOME/local/src/respack-fork/local-tools/cmp_epsqw.py
-CMPR=$T/compare_runs.py
+CMPR=$(cd "$(dirname "$0")" && pwd)/compare_runs.py
 ulimit -s unlimited
 export OMP_STACKSIZE=512M OPENBLAS_NUM_THREADS=1
 

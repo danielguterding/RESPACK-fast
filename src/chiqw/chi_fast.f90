@@ -1,3 +1,13 @@
+! This file is part of the zen-opt fork of RESPACK, a modified version of RESPACK 20240804
+! (original: https://sites.google.com/view/kazuma7k6r, Copyright (c) 2017 Kazuma Nakamura et al.).
+! Copyright (C) 2026 Daniel Guterding
+!
+! This program is free software: you can redistribute it and/or modify it under the terms of the
+! GNU General Public License as published by the Free Software Foundation, version 3 of the License.
+! This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without
+! even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+! General Public License (GPL/GPLv3.txt) for more details.
+!
 !
 ! m_chi_fast -- restructured band-pair loop of calc_chiqw (RESPACK fork, branch zen-opt)
 !

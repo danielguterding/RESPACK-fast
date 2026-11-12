@@ -1,3 +1,5 @@
+# Part of the zen-opt fork of RESPACK. Copyright (C) 2026 Daniel Guterding.
+# GNU General Public License, version 3 (see GPL/GPLv3.txt).
 import sys, numpy as np
 def rd(p):
     with open(p,'rb') as f:

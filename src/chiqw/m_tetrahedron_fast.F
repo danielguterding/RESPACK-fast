@@ -23,6 +23,11 @@
 !     For those not following the above, this part of the program package is also
 !     released under the MIT License. http://opensource.org/licenses/mit-license.php
 !
+!     Modified 2026 by Daniel Guterding for the zen-opt fork of RESPACK
+!     (copy of m_tetrahedron_20170325.F): log ratios via vectorisable real
+!     log/atan2 (lratio), both signs in one pass (ttrhdrn_chi0_pm), fused
+!     normal-tetrahedron kernel (calc0_fused). Same formulas and conditions.
+!
       module m_tetrahedron_fast
       implicit none
       private
