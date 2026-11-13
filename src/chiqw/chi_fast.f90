@@ -176,7 +176,7 @@ contains
 
   !---------------------------------------------------------------------------------------------
   subroutine chi_fast_pairs(lq0, NTK, NTG, Nk_irr, nbufo, nbufv, NTB, N_PAIR, ipair, jpair, &
-       OCC, VIR, E_OCC, E_VIR, P_OCC, P_VIR, &
+       OCC, VIR, d8, OCC4, VIR4, d4, wf_sp, E_OCC, E_VIR, P_OCC, P_VIR, &
        SK0, q, numirr, numrot, trs, NG0, KG0, RW, rginv, pg, nsymq, nnp, L1, L2, L3, packing, &
        LG0, NGeps, No_G_0, b1, b2, b3, MAT_NL, off_v, off_o, &
        dmna, dmnr, nkb1, nkb2, nkb3, imt1, index_kpt, Ef, delt, nen, em, &
@@ -184,7 +184,12 @@ contains
     logical, intent(in) :: lq0
     integer, intent(in) :: NTK, NTG, Nk_irr, nbufo, nbufv, NTB, N_PAIR
     integer, intent(in) :: ipair(N_PAIR), jpair(N_PAIR)
-    complex(8), intent(in) :: OCC(NTG, nbufo, Nk_irr), VIR(NTG, nbufv, Nk_irr)
+    ! wave functions in double (OCC, VIR) or, with wf_sp (GPU path), in single precision (OCC4, VIR4); the unused
+    ! pair is a placeholder. d8, d4: (NTG, nbufo, nbufv, Nk_irr) of the arrays as passed
+    integer, intent(in) :: d8(4), d4(4)
+    complex(8), intent(in) :: OCC(d8(1), d8(2), d8(4)), VIR(d8(1), d8(3), d8(4))
+    complex(4), intent(in) :: OCC4(d4(1), d4(2), d4(4)), VIR4(d4(1), d4(3), d4(4))
+    logical, intent(in) :: wf_sp
     real(8), intent(in) :: E_OCC(nbufo, Nk_irr), E_VIR(nbufv, Nk_irr)
     complex(8), intent(in) :: P_OCC(nbufo, NTK), P_VIR(nbufv, NTK)
     real(8), intent(in) :: SK0(3, NTK), q(3)
@@ -228,6 +233,9 @@ contains
       write(6,*) 'chi_fast_pairs: chi_fast_init not called'; stop
     end if
     if (N_PAIR <= 0) return
+    if (wf_sp .and. .not. use_gpu) then
+      write(6,*) 'chi_fast_pairs: single-precision wave functions need the GPU path'; stop
+    end if
     nthr = omp_get_max_threads()
     scl = 1d0/dble(ngrid)
 
@@ -695,23 +703,39 @@ contains
         if (sp_up) then
           !$omp parallel do schedule(static)
           do jl = 1, ntj
-            call c0_apply_sp(NG0(ik), trs(ik), jmapJ, pmapJ, OCC(1, tj(jl), ikir), c4(:, jl))
+            if (wf_sp) then
+              call c0_apply_s(NG0(ik), trs(ik), jmapJ, pmapJ, OCC4(1, tj(jl), ikir), c4(:, jl))
+            else
+              call c0_apply_sp(NG0(ik), trs(ik), jmapJ, pmapJ, OCC(1, tj(jl), ikir), c4(:, jl))
+            end if
           end do
           !$omp end parallel do
           !$omp parallel do schedule(static)
           do il = 1, nti
-            call c0_apply_sp(NG0(ikq), trs(ikq), jmapI, pmapI, VIR(1, ti(il), ikirq), c4(:, ntj + il))
+            if (wf_sp) then
+              call c0_apply_s(NG0(ikq), trs(ikq), jmapI, pmapI, VIR4(1, ti(il), ikirq), c4(:, ntj + il))
+            else
+              call c0_apply_sp(NG0(ikq), trs(ikq), jmapI, pmapI, VIR(1, ti(il), ikirq), c4(:, ntj + il))
+            end if
           end do
           !$omp end parallel do
         else
           !$omp parallel do schedule(static)
           do jl = 1, ntj
-            call c0_apply(NG0(ik), trs(ik), jmapJ, pmapJ, OCC(1, tj(jl), ikir), cJ(1, jl))
+            if (wf_sp) then
+              call c0_apply_s8(NG0(ik), trs(ik), jmapJ, pmapJ, OCC4(1, tj(jl), ikir), cJ(1, jl))
+            else
+              call c0_apply(NG0(ik), trs(ik), jmapJ, pmapJ, OCC(1, tj(jl), ikir), cJ(1, jl))
+            end if
           end do
           !$omp end parallel do
           !$omp parallel do schedule(static)
           do il = 1, nti
-            call c0_apply(NG0(ikq), trs(ikq), jmapI, pmapI, VIR(1, ti(il), ikirq), cI(1, il))
+            if (wf_sp) then
+              call c0_apply_s8(NG0(ikq), trs(ikq), jmapI, pmapI, VIR4(1, ti(il), ikirq), cI(1, il))
+            else
+              call c0_apply(NG0(ikq), trs(ikq), jmapI, pmapI, VIR(1, ti(il), ikirq), cI(1, il))
+            end if
           end do
           !$omp end parallel do
         end if
@@ -969,6 +993,46 @@ contains
       dst(1:n) = (0.0d0, 0.0d0)
     end if
   end subroutine c0_apply
+
+  ! as c0_apply, source and result in single precision (wf_sp)
+  subroutine c0_apply_s(n, itrs, jmap, pmap, src, dst)
+    integer, intent(in) :: n, itrs, jmap(n)
+    complex(8), intent(in) :: pmap(n)
+    complex(4), intent(in) :: src(*)
+    complex(4), intent(inout) :: dst(*)
+    integer :: ig
+    if (itrs == 1) then
+      do ig = 1, n
+        dst(ig) = cmplx(cmplx(src(jmap(ig)), kind=8)*pmap(ig), kind=4)
+      end do
+    else if (itrs == -1) then
+      do ig = 1, n
+        dst(ig) = cmplx(conjg(cmplx(src(jmap(ig)), kind=8)*pmap(ig)), kind=4)
+      end do
+    else
+      dst(1:n) = (0.0, 0.0)
+    end if
+  end subroutine c0_apply_s
+
+  ! as c0_apply, single-precision source, double-precision result (wf_sp, q = 0 k.p terms)
+  subroutine c0_apply_s8(n, itrs, jmap, pmap, src, dst)
+    integer, intent(in) :: n, itrs, jmap(n)
+    complex(8), intent(in) :: pmap(n)
+    complex(4), intent(in) :: src(*)
+    complex(8), intent(inout) :: dst(*)
+    integer :: ig
+    if (itrs == 1) then
+      do ig = 1, n
+        dst(ig) = cmplx(src(jmap(ig)), kind=8)*pmap(ig)
+      end do
+    else if (itrs == -1) then
+      do ig = 1, n
+        dst(ig) = conjg(cmplx(src(jmap(ig)), kind=8)*pmap(ig))
+      end do
+    else
+      dst(1:n) = (0.0d0, 0.0d0)
+    end if
+  end subroutine c0_apply_s8
 
   ! as c0_apply, result in single precision (GPU uploads with single-precision FFTs)
   subroutine c0_apply_sp(n, itrs, jmap, pmap, src, dst)

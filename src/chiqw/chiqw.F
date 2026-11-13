@@ -1137,9 +1137,38 @@
       flush(6) 
       !-- 
       call MPI_BARRIER(comm_glb,ierr)
-      allocate(OCC(NTG,1:nbufo,Nk_irr));OCC(:,:,:)=0.0d0 
-      allocate(VIR(NTG,1:nbufv,Nk_irr));VIR(:,:,:)=0.0d0 
-      allocate(VIR_new(NTG,1:nbufv,Nk_irr));VIR_new(:,:,:)=0.0d0 
+!fork: single-precision wave functions on the GPU path (it uses
+!fork: single-precision FFTs): half the memory; RESPACK_WFN_DP=1 keeps
+!fork: double precision. The ring buffer VIR_new is only needed for
+!fork: more than one rank per q group (band distribution).
+      wf_sp=(flg_fast==1.and.flg_gpu==1.and.fast_fft_sp==1)
+      call get_environment_variable('RESPACK_WFN_DP',cenv,lenv,ienv)
+      if(ienv==0.and.lenv>0)then
+       if(cenv(1:1)=='1')wf_sp=.false.
+      endif
+      if(myrank_glb.eq.MPI_io_rank)write(6,*)'wave functions in ',
+     +   merge('single','double',wf_sp),' precision'
+      if(wf_sp)then
+       allocate(OCC(1,1,1),VIR(1,1,1),VIR_new(1,1,1))
+       allocate(OCC4a(NTG,1:nbufo,Nk_irr));OCC4a=(0.0,0.0)
+       allocate(VIR4a(NTG,1:nbufv,Nk_irr));VIR4a=(0.0,0.0)
+       if(nproc>1)then
+        allocate(VIR4_new(NTG,1:nbufv,Nk_irr))
+       else
+        allocate(VIR4_new(1,1,1))
+       endif
+      else
+       allocate(OCC(NTG,1:nbufo,Nk_irr));OCC(:,:,:)=0.0d0 
+       allocate(VIR(NTG,1:nbufv,Nk_irr));VIR(:,:,:)=0.0d0 
+       if(nproc>1)then
+        allocate(VIR_new(NTG,1:nbufv,Nk_irr));VIR_new(:,:,:)=0.0d0
+       else
+        allocate(VIR_new(1,1,1))
+       endif
+       allocate(OCC4a(1,1,1),VIR4a(1,1,1),VIR4_new(1,1,1))
+      endif
+      OCC4=>OCC4a
+      VIR4=>VIR4a
       call MPI_BARRIER(comm_glb,ierr)
 !--
 !OPEN(102,FILE='./dir-wfn/dat.wfn',FORM='unformatted') 
@@ -1156,27 +1185,61 @@
         dest=0
         pnocld=pno 
         call MPI_Send(pnocld,1,MPI_INTEGER,dest,0,comm,ierr) 
-        call MPI_Recv(OCC(1,1,ik),nbufo*NTG,MPI_DOUBLE_COMPLEX,
-     +                dest,0,comm,status,ierr) 
+        if(wf_sp)then
+         call MPI_Recv(OCC4(1,1,ik),nbufo*NTG,MPI_COMPLEX,
+     +                 dest,0,comm,status,ierr)
+        else
+         call MPI_Recv(OCC(1,1,ik),nbufo*NTG,MPI_DOUBLE_COMPLEX,
+     +                 dest,0,comm,status,ierr)
+        endif
         pnvcld=pnv 
         call MPI_Send(pnvcld,1,MPI_INTEGER,dest,0,comm,ierr) 
-        call MPI_Recv(VIR(1,1,ik),nbufv*NTG,MPI_DOUBLE_COMPLEX,
-     +                dest,0,comm,status,ierr) 
+        if(wf_sp)then
+         call MPI_Recv(VIR4(1,1,ik),nbufv*NTG,MPI_COMPLEX,
+     +                 dest,0,comm,status,ierr)
+        else
+         call MPI_Recv(VIR(1,1,ik),nbufv*NTG,MPI_DOUBLE_COMPLEX,
+     +                 dest,0,comm,status,ierr)
+        endif
        else 
+        allocate(zrd(NTG))
         do ib=1,pno
-         read(102)(OCC(ig,ib,ik),ig=1,NGI(ik))
+         if(wf_sp)then
+          read(102)(zrd(ig),ig=1,NGI(ik))
+          OCC4(1:NGI(ik),ib,ik)=cmplx(zrd(1:NGI(ik)),kind=4)
+         else
+          read(102)(OCC(ig,ib,ik),ig=1,NGI(ik))
+         endif
         enddo 
-        allocate(Otmp(NTG,nbufo));Otmp(:,:)=0.0d0  
+        if(wf_sp)then
+         allocate(Otmp4(NTG,nbufo));Otmp4=(0.0,0.0)
+        else
+         allocate(Otmp(NTG,nbufo));Otmp(:,:)=0.0d0
+        endif
         do source=1,nproc-1
          write(6,*)'source=',source 
          call MPI_Recv(pnocld,1,MPI_INTEGER,source,0,comm,status,ierr) 
          do ib=1,pnocld 
-          read(102)(Otmp(ig,ib),ig=1,NGI(ik))
+          if(wf_sp)then
+           read(102)(zrd(ig),ig=1,NGI(ik))
+           Otmp4(1:NGI(ik),ib)=cmplx(zrd(1:NGI(ik)),kind=4)
+          else
+           read(102)(Otmp(ig,ib),ig=1,NGI(ik))
+          endif
          enddo 
-         call MPI_Send(Otmp(1,1),nbufo*NTG,MPI_DOUBLE_COMPLEX,
-     +                 source,0,comm,ierr) 
+         if(wf_sp)then
+          call MPI_Send(Otmp4(1,1),nbufo*NTG,MPI_COMPLEX,
+     +                  source,0,comm,ierr)
+         else
+          call MPI_Send(Otmp(1,1),nbufo*NTG,MPI_DOUBLE_COMPLEX,
+     +                  source,0,comm,ierr)
+         endif
         enddo!source 
-        deallocate(Otmp) 
+        if(wf_sp)then
+         deallocate(Otmp4)
+        else
+         deallocate(Otmp)
+        endif
         !--
         !20180412 Maxim Charlebois 
         !
@@ -1198,18 +1261,42 @@
         enddo!ib 
         !--
         do ib=1,pnv 
-         read(102)(VIR(ig,ib,ik),ig=1,NGI(ik))
+         if(wf_sp)then
+          read(102)(zrd(ig),ig=1,NGI(ik))
+          VIR4(1:NGI(ik),ib,ik)=cmplx(zrd(1:NGI(ik)),kind=4)
+         else
+          read(102)(VIR(ig,ib,ik),ig=1,NGI(ik))
+         endif
         enddo 
-        allocate(Vtmp(NTG,nbufv));Vtmp(:,:)=0.0d0  
+        if(wf_sp)then
+         allocate(Vtmp4(NTG,nbufv));Vtmp4=(0.0,0.0)
+        else
+         allocate(Vtmp(NTG,nbufv));Vtmp(:,:)=0.0d0
+        endif
         do source=1,nproc-1
          call MPI_Recv(pnvcld,1,MPI_INTEGER,source,0,comm,status,ierr) 
          do ib=1,pnvcld 
-          read(102)(Vtmp(ig,ib),ig=1,NGI(ik))
+          if(wf_sp)then
+           read(102)(zrd(ig),ig=1,NGI(ik))
+           Vtmp4(1:NGI(ik),ib)=cmplx(zrd(1:NGI(ik)),kind=4)
+          else
+           read(102)(Vtmp(ig,ib),ig=1,NGI(ik))
+          endif
          enddo 
-         call MPI_Send(Vtmp(1,1),nbufv*NTG,MPI_DOUBLE_COMPLEX,
-     +                 source,0,comm,ierr) 
+         if(wf_sp)then
+          call MPI_Send(Vtmp4(1,1),nbufv*NTG,MPI_COMPLEX,
+     +                  source,0,comm,ierr)
+         else
+          call MPI_Send(Vtmp(1,1),nbufv*NTG,MPI_DOUBLE_COMPLEX,
+     +                  source,0,comm,ierr)
+         endif
         enddo!source 
-        deallocate(Vtmp) 
+        if(wf_sp)then
+         deallocate(Vtmp4)
+        else
+         deallocate(Vtmp)
+        endif
+        deallocate(zrd)
         do ib=1,NTB-N_CALC_BAND 
         read(102)
         enddo 
@@ -1223,10 +1310,22 @@
      +                    ,comm_perp,ierr)
        call MPI_COMM_RANK(comm_perp,myrank_perp,ierr)
        call MPI_COMM_SIZE(comm_perp,nproc_perp,ierr)
-       call MPI_Bcast(OCC,nbufo*Nk_irr*NTG,MPI_DOUBLE_COMPLEX,  
-     +                0,comm_perp,ierr) 
-       call MPI_Bcast(VIR,nbufv*Nk_irr*NTG,MPI_DOUBLE_COMPLEX,  
-     +                0,comm_perp,ierr) 
+!fork: with one rank per q group every rank has read all bands itself
+       if(num_of_mpi_per_comm>1)then
+        if(wf_sp)then
+         do ik=1,Nk_irr
+          call MPI_Bcast(OCC4(1,1,ik),nbufo*NTG,MPI_COMPLEX,
+     +                   0,comm_perp,ierr)
+          call MPI_Bcast(VIR4(1,1,ik),nbufv*NTG,MPI_COMPLEX,
+     +                   0,comm_perp,ierr)
+         enddo
+        else
+         call MPI_Bcast(OCC,nbufo*Nk_irr*NTG,MPI_DOUBLE_COMPLEX,
+     +                  0,comm_perp,ierr)
+         call MPI_Bcast(VIR,nbufv*Nk_irr*NTG,MPI_DOUBLE_COMPLEX,
+     +                  0,comm_perp,ierr)
+        endif
+       endif
       ENDIF 
 !--
 !      call MPI_BARRIER(comm_glb,ierr)
@@ -1359,7 +1458,11 @@
 !fork: restructured pair loop (m_chi_fast); flg_fast=0 -> original
        if(flg_fast==1)then
         call chi_fast_pairs(.false.,NTK,NTG,Nk_irr,nbufo,nbufv,NTB,
-     +   N_PAIR,i_for_pair,j_for_pair,OCC,VIR,E_OCC,E_VIR,P_OCC,P_VIR,
+     +   N_PAIR,i_for_pair,j_for_pair,OCC,VIR,
+     +   (/size(OCC,1),size(OCC,2),size(VIR,2),size(OCC,3)/),
+     +   OCC4,VIR4,
+     +   (/size(OCC4,1),size(OCC4,2),size(VIR4,2),size(OCC4,3)/),
+     +   wf_sp,E_OCC,E_VIR,P_OCC,P_VIR,
      +   SK0,(/q1,q2,q3/),numirr,numrot,trs,NG0,KG0,RW,rginv,pg,nsymq,
      +   nnp,L1,L2,L3,packing,LG0(1,1,iq),NG_for_eps,0,b1,b2,b3,
      +   MAT_NLr_rNL,N_docc+bnv-1,bno-1,dmna,dmnr,nkb1,nkb2,nkb3,imt1,
@@ -1495,6 +1598,8 @@
 !$OMP END PARALLEL
        endif!flg_fast
        !--
+!fork: nothing to exchange with one rank per q group
+       if(nproc>1)then
        if(myrank.eq.0)write(6,*)'#MPI start'
        call MPI_BARRIER(comm,ierr)
        dest=modulo(myrank+1,nproc)
@@ -1531,11 +1636,17 @@
      +                   P_VIR_new, nbufv*NTK, MPI_DOUBLE_COMPLEX, 
      +                      source,         0, 
      +                        comm,    status,                  ierr)
+       if(wf_sp)then
+        call MPI_SENDRECV(VIR4,nbufv*Nk_irr*NTG,MPI_COMPLEX,
+     +   dest,0,VIR4_new,nbufv*Nk_irr*NTG,MPI_COMPLEX,
+     +   source,0,comm,status,ierr)
+       else
        call MPI_SENDRECV(    VIR, nbufv*Nk_irr*NTG, MPI_DOUBLE_COMPLEX,
      +                      dest,             0, 
      +                    VIR_new, nbufv*Nk_irr*NTG, MPI_DOUBLE_COMPLEX,
      +                     source,             0,
      +                      comm,        status,             ierr)
+       endif
        pnv=newpnv
        bnv=newbnv
        env=newenv
@@ -1543,8 +1654,13 @@
        EV_AVE(1:nbufv)=EV_AVE_new(1:nbufv)
        E_VIR(1:nbufv,1:Nk_irr)=E_VIR_new(1:nbufv,1:Nk_irr)
        P_VIR(1:nbufv,1:NTK)=P_VIR_new(1:nbufv,1:NTK)
-       VIR(1:NTG,1:nbufv,1:Nk_irr)=VIR_new(1:NTG,1:nbufv,1:Nk_irr)
+       if(wf_sp)then
+        VIR4(1:NTG,1:nbufv,1:Nk_irr)=VIR4_new(1:NTG,1:nbufv,1:Nk_irr)
+       else
+        VIR(1:NTG,1:nbufv,1:Nk_irr)=VIR_new(1:NTG,1:nbufv,1:Nk_irr)
+       endif
        if(myrank.eq.0)write(6,*)'#MPI end' 
+       endif!nproc>1
        enddo!irot 
        !--
        tfk(1)=MPI_Wtime()!fork
@@ -1676,16 +1792,32 @@
          ikir=numirr(ik)
          iop=numrot(ik) 
          allocate(C0_K(NTG));C0_K(:)=0.0d0 
+         if(wf_sp)then
+          allocate(zw(NTG));zw(:)=OCC4(:,jb,ikir)
+          call make_C0(NTG,trs(ik),NG0(ik),KG0(1,1,ik),RW(1,ik),
+     +    rginv(1,1,iop),pg(1,iop),nnp,L1,L2,L3,
+     +    packing(-L1,-L2,-L3,ikir),zw(1),C0_K(1))
+          deallocate(zw)
+         else
          call make_C0(NTG,trs(ik),NG0(ik),KG0(1,1,ik),RW(1,ik),
      +   rginv(1,1,iop),pg(1,iop),nnp,L1,L2,L3,
      +   packing(-L1,-L2,-L3,ikir),OCC(1,jb,ikir),C0_K(1)) 
+         endif
 !C0_KQ(:)=VIR(:,ib,ikq) 
          ikir=numirr(ikq)
          iop=numrot(ikq) 
          allocate(C0_KQ(NTG));C0_KQ(:)=0.0d0 
+         if(wf_sp)then
+          allocate(zw(NTG));zw(:)=VIR4(:,ib,ikir)
+          call make_C0(NTG,trs(ikq),NG0(ikq),KG0(1,1,ikq),RW(1,ikq),
+     +    rginv(1,1,iop),pg(1,iop),nnp,L1,L2,L3,
+     +    packing(-L1,-L2,-L3,ikir),zw(1),C0_KQ(1))
+          deallocate(zw)
+         else
          call make_C0(NTG,trs(ikq),NG0(ikq),KG0(1,1,ikq),RW(1,ikq),     
      +   rginv(1,1,iop),pg(1,iop),nnp,L1,L2,L3,
      +   packing(-L1,-L2,-L3,ikir),VIR(1,ib,ikir),C0_KQ(1)) 
+         endif
          call calc_VMaa(NTK,NTG,NG0(1),KG0(1,1,1),C0_K(1),C0_KQ(1),ik, 
      +                  b1(1),b2(1),b3(1),SKT(1),vm(1))  
          deallocate(C0_K,C0_KQ) 
@@ -1762,7 +1894,11 @@
 !fork: restructured pair loop (m_chi_fast); flg_fast=0 -> original
        if(flg_fast==1)then
         call chi_fast_pairs(.true.,NTK,NTG,Nk_irr,nbufo,nbufv,NTB,
-     +   N_PAIR,i_for_pair,j_for_pair,OCC,VIR,E_OCC,E_VIR,P_OCC,P_VIR,
+     +   N_PAIR,i_for_pair,j_for_pair,OCC,VIR,
+     +   (/size(OCC,1),size(OCC,2),size(VIR,2),size(OCC,3)/),
+     +   OCC4,VIR4,
+     +   (/size(OCC4,1),size(OCC4,2),size(VIR4,2),size(OCC4,3)/),
+     +   wf_sp,E_OCC,E_VIR,P_OCC,P_VIR,
      +   SK0,(/q1,q2,q3/),numirr,numrot,trs,NG0,KG0,RW,rginv,pg,nsymq,
      +   nnp,L1,L2,L3,packing,LG0(1,1,iq),NG_for_eps,No_G_0,b1,b2,b3,
      +   MAT_NLr_rNL,N_docc+bnv-1,bno-1,dmna,dmnr,nkb1,nkb2,nkb3,imt1,
@@ -1964,6 +2100,8 @@
 !$OMP END PARALLEL
       endif!flg_fast
       !--
+!fork: nothing to exchange with one rank per q group
+      if(nproc>1)then
       if(myrank.eq.0)write(6,*)'#MPI start' 
        call MPI_BARRIER(comm,ierr)
        dest=modulo(myrank+1,nproc)
@@ -2004,11 +2142,17 @@
      +                   P_VIR_new, nbufv*NTK, MPI_DOUBLE_COMPLEX, 
      +                      source,         0, 
      +                        comm,    status,                  ierr)
+       if(wf_sp)then
+        call MPI_SENDRECV(VIR4,nbufv*Nk_irr*NTG,MPI_COMPLEX,
+     +   dest,0,VIR4_new,nbufv*Nk_irr*NTG,MPI_COMPLEX,
+     +   source,0,comm,status,ierr)
+       else
        call MPI_SENDRECV(    VIR, nbufv*Nk_irr*NTG, MPI_DOUBLE_COMPLEX,
      +                      dest,             0, 
      +                   VIR_new, nbufv*Nk_irr*NTG, MPI_DOUBLE_COMPLEX,
      +                    source,             0,
      +                      comm,        status,             ierr)
+       endif
        pnv=newpnv
        bnv=newbnv
        env=newenv
@@ -2017,8 +2161,13 @@
        EV_AVE(1:nbufv)=EV_AVE_new(1:nbufv)
        E_VIR(1:nbufv,1:Nk_irr)=E_VIR_new(1:nbufv,1:Nk_irr)
        P_VIR(1:nbufv,1:NTK)=P_VIR_new(1:nbufv,1:NTK)
-       VIR(1:NTG,1:nbufv,1:Nk_irr)=VIR_new(1:NTG,1:nbufv,1:Nk_irr)
+       if(wf_sp)then
+        VIR4(1:NTG,1:nbufv,1:Nk_irr)=VIR4_new(1:NTG,1:nbufv,1:Nk_irr)
+       else
+        VIR(1:NTG,1:nbufv,1:Nk_irr)=VIR_new(1:NTG,1:nbufv,1:Nk_irr)
+       endif
        if(myrank.eq.0) write(6,*)'#MPI end' 
+      endif!nproc>1
       enddo!irot 
       !--
       tfk(1)=MPI_Wtime()!fork
