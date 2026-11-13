@@ -570,9 +570,27 @@ k·p terms need the double-precision coefficients, so that q keeps the old path.
 - copies: 28.5 GB in 1.1 s (26 GB/s);
 - pair densities: 15.6 s instead of 18.2 s (5 Ry), 15.0 s instead of 17.1 s (3.5 Ry).
 
-The remaining large items are the pair products, the x pass and the gather: 13 s, about 85 % of the phase. A
-fused kernel that forms the products and computes only the needed x frequencies (19–21 of 90) per line would
-avoid writing and re-reading the full product grid.
+**Fused pair products and x pass (`k_prodx4`).** With single-precision pruned FFTs, the pair products, the x pass
+and the gather of the needed x frequencies (19–21 of 90) are one kernel (`RESPACK_GPU_FUSEX=0` switches it off):
+- **Per block:** one pair and 32 lines (y, z). It loads the lines of both bands with coalesced reads and forms
+  their product in shared memory (about 24 KB, so it also fits AMD GPUs).
+- **Per thread:** the needed frequencies of one line, as a direct DFT with an exact twiddle table, written in the
+  layout of the y pass.
+- **Order:** blocks run pair-fastest, so concurrently running blocks share the band lines in L2.
+
+The full product grid is no longer written and re-read; a direct DFT costs more arithmetic than an FFT, but
+memory traffic was the limit. Effect on the case above:
+
+| one q, L40S | products + x pass + gather (GPU) | pair densities | total |
+|---|---|---|---|
+| 3.5 Ry, before | 13.0 s | 15.0 s | 67.8 s |
+| 3.5 Ry, fused | 4.0 s | 6.2 s | 57.5 s |
+| 5 Ry, fused | 4.0 s | 7.8 s | 125 s (under Nsight Systems) |
+
+ε⁻¹ changes at the rounding level (fused against not fused: 1.1×10⁻⁷). Against CPU double precision: SrVO₃
+chain 4.3×10⁻⁶ (4.6×10⁻⁶ before), Si chain 4.1×10⁻⁷; U(ω), J(ω) unchanged. The pair densities are now split
+about evenly between the CPU rotation (about 3–5 s, overlapped) and the GPU. The kernel reaches about 12
+TFLOP/s; a two-stage DFT (90 = 9 × 10) would need about 5× fewer operations.
 
 **Several GPUs (q-parallel, `MPI_num_qcomm`, one rank per GPU).** Tested with the FP16 path and the
 round-to-nearest kernel: 4 q points of the case above (3.5 Ry), 8 physical cores per rank.

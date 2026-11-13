@@ -104,6 +104,8 @@ static struct {
   // pruned forward FFTs of the pair products (per q): only the NG components of the eps sphere are needed
   int prune, nsx, npxy;          // distinct x columns, distinct (x, y) pairs of the sphere
   int *sxl;                      // nsx: x values
+  int fusex;                     // single precision: pair products + x pass + x gather in one kernel (k_prodx4)
+  cc *twx;                       // n1: exp(-2 pi i x / n1) (forward), for k_prodx4
   int *pxs, *pxy;                // npxy: index into sxl, y value
   int *gp, *gz;                  // NG: (x, y) pair index and z of each G
   char *Bp; size_t Bp_cap;       // after the x pass: fbatch * nsx * n2 * n3 (y contiguous)
@@ -290,6 +292,68 @@ __global__ void k_scatter4(size_t n, int ncoef, const zc *__restrict__ coef, con
   }
 }
 
+// Pair products, forward transform along x and gather of the needed x frequencies in one kernel (single precision):
+//   B[b][y + n2*(s + nsx*z)] = sum_x conj(u_I(x,y,z)) u_J(x,y,z) exp(-2 pi i sxl[s] x / n1),  pair b = p - p0
+// replaces k_products4 + x-pass FFT + k_prx (which write and re-read the full product grid). Block: pair
+// blockIdx.x, lines (y, z) l0 .. l0+lpb-1 (blockIdx.y), 128 threads. The product of the block's lines is formed while
+// loading (coalesced, both bands) into shared memory; then thread (line l, group g) computes the frequencies
+// s = g, g+4, ... as a direct DFT with an exact twiddle table. Pair-fastest block order: concurrently running blocks
+// share the same lines of the batch's bands in L2.
+#define PRODX_T 128
+#define PRODX_G 4      // groups of threads per line (PRODX_T / lpb = PRODX_G with lpb = 32)
+#define PRODX_ACC 8    // frequencies per thread and pass
+__global__ void __launch_bounds__(PRODX_T)
+k_prodx4(int p0, const int *__restrict__ pj, const int *__restrict__ pi, const cc *__restrict__ u, int ubJ, int ubI,
+         size_t ngrid, int n1, int n2, int n3, int nsx, const int *__restrict__ sxl, const cc *__restrict__ twx,
+         cc *__restrict__ B) {
+  extern __shared__ float2 sm[];
+  const int lpb = PRODX_T / PRODX_G, ld = n1 + 1;
+  cc *f = (cc *)sm;                   // lpb x ld
+  cc *tw = f + (size_t)lpb * ld;      // n1
+  const int b = blockIdx.x, p = p0 + b, nlines = n2 * n3, l0 = blockIdx.y * lpb;
+  const int nl = nlines - l0 < lpb ? nlines - l0 : lpb;
+  const cc *uI = u + (size_t)(ubI + pi[p]) * ngrid + (size_t)l0 * n1;
+  const cc *uJ = u + (size_t)(ubJ + pj[p]) * ngrid + (size_t)l0 * n1;
+  for (int e = threadIdx.x; e < nl * n1; e += PRODX_T) {
+    const int l = e / n1, x = e - l * n1;
+    f[l * ld + x] = cuCmulf(cuConjf(uI[e]), uJ[e]);
+  }
+  for (int x = threadIdx.x; x < n1; x += PRODX_T) tw[x] = twx[x];
+  __syncthreads();
+  const int l = threadIdx.x % lpb, g = threadIdx.x / lpb;
+  if (l >= nl) return;
+  const int L = l0 + l, y = L % n2, z = L / n2;
+  const size_t per = (size_t)nsx * n2 * n3;
+  cc *Bb = B + (size_t)b * per + y + (size_t)n2 * (size_t)nsx * z;
+  const cc *fl = f + l * ld;
+  for (int s0 = g; s0 < nsx; s0 += PRODX_G * PRODX_ACC) {
+    int k[PRODX_ACC], idx[PRODX_ACC];
+    float ar[PRODX_ACC], ai[PRODX_ACC];
+#pragma unroll
+    for (int j = 0; j < PRODX_ACC; j++) {
+      const int sj = s0 + PRODX_G * j;
+      k[j] = sj < nsx ? sxl[sj] : 0;
+      idx[j] = 0; ar[j] = 0.f; ai[j] = 0.f;
+    }
+    for (int x = 0; x < n1; x++) {
+      const cc v = fl[x];
+#pragma unroll
+      for (int j = 0; j < PRODX_ACC; j++) {
+        const cc w = tw[idx[j]];
+        ar[j] = fmaf(v.x, w.x, fmaf(-v.y, w.y, ar[j]));
+        ai[j] = fmaf(v.x, w.y, fmaf(v.y, w.x, ai[j]));
+        idx[j] += k[j];
+        if (idx[j] >= n1) idx[j] -= n1;
+      }
+    }
+#pragma unroll
+    for (int j = 0; j < PRODX_ACC; j++) {
+      const int sj = s0 + PRODX_G * j;
+      if (sj < nsx) Bb[(size_t)n2 * sj] = make_cuComplex(ar[j], ai[j]);
+    }
+  }
+}
+
 __global__ void k_products4(size_t n, size_t ngrid, int p0, const int *__restrict__ pj, const int *__restrict__ pi,
                             const cc *__restrict__ u, int ubJ, int ubI, cc *__restrict__ f) {
   for (size_t t = blockIdx.x * (size_t)blockDim.x + threadIdx.x; t < n; t += (size_t)gridDim.x * blockDim.x) {
@@ -466,6 +530,19 @@ extern "C" int chi_gpu_init(int n1, int n2, int n3, int fbatch, int verbose, int
   g.dev = local_rank() % ndev;
   CK(cudaSetDevice(g.dev));
   g.n1 = n1; g.n2 = n2; g.n3 = n3;
+  {   // twiddles of the fused x pass (exact: computed in double precision, rounded once)
+    cc *tw = (cc *)malloc((size_t)n1 * sizeof(cc));
+    for (int x = 0; x < n1; x++) {
+      const double a = -2.0 * M_PI * (double)x / (double)n1;
+      tw[x] = make_cuComplex((float)cos(a), (float)sin(a));
+    }
+    CK(cudaMalloc((void **)&g.twx, (size_t)n1 * sizeof(cc)));
+    CK(cudaMemcpy(g.twx, tw, (size_t)n1 * sizeof(cc), cudaMemcpyHostToDevice));
+    free(tw);
+    const char *e = getenv("RESPACK_GPU_FUSEX");
+    // shared memory of k_prodx4: 32 lines of n1+1 plus n1 twiddles; 48 KB fits all GPUs without opt-in
+    g.fusex = !(e && strcmp(e, "0") == 0) && ((size_t)(32 * (n1 + 1) + n1) * sizeof(cc) <= 48 * 1024);
+  }
   g.ngrid = (size_t)n1 * n2 * n3;
   // grids per batched FFT (bands and pair products): fbatch > 0 from the caller, RESPACK_GPU_FBATCH, or
   // automatic from a 256 MB budget (16 .. 1024); small grids need large batches to amortise the launches
@@ -612,8 +689,9 @@ extern "C" int chi_gpu_q_begin(int NG, int nen, int lq0, const int *ext) {
       if (ensure(&g.Cp, &g.Cp_cap, (size_t)g.fbatch * npxy * g.n3 * es)) return -1;
     }
     if (g.verbose)
-      printf(" chi_gpu: NG %d, pruned FFTs %s (x columns %d of %d, (x,y) pairs %d of %d; y+z passes %.2f of a full pass)\n",
-             NG, g.prune ? "on" : "off", nsx, n1, npxy, n1 * n2, rel);
+      printf(" chi_gpu: NG %d, pruned FFTs %s (x columns %d of %d, (x,y) pairs %d of %d; y+z passes %.2f of a full pass)%s\n",
+             NG, g.prune ? "on" : "off", nsx, n1, npxy, n1 * n2, rel,
+             g.prune && g.fft_sp && g.fusex ? "; products + x pass fused" : "");
     free(xm); free(sxl); free(gp); free(gz); free(pm); free(pxs); free(pxy);
   }
   size_t nchi = (size_t)NG * NG * nen;
@@ -713,13 +791,22 @@ extern "C" int chi_gpu_pairs(int ik0, int NTK, int ubJ, int ubI, double scl) {
     if (g.prune) {   // forward FFT as x pass (all lines), y pass (needed x), z pass (needed (x, y))
       const int n1 = g.n1, n2 = g.n2, n3 = g.n3, nsx = g.nsx, npxy = g.npxy, sp = g.fft_sp;
       void *f = sp ? (void *)g.f4 : (void *)g.f;
-      if (sp) k_products4<<<grid1(n), 256, 0, g.st>>>(n, g.ngrid, p0, g.pj, g.pi, g.u4, ubJ, ubI, g.f4);
-      else k_products<<<grid1(n), 256, 0, g.st>>>(n, g.ngrid, p0, g.pj, g.pi, g.u, ubJ, ubI, g.f);
-      CK(cudaGetLastError());
-      if (fft1_many(f, m, n2 * n3, n1, sp, CUFFT_FORWARD)) return -2;
       size_t nb = (size_t)m * nsx * n2 * n3, nc = (size_t)m * npxy * n3;
-      if (sp) k_prx<cc><<<grid1(nb), 256, 0, g.st>>>(nb, n1, n2, n3, nsx, g.sxl, g.f4, g.ngrid, (cc *)g.Bp);
-      else k_prx<zc><<<grid1(nb), 256, 0, g.st>>>(nb, n1, n2, n3, nsx, g.sxl, g.f, g.ngrid, (zc *)g.Bp);
+      if (sp && g.fusex) {   // products, x pass and x gather fused (k_prodx4)
+        const int lpb = PRODX_T / PRODX_G;
+        const dim3 grd(m, (n2 * n3 + lpb - 1) / lpb);
+        const size_t shm = (size_t)(lpb * (n1 + 1) + n1) * sizeof(cc);
+        k_prodx4<<<grd, PRODX_T, shm, g.st>>>(p0, g.pj, g.pi, g.u4, ubJ, ubI, g.ngrid, n1, n2, n3, nsx, g.sxl, g.twx,
+                                              (cc *)g.Bp);
+        CK(cudaGetLastError());
+      } else {
+        if (sp) k_products4<<<grid1(n), 256, 0, g.st>>>(n, g.ngrid, p0, g.pj, g.pi, g.u4, ubJ, ubI, g.f4);
+        else k_products<<<grid1(n), 256, 0, g.st>>>(n, g.ngrid, p0, g.pj, g.pi, g.u, ubJ, ubI, g.f);
+        CK(cudaGetLastError());
+        if (fft1_many(f, m, n2 * n3, n1, sp, CUFFT_FORWARD)) return -2;
+        if (sp) k_prx<cc><<<grid1(nb), 256, 0, g.st>>>(nb, n1, n2, n3, nsx, g.sxl, g.f4, g.ngrid, (cc *)g.Bp);
+        else k_prx<zc><<<grid1(nb), 256, 0, g.st>>>(nb, n1, n2, n3, nsx, g.sxl, g.f, g.ngrid, (zc *)g.Bp);
+      }
       if (fft1_many(g.Bp, m, nsx * n3, n2, sp, CUFFT_FORWARD)) return -2;
       if (sp) k_pry<cc><<<grid1(nc), 256, 0, g.st>>>(nc, n2, n3, nsx, npxy, g.pxs, g.pxy, (cc *)g.Bp, (cc *)g.Cp);
       else k_pry<zc><<<grid1(nc), 256, 0, g.st>>>(nc, n2, n3, nsx, npxy, g.pxs, g.pxy, (zc *)g.Bp, (zc *)g.Cp);
