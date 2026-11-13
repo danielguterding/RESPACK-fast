@@ -514,34 +514,57 @@ CGEMM ∝ NG²·N_k·N_pair·N_ω and the FFTs ∝ N_pair·N_k·N_grid.
 
 ### Remaining GPU candidates
 
-The figures below are projected for a large molecular crystal (about 120 atoms per cell; NG ≈ 2100,
-N_pair ≈ 10⁵, N_k = 75, N_grid ≈ 3×10⁵, 70 ω) from the rates measured at NG = 1963, not measured on such a
-system.
+Measured on a large molecular crystal: about 120 atoms per cell, 75 k points, FFT grid 90 × 48 × 72, SCF wave
+functions with 289 bands, 11,858 band pairs; one q with FP16 and the round-to-nearest kernel on one L40S, 8 CPU
+cores. Production runs with about 650 bands have about 8× as many pairs.
 
-| part | where | projected cost per q (L40S) | status |
+| one q | `Ecut_for_eps` 3.5 Ry (NG 1231) | 5 Ry (NG 2100) | 5 Ry, CGEMM |
 |---|---|---|---|
-| χ⁰ products | GPU | ≈ 6 min (FP16 split, round-to-nearest kernel) | done |
-| pair-density FFTs (`fast_fft_sp=1`, pruned) | GPU | ≈ 5–8 min including the rotation below | done |
-| wave-function rotation (`make_C0_map`) + uploads | CPU, serial with the GPU | part of the line above | next candidate: GPU-resident irreducible wave functions |
-| tetrahedron weights | CPU | ≈ 2 min (8 cores) | done: overlapped with the χ⁰ products of the previous tile |
-| ε inversion (70 ω), writing ε⁻¹ | CPU | ≈ 0.5 min, ≈ 5 GB per q | done: in the background (`flg_async_eps`) |
-| `calc_w3d` / `calc_j3d` | CPU | minutes per system | no |
+| pair densities (rotation, uploads, FFTs) | 18.9 s | 21.5 s | 21.6 s |
+| tetrahedron weights | 4.2 s (1 tile: not overlapped) | 4.3 s | 4.4 s |
+| χ⁰ products | 16.6 s | 49.6 s | 73.3 s |
+| ε inversion / writing ε⁻¹ (in the background with several q) | 7.6 / 1.6 s | 36.3 / 4.9 s | 36.2 / 5.4 s |
+| total, including reading the wave functions | 90 s | 160 s | 184 s |
+
+**Tile size on the GPU path.** Each band's wave function is rotated on the CPU, uploaded and transformed once per
+tile that contains it, so small tiles repeat that work many times. The tile size used to follow the CPU path's
+rules: a 4 GB host budget that included the pair densities, and per-thread real-space buffers for 8 threads. On
+the GPU path the pair densities and the real-space work are on the GPU, but these rules still cut the tiles to
+10 × 11 band pairs, 125 tiles for this q. Now the GPU path takes 60 % of the device memory left after χ and 2 GB
+for the FFT and GEMM buffers (`RESPACK_GPU_TILE_MB` overrides). The case above then has 1 tile at 3.5 Ry and 2 at
+5 Ry on the L40S:
+
+| one q, L40S | pair densities, old → new tiles | total |
+|---|---|---|
+| 3.5 Ry | 280.2 → 18.9 s | 345 → 90 s |
+| 5 Ry | 184.0 → 21.5 s | 316 → 160 s |
+
+The results are unchanged:
+- SrVO₃ and Si chains: identical, with one tile per q before and after.
+- NG = 1963: ε⁻¹ deviates from CPU double precision by 8.4×10⁻⁷ (7.8×10⁻⁷ before); only the summation
+  order changed.
+
+On a 16 GB card the same case gets about 3 tiles at 3.5 Ry and 6 at 5 Ry. On the RX 9060 XT, with the old tiles
+and other jobs on the CPU, the pair densities took 173 s (3.5 Ry) and 198 s (5 Ry), and the χ⁰ products 56 s and
+158 s (CGEMM: 484 s).
 
 **Overlap of the tetrahedron weights.** With the GPU, the weights of tile t + 1 are computed in a second
 OpenMP thread while the main thread drives the χ⁰ products of tile t on the GPU. They start only after the pair
 densities of tile t: run concurrently with those, they slowed the CPU part of phase A (short parallel loops)
 5-fold. Only the weights of the first tile run alone. The results are bitwise identical. Effect at NG = 1963, one
-q, L40S (4 tiles): 54.6 s instead of 55.8 s (FP16) and 59.2 s instead of 61.3 s (CGEMM). With many tiles, as in
-the projection, practically all of the weights are hidden. When the weights take longer than the χ⁰ products
+q, L40S (4 tiles): 54.6 s instead of 55.8 s (FP16) and 59.2 s instead of 61.3 s (CGEMM). With many tiles,
+practically all of the weights are hidden: production runs with about 650 bands have about 12 tiles per q on an
+L40S at NG = 2100. With a single tile, nothing is hidden. When the weights take longer than the χ⁰ products
 (small NG, e.g. the SrVO₃ and Si chains), the products are hidden instead. In the timing line, the tetrahedron
 time then runs concurrently, so the three phases no longer add up to the wall time.
 
-**Next candidate: GPU-resident irreducible wave functions.** Upload them once per q and rotate them with a gather
-kernel on the GPU. That removes the CPU rotation and the repeated uploads in every tile containing a band. At
-`Ecut_for_psi` = 80 Ry and 650 bands on 24 irreducible k points, they take about 17 GB in single precision: this
-fits the L40S, but not a 16 GB card.
-
-Measure a q point of the real system before implementing it.
+**Remaining candidates.** With large tiles, the pair densities are 20–40 % of a q in this case. The χ⁰ products
+dominate at 5 Ry. GPU-resident irreducible wave functions (rotation on the GPU) would now save only the
+remaining rotation and upload time within that share. The larger levers are:
+- **More GPUs, parallel over q:** `MPI_num_qcomm`, one rank per GPU.
+- **Fewer frequencies in the χ⁰ products:** a spectral (Hilbert-transform) representation. Each transition
+  contributes to a few energy bins instead of all 70 frequencies, with real weights. This changes the method
+  and would need validation against the original code.
 
 ## Build
 

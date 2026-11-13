@@ -44,6 +44,7 @@
 #define cudaGetErrorString hipGetErrorString
 #define cudaGetLastError hipGetLastError
 #define cudaGetDeviceCount hipGetDeviceCount
+#define cudaMemGetInfo hipMemGetInfo
 #define cudaSetDevice hipSetDevice
 #define cudaDeviceProp hipDeviceProp_t
 #define cudaGetDeviceProperties hipGetDeviceProperties

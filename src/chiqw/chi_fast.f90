@@ -55,6 +55,9 @@ module m_chi_fast
     integer(c_int) function chi_gpu_available() bind(C, name='chi_gpu_available')
       import :: c_int
     end function chi_gpu_available
+    real(c_double) function chi_gpu_mem_total_mb() bind(C, name='chi_gpu_mem_total_mb')
+      import :: c_double
+    end function chi_gpu_mem_total_mb
     integer(c_int) function chi_gpu_init(n1, n2, n3, fbatch, verbose, fft_sp) bind(C, name='chi_gpu_init')
       import :: c_int
       integer(c_int), value :: n1, n2, n3, fbatch, verbose, fft_sp
@@ -252,13 +255,32 @@ contains
 
     !--- tile size from the memory budget
     bytes_pair = 16d0*dble(NTK)*dble(NGeps + nen + merge(3, 0, lq0))     ! A, W, V rows of one pair
-    budget = 0.7d0*mem_budget_mb*1048576d0
+    if (use_gpu) then
+      ! GPU path: A, W, V of a tile live on the GPU (W also on the host, twice with the overlap of phase B), the
+      ! real-space work of phase A as well. Budget: 60 % of the device memory left after chi(NG, NG, nen) and 2 GB
+      ! for the FFT and GEMM buffers (RESPACK_GPU_TILE_MB overrides). Larger tiles mean fewer rotations, uploads and
+      ! band FFTs: each band is handled once per tile containing it (fast_mem_mb applies to the CPU path).
+      budget = 0.6d0*(chi_gpu_mem_total_mb() - 16d0*dble(NGeps)**2*dble(nen)/1048576d0 - 2048d0)*1048576d0
+      block
+        character(len=32) :: ev
+        integer :: lev, st
+        call get_environment_variable('RESPACK_GPU_TILE_MB', ev, lev, st)
+        if (st == 0 .and. lev > 0) then
+          read(ev, *, iostat=st) budget
+          if (st == 0) budget = budget*1048576d0
+        end if
+      end block
+      budget = max(budget, 64d0*1048576d0)
+    else
+      budget = 0.7d0*mem_budget_mb*1048576d0
+    end if
     npmax = max(1_8, int(budget/bytes_pair, 8))
     bj = int(min(dble(nJ), max(1d0, sqrt(dble(npmax)))))
     bi = int(min(dble(nI), max(1d0, dble(npmax)/dble(bj))))
     if (bi == nI) bj = int(min(dble(nJ), max(1d0, dble(npmax)/dble(nI))))
-    ! per-thread real-space buffers of phase A must also fit (into the remaining 30 %)
+    ! CPU path: per-thread real-space buffers of phase A must also fit (into the remaining 30 %)
     do
+      if (use_gpu) exit
       bytes_thrA = 16d0*dble(ldg)*dble(bj + bi + 1)*dble(nthr)
       if (bytes_thrA <= 0.3d0*mem_budget_mb*1048576d0 .or. (bj == 1 .and. bi == 1)) exit
       if (bj >= bi) then; bj = max(1, bj/2); else; bi = max(1, bi/2); end if

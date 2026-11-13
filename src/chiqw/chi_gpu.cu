@@ -892,3 +892,9 @@ extern "C" int chi_gpu_q_end(zc *chi_host, zc *Y_host, zc *Z_host) {
 }
 
 extern "C" int chi_gpu_available(void) { return 1; }
+// total memory of the device used by this rank (MB), for the tile size in chi_fast.f90
+extern "C" double chi_gpu_mem_total_mb(void) {
+  size_t fr = 0, tot = 0;
+  if (cudaMemGetInfo(&fr, &tot) != cudaSuccess) return 0.0;
+  return (double)tot / 1048576.0;
+}
