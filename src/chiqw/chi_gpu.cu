@@ -72,6 +72,13 @@ static struct {
   zc *tmp; size_t tmp_cap;       // NG
   cc *Bt; size_t Bt_cap;         // NG*kc
   cc *T4; size_t T4_cap;         // NG*NG
+  // pruned forward FFTs of the pair products (per q): only the NG components of the eps sphere are needed
+  int prune, nsx, npxy;          // distinct x columns, distinct (x, y) pairs of the sphere
+  int *sxl;                      // nsx: x values
+  int *pxs, *pxy;                // npxy: index into sxl, y value
+  int *gp, *gz;                  // NG: (x, y) pair index and z of each G
+  char *Bp; size_t Bp_cap;       // after the x pass: fbatch * nsx * n2 * n3 (y contiguous)
+  char *Cp; size_t Cp_cap;       // after the y pass: fbatch * npxy * n3 (z contiguous)
 } g;
 
 static int grid1(size_t n) {
@@ -124,6 +131,87 @@ static int fft_many(void *data, int m, int sp, int dir) {
     m -= b;
   }
   return 0;
+}
+
+// 1D plans for the pruned FFTs, keyed by (length, batch, precision); flushed when full
+static struct { int len, batch, sp; cufftHandle h; } p1cache[64];
+static int np1cache = 0;
+static int get_plan1(int len, int batch, int sp, cufftHandle *h) {
+  for (int i = 0; i < np1cache; i++)
+    if (p1cache[i].len == len && p1cache[i].batch == batch && p1cache[i].sp == sp) { *h = p1cache[i].h; return 0; }
+  if (np1cache == 64) {   // all queued work must be done before the plans are destroyed
+    CK(cudaStreamSynchronize(g.st));
+    for (int i = 0; i < np1cache; i++) CF(cufftDestroy(p1cache[i].h));
+    np1cache = 0;
+  }
+  cufftHandle p;
+  int n[1] = {len};
+  CF(cufftPlanMany(&p, 1, n, NULL, 1, len, NULL, 1, len, sp ? CUFFT_C2C : CUFFT_Z2Z, batch));
+  CF(cufftSetStream(p, g.st));
+  p1cache[np1cache].len = len; p1cache[np1cache].batch = batch; p1cache[np1cache].sp = sp; p1cache[np1cache].h = p;
+  np1cache++;
+  *h = p;
+  return 0;
+}
+
+// in-place 1D FFTs of length len for m pairs, each with `lines` contiguous lines (pairs consecutive);
+// batches of fbatch pairs, the remainder as powers of two
+static int fft1_many(void *data, int m, int lines, int len, int sp, int dir) {
+  const size_t es = sp ? sizeof(cc) : sizeof(zc);
+  char *d = (char *)data;
+  while (m > 0) {
+    int b = g.fbatch;
+    if (m < g.fbatch) { b = 1; while (2 * b <= m) b *= 2; }
+    cufftHandle p;
+    if (get_plan1(len, lines * b, sp, &p)) return -2;
+    if (sp) { CF(cufftExecC2C(p, (cc *)d, (cc *)d, dir)); }
+    else { CF(cufftExecZ2Z(p, (zc *)d, (zc *)d, dir)); }
+    d += (size_t)b * lines * len * es;
+    m -= b;
+  }
+  return 0;
+}
+
+// pruned FFT: keep the needed x columns after the x pass, with y contiguous: B[b][y + n2*(sx + nsx*z)]
+template <typename T>
+__global__ void k_prx(size_t n, int n1, int n2, int n3, int nsx, const int *__restrict__ sxl, const T *__restrict__ f,
+                      size_t ngrid, T *__restrict__ B) {
+  const size_t per = (size_t)nsx * n2 * n3;
+  for (size_t t = blockIdx.x * (size_t)blockDim.x + threadIdx.x; t < n; t += (size_t)gridDim.x * blockDim.x) {
+    size_t b = t / per, j = t - b * per;
+    int y = (int)(j % n2);
+    size_t r = j / n2;
+    int sx = (int)(r % nsx), z = (int)(r / nsx);
+    B[t] = f[b * ngrid + sxl[sx] + (size_t)n1 * (y + (size_t)n2 * z)];
+  }
+}
+
+// keep the needed (x, y) pairs after the y pass, with z contiguous: C[b][z + n3*p]
+template <typename T>
+__global__ void k_pry(size_t n, int n2, int n3, int nsx, int npxy, const int *__restrict__ pxs, const int *__restrict__ pxy,
+                      const T *__restrict__ B, T *__restrict__ C) {
+  const size_t per = (size_t)npxy * n3, perB = (size_t)nsx * n2 * n3;
+  for (size_t t = blockIdx.x * (size_t)blockDim.x + threadIdx.x; t < n; t += (size_t)gridDim.x * blockDim.x) {
+    size_t b = t / per, j = t - b * per;
+    int z = (int)(j % n3), p = (int)(j / n3);
+    C[t] = B[b * perB + pxy[p] + (size_t)n2 * (pxs[p] + (size_t)nsx * z)];
+  }
+}
+
+__device__ __forceinline__ zc to_zc(zc v) { return v; }
+__device__ __forceinline__ zc to_zc(cc v) { return make_cuDoubleComplex((double)cuCrealf(v), (double)cuCimagf(v)); }
+
+// the NG components after the z pass into At(G, row), x scl
+template <typename T>
+__global__ void k_gatherp(size_t n, int NG, int n3, int npxy, int p0, const int *__restrict__ gp, const int *__restrict__ gz,
+                          const T *__restrict__ C, zc *__restrict__ At, int ik0, int NTK, double scl) {
+  const size_t per = (size_t)npxy * n3;
+  for (size_t t = blockIdx.x * (size_t)blockDim.x + threadIdx.x; t < n; t += (size_t)gridDim.x * blockDim.x) {
+    size_t b = t / NG, gg = t - b * NG;
+    size_t row = (size_t)ik0 + (size_t)NTK * (size_t)(p0 + b);
+    zc v = to_zc(C[b * per + gz[gg] + (size_t)n3 * gp[gg]]);
+    At[gg + (size_t)NG * row] = make_cuDoubleComplex(cuCreal(v) * scl, cuCimag(v) * scl);
+  }
 }
 
 //------------------------------------------------------------------------------------------------
@@ -280,6 +368,54 @@ extern "C" int chi_gpu_q_begin(int NG, int nen, int lq0, const int *ext) {
   g.ext = NULL; g.chi = g.Y = g.Z = NULL;
   CK(cudaMalloc((void **)&g.ext, NG * sizeof(int)));
   CK(cudaMemcpy(g.ext, ext, NG * sizeof(int), cudaMemcpyHostToDevice));
+  // pruning tables from the gather indices ext = x + n1*(y + n2*z)
+  {
+    const int n1 = g.n1, n2 = g.n2;
+    int *xm = (int *)malloc(n1 * sizeof(int)), *sxl = (int *)malloc(n1 * sizeof(int));
+    int *gp = (int *)malloc(NG * sizeof(int)), *gz = (int *)malloc(NG * sizeof(int));
+    for (int x = 0; x < n1; x++) xm[x] = -1;
+    int nsx = 0;
+    for (int i = 0; i < NG; i++) { int x = ext[i] % n1; if (xm[x] < 0) xm[x] = 1; }
+    for (int x = 0; x < n1; x++) if (xm[x] > 0) { xm[x] = nsx; sxl[nsx++] = x; }
+    int *pm = (int *)malloc((size_t)nsx * n2 * sizeof(int)), *pxs = (int *)malloc((size_t)nsx * n2 * sizeof(int)),
+        *pxy = (int *)malloc((size_t)nsx * n2 * sizeof(int));
+    for (int i = 0; i < nsx * n2; i++) pm[i] = -1;
+    int npxy = 0;
+    for (int i = 0; i < NG; i++) {
+      int x = ext[i] % n1, y = (ext[i] / n1) % n2, k = xm[x] + nsx * y;
+      if (pm[k] < 0) { pm[k] = npxy; pxs[npxy] = xm[x]; pxy[npxy] = y; npxy++; }
+      gp[i] = pm[k]; gz[i] = ext[i] / (n1 * n2);
+    }
+    // work of the y and z passes relative to one full pass; pruning pays off below ~1.6 (two passes + copies)
+    double rel = ((double)nsx * n2 * g.n3 + (double)npxy * g.n3) / (double)g.ngrid;
+    const char *e = getenv("RESPACK_GPU_PRUNE");
+    g.prune = e && *e ? atoi(e) : (rel < 1.6);
+    g.nsx = nsx; g.npxy = npxy;
+    if (g.prune) {
+      if (g.sxl) CK(cudaFree(g.sxl));
+      if (g.pxs) CK(cudaFree(g.pxs));
+      if (g.pxy) CK(cudaFree(g.pxy));
+      if (g.gp) CK(cudaFree(g.gp));
+      if (g.gz) CK(cudaFree(g.gz));
+      CK(cudaMalloc((void **)&g.sxl, nsx * sizeof(int)));
+      CK(cudaMalloc((void **)&g.pxs, npxy * sizeof(int)));
+      CK(cudaMalloc((void **)&g.pxy, npxy * sizeof(int)));
+      CK(cudaMalloc((void **)&g.gp, NG * sizeof(int)));
+      CK(cudaMalloc((void **)&g.gz, NG * sizeof(int)));
+      CK(cudaMemcpy(g.sxl, sxl, nsx * sizeof(int), cudaMemcpyHostToDevice));
+      CK(cudaMemcpy(g.pxs, pxs, npxy * sizeof(int), cudaMemcpyHostToDevice));
+      CK(cudaMemcpy(g.pxy, pxy, npxy * sizeof(int), cudaMemcpyHostToDevice));
+      CK(cudaMemcpy(g.gp, gp, NG * sizeof(int), cudaMemcpyHostToDevice));
+      CK(cudaMemcpy(g.gz, gz, NG * sizeof(int), cudaMemcpyHostToDevice));
+      const size_t es = g.fft_sp ? sizeof(cc) : sizeof(zc);
+      if (ensure(&g.Bp, &g.Bp_cap, (size_t)g.fbatch * nsx * n2 * g.n3 * es)) return -1;
+      if (ensure(&g.Cp, &g.Cp_cap, (size_t)g.fbatch * npxy * g.n3 * es)) return -1;
+    }
+    if (g.verbose)
+      printf(" chi_gpu: NG %d, pruned FFTs %s (x columns %d of %d, (x,y) pairs %d of %d; y+z passes %.2f of a full pass)\n",
+             NG, g.prune ? "on" : "off", nsx, n1, npxy, n1 * n2, rel);
+    free(xm); free(sxl); free(gp); free(gz); free(pm); free(pxs); free(pxy);
+  }
   size_t nchi = (size_t)NG * NG * nen;
   CK(cudaMalloc((void **)&g.chi, nchi * sizeof(zc)));
   CK(cudaMemsetAsync(g.chi, 0, nchi * sizeof(zc), g.st));
@@ -343,7 +479,23 @@ extern "C" int chi_gpu_pairs(int ik0, int NTK, int ubJ, int ubI, double scl) {
     int m = g.np - p0 < g.fbatch ? g.np - p0 : g.fbatch;
     size_t n = (size_t)m * g.ngrid;
     size_t ng = (size_t)m * g.NG;
-    if (g.fft_sp) {
+    if (g.prune) {   // forward FFT as x pass (all lines), y pass (needed x), z pass (needed (x, y))
+      const int n1 = g.n1, n2 = g.n2, n3 = g.n3, nsx = g.nsx, npxy = g.npxy, sp = g.fft_sp;
+      void *f = sp ? (void *)g.f4 : (void *)g.f;
+      if (sp) k_products4<<<grid1(n), 256, 0, g.st>>>(n, g.ngrid, p0, g.pj, g.pi, g.u4, ubJ, ubI, g.f4);
+      else k_products<<<grid1(n), 256, 0, g.st>>>(n, g.ngrid, p0, g.pj, g.pi, g.u, ubJ, ubI, g.f);
+      CK(cudaGetLastError());
+      if (fft1_many(f, m, n2 * n3, n1, sp, CUFFT_FORWARD)) return -2;
+      size_t nb = (size_t)m * nsx * n2 * n3, nc = (size_t)m * npxy * n3;
+      if (sp) k_prx<cc><<<grid1(nb), 256, 0, g.st>>>(nb, n1, n2, n3, nsx, g.sxl, g.f4, g.ngrid, (cc *)g.Bp);
+      else k_prx<zc><<<grid1(nb), 256, 0, g.st>>>(nb, n1, n2, n3, nsx, g.sxl, g.f, g.ngrid, (zc *)g.Bp);
+      if (fft1_many(g.Bp, m, nsx * n3, n2, sp, CUFFT_FORWARD)) return -2;
+      if (sp) k_pry<cc><<<grid1(nc), 256, 0, g.st>>>(nc, n2, n3, nsx, npxy, g.pxs, g.pxy, (cc *)g.Bp, (cc *)g.Cp);
+      else k_pry<zc><<<grid1(nc), 256, 0, g.st>>>(nc, n2, n3, nsx, npxy, g.pxs, g.pxy, (zc *)g.Bp, (zc *)g.Cp);
+      if (fft1_many(g.Cp, m, npxy, n3, sp, CUFFT_FORWARD)) return -2;
+      if (sp) k_gatherp<cc><<<grid1(ng), 256, 0, g.st>>>(ng, g.NG, n3, npxy, p0, g.gp, g.gz, (cc *)g.Cp, g.At, ik0, NTK, scl);
+      else k_gatherp<zc><<<grid1(ng), 256, 0, g.st>>>(ng, g.NG, n3, npxy, p0, g.gp, g.gz, (zc *)g.Cp, g.At, ik0, NTK, scl);
+    } else if (g.fft_sp) {
       k_products4<<<grid1(n), 256, 0, g.st>>>(n, g.ngrid, p0, g.pj, g.pi, g.u4, ubJ, ubI, g.f4);
       CK(cudaGetLastError());
       if (fft_many(g.f4, m, 1, CUFFT_FORWARD)) return -2;
