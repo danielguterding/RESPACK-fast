@@ -88,6 +88,7 @@
 #define cufftSetStream hipfftSetStream
 #define cufftExecZ2Z hipfftExecZ2Z
 #define cufftExecC2C hipfftExecC2C
+#define cufftDestroy hipfftDestroy
 
 // BLAS
 #define cublasHandle_t hipblasHandle_t
