@@ -45,7 +45,6 @@
 #define cudaGetLastError hipGetLastError
 #define cudaGetDeviceCount hipGetDeviceCount
 #define cudaMemGetInfo hipMemGetInfo
-#define cudaMemcpy2DAsync hipMemcpy2DAsync
 #define cudaSetDevice hipSetDevice
 #define cudaDeviceProp hipDeviceProp_t
 #define cudaGetDeviceProperties hipGetDeviceProperties
@@ -56,6 +55,7 @@
 #define cudaFree hipFree
 #define cudaMallocHost(p, n) hipHostMalloc((p), (n), hipHostMallocDefault)
 #define cudaFreeHost hipHostFree
+#define cudaHostAlloc hipHostMalloc
 #define cudaMemcpy hipMemcpy
 #define cudaMemcpyAsync hipMemcpyAsync
 #define cudaMemcpy2DAsync hipMemcpy2DAsync

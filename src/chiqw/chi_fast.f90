@@ -50,6 +50,11 @@ module m_chi_fast
   logical, save :: verbose = .false.
   logical, save :: gemm_sp = .false.   ! fast_gemm_sp=1: single-precision CGEMM blocks, double-precision accumulation
   logical, save :: use_gpu = .false.   ! flg_gpu=1: CUDA path (chi_gpu.cu)
+  ! GPU path with single-precision FFTs: rotated coefficients in single precision, in pinned host memory (kept and
+  ! grown as needed; pageable fallback), for the band uploads
+  type(c_ptr), save :: pin_ptr = c_null_ptr
+  integer(8), save :: pin_cap = 0
+  complex(4), allocatable, target, save :: pin_fallback(:)
 
   interface
     integer(c_int) function chi_gpu_available() bind(C, name='chi_gpu_available')
@@ -58,6 +63,20 @@ module m_chi_fast
     real(c_double) function chi_gpu_mem_total_mb() bind(C, name='chi_gpu_mem_total_mb')
       import :: c_double
     end function chi_gpu_mem_total_mb
+    integer(c_int) function chi_gpu_bands_sp(nb, ldc, coef, ncoef, idx, ubase) bind(C, name='chi_gpu_bands_sp')
+      import :: c_int, c_float_complex
+      integer(c_int), value :: nb, ldc, ncoef, ubase
+      complex(c_float_complex), intent(in) :: coef(*)
+      integer(c_int), intent(in) :: idx(*)
+    end function chi_gpu_bands_sp
+    type(c_ptr) function chi_gpu_host_alloc(nbytes) bind(C, name='chi_gpu_host_alloc')
+      import :: c_ptr, c_size_t
+      integer(c_size_t), value :: nbytes
+    end function chi_gpu_host_alloc
+    subroutine chi_gpu_host_free(p) bind(C, name='chi_gpu_host_free')
+      import :: c_ptr
+      type(c_ptr), value :: p
+    end subroutine chi_gpu_host_free
     integer(c_int) function chi_gpu_init(n1, n2, n3, fbatch, verbose, fft_sp) bind(C, name='chi_gpu_init')
       import :: c_int
       integer(c_int), value :: n1, n2, n3, fbatch, verbose, fft_sp
@@ -202,7 +221,7 @@ contains
     integer(c_int) :: rcg
     integer, allocatable :: tj(:), ti(:), pjl(:), pil(:)
     integer :: ntj, nti
-    real(8) :: t0, t1, tA, tB, tC
+    real(8) :: t0, t1, tA, tB, tC, tArot, tAbnd, tApair   ! phase A (GPU): rotation / bands / pairs (host wall)
     integer :: itn, lev0, spl, nsub, isub, lpa, lpb
 
     if (ngrid == 0) then
@@ -309,7 +328,7 @@ contains
     if (verbose) write(6,'(a,l2,a,i8,a,2i6,a,2i6,a,i6)') ' chi_fast: q0=', lq0, ' pairs=', N_PAIR, &
          ' bands(occ,vir)=', nJ, nI, ' tile=', bj, bi, ' ntile=', ntile
 
-    tA = 0d0; tB = 0d0; tC = 0d0
+    tA = 0d0; tB = 0d0; tC = 0d0; tArot = 0d0; tAbnd = 0d0; tApair = 0d0
     allocate(tj(bj), ti(bi))
     if (use_gpu) then
       allocate(ext0(NGeps))
@@ -446,6 +465,8 @@ contains
     end if
     ! with the GPU, the tetrahedron time runs concurrently (except for the first tile): the sum is not the wall time
     if (verbose) write(6,'(a,3f10.2)') ' chi_fast: time (s) pair densities / tetrahedron / zgemm ', tA, tB, tC
+    if (verbose .and. use_gpu) write(6,'(a,3f10.2)') ' chi_fast: pair densities (s) CPU rotation / bands (upload, FFT) /' &
+         //' pairs (products, FFT, gather) ', tArot, tAbnd, tApair
 
   contains
 
@@ -636,10 +657,26 @@ contains
     ! GPU phase A: wave-function rotation on the CPU, grid/FFT/pair-density work on the GPU
     subroutine phase_a_gpu()
       complex(8), allocatable :: cJ(:, :), cI(:, :), pmapJ(:), pmapI(:)
+      complex(4), pointer, contiguous :: c4(:, :)
+      logical :: sp_up
       integer(c_int), allocatable :: idxJ(:), idxI(:), pj0(:), pi0(:)
       integer, allocatable :: jmapJ(:), jmapI(:)
       integer :: ik, ikq, ikir, iop, ikirq, iopq, jl, il, ig, lp
-      allocate(cJ(NTG, ntj), cI(NTG, nti), idxJ(NTG), idxI(NTG), pj0(np), pi0(np))
+      real(8) :: ta0
+      ! single-precision uploads with single-precision FFTs; q = 0 keeps double precision (k.p terms from cJ, cI)
+      sp_up = fft_sp .and. .not. lq0
+      if (sp_up) then
+        call pinned_c4(int(NTG, 8)*int(ntj + nti, 8))
+        if (c_associated(pin_ptr)) then
+          call c_f_pointer(pin_ptr, c4, [NTG, ntj + nti])
+        else
+          c4(1:NTG, 1:ntj + nti) => pin_fallback(1:int(NTG, 8)*int(ntj + nti, 8))
+        end if
+        allocate(cJ(1, 1), cI(1, 1))
+      else
+        allocate(cJ(NTG, ntj), cI(NTG, nti))
+      end if
+      allocate(idxJ(NTG), idxI(NTG), pj0(np), pi0(np))
       allocate(pmapJ(NTG), pmapI(NTG), jmapJ(NTG), jmapI(NTG))
       pj0 = pjl(1:np) - 1
       pi0 = pil(1:np) - 1
@@ -650,30 +687,54 @@ contains
         ikir = numirr(ik); iop = numrot(ik)
         ikirq = numirr(ikq); iopq = numrot(ikq)
         ! rotation maps and phase factors once per k point, then per band only gather and multiply
+        ta0 = omp_get_wtime()
         call make_C0_map(NTG, trs(ik), NG0(ik), KG0(1, 1, ik), RW(1, ik), rginv(1, 1, iop), pg(1, iop), &
              nnp, L1, L2, L3, packing(-L1, -L2, -L3, ikir), jmapJ, pmapJ)
         call make_C0_map(NTG, trs(ikq), NG0(ikq), KG0(1, 1, ikq), RW(1, ikq), rginv(1, 1, iopq), pg(1, iopq), &
              nnp, L1, L2, L3, packing(-L1, -L2, -L3, ikirq), jmapI, pmapI)
-        !$omp parallel do schedule(static)
-        do jl = 1, ntj
-          call c0_apply(NG0(ik), trs(ik), jmapJ, pmapJ, OCC(1, tj(jl), ikir), cJ(1, jl))
-        end do
-        !$omp end parallel do
-        !$omp parallel do schedule(static)
-        do il = 1, nti
-          call c0_apply(NG0(ikq), trs(ikq), jmapI, pmapI, VIR(1, ti(il), ikirq), cI(1, il))
-        end do
-        !$omp end parallel do
+        if (sp_up) then
+          !$omp parallel do schedule(static)
+          do jl = 1, ntj
+            call c0_apply_sp(NG0(ik), trs(ik), jmapJ, pmapJ, OCC(1, tj(jl), ikir), c4(:, jl))
+          end do
+          !$omp end parallel do
+          !$omp parallel do schedule(static)
+          do il = 1, nti
+            call c0_apply_sp(NG0(ikq), trs(ikq), jmapI, pmapI, VIR(1, ti(il), ikirq), c4(:, ntj + il))
+          end do
+          !$omp end parallel do
+        else
+          !$omp parallel do schedule(static)
+          do jl = 1, ntj
+            call c0_apply(NG0(ik), trs(ik), jmapJ, pmapJ, OCC(1, tj(jl), ikir), cJ(1, jl))
+          end do
+          !$omp end parallel do
+          !$omp parallel do schedule(static)
+          do il = 1, nti
+            call c0_apply(NG0(ikq), trs(ikq), jmapI, pmapI, VIR(1, ti(il), ikirq), cI(1, il))
+          end do
+          !$omp end parallel do
+        end if
         do ig = 1, NG0(ik)
           idxJ(ig) = gidx(KG0(1, ig, ik), KG0(2, ig, ik), KG0(3, ig, ik)) - 1
         end do
         do ig = 1, NG0(ikq)
           idxI(ig) = gidx(KG0(1, ig, ikq) - shG(1, ik), KG0(2, ig, ikq) - shG(2, ik), KG0(3, ig, ikq) - shG(3, ik)) - 1
         end do
-        rcg = chi_gpu_bands(ntj, NTG, cJ, NG0(ik), idxJ, 0)
-        call gpu_check(rcg, 'chi_gpu_bands (occ)')
-        rcg = chi_gpu_bands(nti, NTG, cI, NG0(ikq), idxI, ntj)
-        call gpu_check(rcg, 'chi_gpu_bands (vir)')
+        tArot = tArot + omp_get_wtime() - ta0
+        ta0 = omp_get_wtime()
+        if (sp_up) then
+          rcg = chi_gpu_bands_sp(ntj, NTG, c4(:, 1:ntj), NG0(ik), idxJ, 0)
+          call gpu_check(rcg, 'chi_gpu_bands_sp (occ)')
+          rcg = chi_gpu_bands_sp(nti, NTG, c4(:, ntj + 1:ntj + nti), NG0(ikq), idxI, ntj)
+          call gpu_check(rcg, 'chi_gpu_bands_sp (vir)')
+        else
+          rcg = chi_gpu_bands(ntj, NTG, cJ, NG0(ik), idxJ, 0)
+          call gpu_check(rcg, 'chi_gpu_bands (occ)')
+          rcg = chi_gpu_bands(nti, NTG, cI, NG0(ikq), idxI, ntj)
+          call gpu_check(rcg, 'chi_gpu_bands (vir)')
+        end if
+        tAbnd = tAbnd + omp_get_wtime() - ta0
         if (lq0) then
           ! k.p G=0 elements, exactly as in the CPU phase A
           !$omp parallel do schedule(dynamic,16)
@@ -702,8 +763,10 @@ contains
           end do
           !$omp end parallel do
         end if
+        ta0 = omp_get_wtime()
         rcg = chi_gpu_pairs(ik - 1, NTK, 0, ntj, scl)
         call gpu_check(rcg, 'chi_gpu_pairs')
+        tApair = tApair + omp_get_wtime() - ta0
       end do
       deallocate(cJ, cI, idxJ, idxI, pj0, pi0, pmapJ, pmapI, jmapJ, jmapI)
     end subroutine phase_a_gpu
@@ -740,6 +803,22 @@ contains
     end subroutine gpu_check
 
     !------------------------------------------------------------------------------------------
+    ! pinned single-precision buffer of at least n elements (module-level, kept; pageable fallback)
+    subroutine pinned_c4(n)
+      integer(8), intent(in) :: n
+      if (n <= pin_cap) return
+      if (c_associated(pin_ptr)) call chi_gpu_host_free(pin_ptr)
+      pin_ptr = c_null_ptr
+      pin_cap = 0
+      if (allocated(pin_fallback)) deallocate(pin_fallback)
+      pin_ptr = chi_gpu_host_alloc(int(8*n, c_size_t))
+      if (.not. c_associated(pin_ptr)) then
+        if (verbose) write(6,*) 'chi_fast: pinned host memory not available, pageable buffer for the uploads'
+        allocate(pin_fallback(n))
+      end if
+      pin_cap = n
+    end subroutine pinned_c4
+
     ! first non-empty tile after tile i (0: none)
     integer function next_tile(i)
       integer, intent(in) :: i
@@ -890,5 +969,24 @@ contains
       dst(1:n) = (0.0d0, 0.0d0)
     end if
   end subroutine c0_apply
+
+  ! as c0_apply, result in single precision (GPU uploads with single-precision FFTs)
+  subroutine c0_apply_sp(n, itrs, jmap, pmap, src, dst)
+    integer, intent(in) :: n, itrs, jmap(n)
+    complex(8), intent(in) :: pmap(n), src(*)
+    complex(4), intent(inout) :: dst(*)
+    integer :: ig
+    if (itrs == 1) then
+      do ig = 1, n
+        dst(ig) = cmplx(src(jmap(ig))*pmap(ig), kind=4)
+      end do
+    else if (itrs == -1) then
+      do ig = 1, n
+        dst(ig) = cmplx(conjg(src(jmap(ig))*pmap(ig)), kind=4)
+      end do
+    else
+      dst(1:n) = (0.0, 0.0)
+    end if
+  end subroutine c0_apply_sp
 
 end module m_chi_fast

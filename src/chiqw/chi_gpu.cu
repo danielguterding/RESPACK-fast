@@ -64,6 +64,7 @@ static struct {
   zc *u; size_t u_cap;           // band functions on the grid, ngrid each
   zc *f;                         // fbatch pair products, ngrid each
   zc *coef; size_t coef_cap;     // packed coefficients (ncoef, nb)
+  cc *coef4; size_t coef4_cap;   // the same in single precision (chi_gpu_bands_sp)
   int *idx; size_t idx_cap;      // scatter indices (0-based)
   // per q
   int NG, nen, lq0;
@@ -273,6 +274,14 @@ __global__ void k_gather(size_t n, int NG, size_t ngrid, int p0, const int *__re
 }
 
 // single-precision FFT variants (fast_fft_sp=1)
+// single-precision coefficients (chi_gpu_bands_sp)
+__global__ void k_scatter4s(size_t n, int ncoef, const cc *__restrict__ coef, const int *__restrict__ idx,
+                            cc *__restrict__ u, size_t ngrid) {
+  for (size_t t = blockIdx.x * (size_t)blockDim.x + threadIdx.x; t < n; t += (size_t)gridDim.x * blockDim.x) {
+    size_t b = t / ncoef, i = t - b * ncoef;
+    u[b * ngrid + idx[i]] = coef[t];
+  }
+}
 __global__ void k_scatter4(size_t n, int ncoef, const zc *__restrict__ coef, const int *__restrict__ idx,
                            cc *__restrict__ u, size_t ngrid) {
   for (size_t t = blockIdx.x * (size_t)blockDim.x + threadIdx.x; t < n; t += (size_t)gridDim.x * blockDim.x) {
@@ -665,6 +674,37 @@ extern "C" int chi_gpu_bands(int nb, int ldc, const zc *coef, int ncoef, const i
 }
 
 // all np pairs of the tile at k-point ik0 (0-based): products, forward FFTs, gather into At
+// as chi_gpu_bands with single-precision coefficients (fast_fft_sp=1), uploaded from pinned host memory
+// (chi_gpu_host_alloc): half the transfer volume at the full PCIe rate
+extern "C" int chi_gpu_bands_sp(int nb, int ldc, const cc *coef, int ncoef, const int *idx, int ubase) {
+  if (nb <= 0) return 0;
+  if (!g.fft_sp) return -4;
+  if (ensure(&g.coef4, &g.coef4_cap, (size_t)ncoef * nb)) return -1;
+  if (ensure(&g.idx, &g.idx_cap, (size_t)ncoef)) return -1;
+  CK(cudaMemcpy2DAsync(g.coef4, ncoef * sizeof(cc), coef, (size_t)ldc * sizeof(cc), ncoef * sizeof(cc), nb,
+                       cudaMemcpyHostToDevice, g.st));
+  CK(cudaMemcpyAsync(g.idx, idx, ncoef * sizeof(int), cudaMemcpyHostToDevice, g.st));
+  size_t n = (size_t)ncoef * nb;
+  cc *u0 = g.u4 + (size_t)ubase * g.ngrid;
+  CK(cudaMemsetAsync(u0, 0, g.ngrid * nb * sizeof(cc), g.st));
+  k_scatter4s<<<grid1(n), 256, 0, g.st>>>(n, ncoef, g.coef4, g.idx, u0, g.ngrid);
+  CK(cudaGetLastError());
+  if (fft_many(u0, nb, 1, CUFFT_INVERSE)) return -2;
+  // the host buffers (coef, idx) are reused by the caller for the next call
+  CK(cudaStreamSynchronize(g.st));
+  return 0;
+}
+
+// pinned (page-locked) host memory for the coefficient uploads; NULL on failure
+extern "C" void *chi_gpu_host_alloc(size_t nbytes) {
+  void *p = NULL;
+  if (cudaHostAlloc(&p, nbytes, 0) != cudaSuccess) { (void)cudaGetLastError(); return NULL; }
+  return p;
+}
+extern "C" void chi_gpu_host_free(void *p) {
+  if (p) (void)cudaFreeHost(p);
+}
+
 extern "C" int chi_gpu_pairs(int ik0, int NTK, int ubJ, int ubI, double scl) {
   for (int p0 = 0; p0 < g.np; p0 += g.fbatch) {
     int m = g.np - p0 < g.fbatch ? g.np - p0 : g.fbatch;

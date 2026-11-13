@@ -551,6 +551,29 @@ On a 16 GB card the same case gets about 3 tiles at 3.5 Ry and 6 at 5 Ry. On the
 and other jobs on the CPU, the pair densities took 173 s (3.5 Ry) and 198 s (5 Ry), and the χ⁰ products 56 s and
 158 s (CGEMM: 484 s).
 
+**Where the pair-density time goes** (Nsight Systems, 5 Ry case above, L40S, 8 physical cores). The phase is
+limited by the GPU; the CPU rotation (5 s) runs while the GPU transforms the previous k point. GPU time:
+
+| | time |
+|---|---|
+| pair products (`k_products4`) | 5.7 s |
+| forward FFT, x pass (all 90-point lines) | 5.8 s |
+| pruning gather after the x pass (`k_prx`) | 1.5 s |
+| y and z passes, band FFTs, scatter | ≈ 1.3 s |
+| host → GPU copies of the rotated wave functions (double precision, pageable) | 3.7 s (55.8 GB, 15 GB/s) |
+
+**Single-precision uploads.** With single-precision FFTs (`fast_fft_sp=1`, the default with the GPU) the rotated
+coefficients are now written in single precision into a pinned host buffer (`c0_apply_sp`,
+`chi_gpu_bands_sp`). The buffer is kept between tiles, grown as needed and is a few hundred MB; there is a
+pageable fallback. The FFTs already ran in single precision, so the results are bitwise identical. At q = 0 the
+k·p terms need the double-precision coefficients, so that q keeps the old path. Effect on the case above:
+- copies: 28.5 GB in 1.1 s (26 GB/s);
+- pair densities: 15.6 s instead of 18.2 s (5 Ry), 15.0 s instead of 17.1 s (3.5 Ry).
+
+The remaining large items are the pair products, the x pass and the gather: 13 s, about 85 % of the phase. A
+fused kernel that forms the products and computes only the needed x frequencies (19–21 of 90) per line would
+avoid writing and re-reading the full product grid.
+
 **Overlap of the tetrahedron weights.** With the GPU, phases B and C run in sub-blocks of about 32,768 rows.
 While the main thread drives the χ⁰ products of sub-block s on the GPU, a second OpenMP thread computes the
 weights of sub-block s + 1, or of the first sub-block of the next tile; all GPU calls stay on the main thread.
