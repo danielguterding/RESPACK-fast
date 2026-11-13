@@ -574,6 +574,14 @@ The remaining large items are the pair products, the x pass and the gather: 13 s
 fused kernel that forms the products and computes only the needed x frequencies (19–21 of 90) per line would
 avoid writing and re-reading the full product grid.
 
+**Several GPUs (q-parallel, `MPI_num_qcomm`, one rank per GPU).** Tested with the FP16 path and the
+round-to-nearest kernel: 4 q points of the case above (3.5 Ry), 8 physical cores per rank.
+- 1 L40S: 217.9 s; 2 L40S: 145.7 s; ε⁻¹ bitwise identical.
+- Both ranks first read all wave functions (about 30 s here), so the speedup approaches 2× only with many q.
+- Every rank holds all wave functions in double precision: 21.7 GB peak per rank here. With about 650 bands
+  that is an estimated 45–50 GB per rank (wave functions alone about 36 GB). This matters on machines with
+  less RAM.
+
 **Overlap of the tetrahedron weights.** With the GPU, phases B and C run in sub-blocks of about 32,768 rows.
 While the main thread drives the χ⁰ products of sub-block s on the GPU, a second OpenMP thread computes the
 weights of sub-block s + 1, or of the first sub-block of the next tile; all GPU calls stay on the main thread.
