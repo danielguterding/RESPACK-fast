@@ -76,6 +76,12 @@
        flg_async_eps=0
        if(flg_gpu==1) flg_async_eps=1
       endif
+!fork: auto -> single-precision FFTs with flg_gpu=1 (consumer and L40S
+! GPUs are weak in FP64; eps^-1 changes by ~3e-6), double otherwise
+      if(fast_fft_sp<0)then
+       fast_fft_sp=0
+       if(flg_gpu==1) fast_fft_sp=1
+      endif
 !--
 !      call MPI_FINALIZE(ierr)
 !      stop

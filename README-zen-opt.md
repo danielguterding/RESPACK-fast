@@ -58,7 +58,7 @@ CPUs and is the precision model for a GPU port.
 
 These deviations are about 200× smaller than the method's own rounding noise.
 
-`fast_fft_sp` (default 0): if 1, the pair densities are computed with single-precision FFTs (`fftwf`)
+`fast_fft_sp` (default −1 = auto: 0 on the CPU, 1 with `flg_gpu=1`): if 1, the pair densities are computed with single-precision FFTs (`fftwf`)
 and stored in double precision. The q = 0 k·p terms stay in double precision. This needs `libfftw3f`.
 
 | test (with `fast_gemm_sp=1`) | ε⁻¹ vs double precision | U(ω), J(ω) | static U, U′, J |
@@ -147,7 +147,9 @@ ZGEMM 51 s. Use 1 MPI process × 8 OpenMP threads (2 × 4 is ≈ 10 % slower; re
 - **Tetrahedron weights.** These stay on the CPU.
 
 The other switches also apply on the GPU:
-- `fast_fft_sp=1` runs the pair-density FFTs in single precision (cuFFT C2C, 3× faster on an L40S).
+- `fast_fft_sp` runs the pair-density FFTs in single precision (cuFFT C2C, 3× faster on an L40S). It defaults to
+  −1 (auto), which means on with `flg_gpu=1` and off on the CPU. ε⁻¹ changes by about 3×10⁻⁶. Set
+  `fast_fft_sp=0` for double-precision FFTs on the GPU.
 - `fast_mem_mb` sets the tile size.
 
 **Build:**
