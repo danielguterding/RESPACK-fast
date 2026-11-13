@@ -83,10 +83,10 @@ module m_chi_fast
       integer(c_int), value :: ik0, NTK, ubJ, ubI
       real(c_double), value :: scl
     end function chi_gpu_pairs
-    integer(c_int) function chi_gpu_gemm(W, V, kc) bind(C, name='chi_gpu_gemm')
+    integer(c_int) function chi_gpu_gemm(W, V, kc, ldw, row0, nrw) bind(C, name='chi_gpu_gemm')
       import :: c_int, c_double_complex
       complex(c_double_complex), intent(in) :: W(*), V(*)
-      integer(c_int), value :: kc
+      integer(c_int), value :: kc, ldw, row0, nrw
     end function chi_gpu_gemm
     integer(c_int) function chi_gpu_q_end(chi, Y, Z) bind(C, name='chi_gpu_q_end')
       import :: c_int, c_double_complex
@@ -203,7 +203,7 @@ contains
     integer, allocatable :: tj(:), ti(:), pjl(:), pil(:)
     integer :: ntj, nti
     real(8) :: t0, t1, tA, tB, tC
-    integer :: itn, lev0
+    integer :: itn, lev0, spl, nsub, isub, lpa, lpb
 
     if (ngrid == 0) then
       write(6,*) 'chi_fast_pairs: chi_fast_init not called'; stop
@@ -321,18 +321,21 @@ contains
         Dacc = zzero
       end if
     end if
-    ! With the GPU, the tetrahedron weights (CPU) of the next tile are computed in a second thread while the main
-    ! thread drives the chi products of this tile on the GPU (all GPU calls stay on the main thread). They start
-    ! after phase A, whose CPU part (rotation, short parallel loops) would otherwise compete for the cores; during
-    ! phase C the main thread mostly waits for the GPU. Phase B of the first tile runs alone.
+    ! With the GPU, phases B and C run in sub-blocks of spl pairs (about 4 x 8192 rows): while the main thread
+    ! drives the chi products of sub-block s on the GPU, a second thread computes the tetrahedron weights of
+    ! sub-block s+1, or of the first sub-block of the next tile (all GPU calls stay on the main thread). The
+    ! weights start after phase A, whose CPU part (rotation, short parallel loops) would otherwise compete for the
+    ! cores; during phase C the main thread mostly waits for the GPU. Only the first sub-block of the first tile
+    ! runs alone.
     if (use_gpu) then
       lev0 = omp_get_max_active_levels()
       if (lev0 < 2) call omp_set_max_active_levels(2)
+      spl = max(1, 32768/NTK)
       itn = next_tile(0)
       if (itn > 0) then
         allocate(Wn(NTK*tcount(itn), nen))
         t0 = omp_get_wtime()
-        call phase_b(itn, Wn)
+        call phase_b(itn, 1, min(spl, tcount(itn)), Wn)
         tB = tB + omp_get_wtime() - t0
       end if
     end if
@@ -373,17 +376,26 @@ contains
         t0 = omp_get_wtime()
         call phase_a_gpu()
         tA = tA + omp_get_wtime() - t0
-        !$omp parallel num_threads(2) default(shared)
-        if (omp_get_thread_num() == 0) then
-          t0 = omp_get_wtime()
-          call phase_c_gpu()
-          tC = tC + omp_get_wtime() - t0
-        else if (itn > 0) then
-          t1 = omp_get_wtime()
-          call phase_b(itn, Wn)
-          tB = tB + omp_get_wtime() - t1
-        end if
-        !$omp end parallel
+        nsub = (np + spl - 1)/spl
+        do isub = 1, nsub
+          lpa = (isub - 1)*spl + 1
+          lpb = min(np, isub*spl)
+          !$omp parallel num_threads(2) default(shared)
+          if (omp_get_thread_num() == 0) then
+            t0 = omp_get_wtime()
+            call phase_c_gpu(lpa, lpb)
+            tC = tC + omp_get_wtime() - t0
+          else
+            t1 = omp_get_wtime()
+            if (isub < nsub) then
+              call phase_b(it, lpb + 1, min(np, lpb + spl), W)
+            else if (itn > 0) then
+              call phase_b(itn, 1, min(spl, tcount(itn)), Wn)
+            end if
+            tB = tB + omp_get_wtime() - t1
+          end if
+          !$omp end parallel
+        end do
       else
         t0 = omp_get_wtime()
         if (fft_sp) then
@@ -393,7 +405,7 @@ contains
         end if
         tA = tA + omp_get_wtime() - t0
         t0 = omp_get_wtime()
-        call phase_b(it, W)
+        call phase_b(it, 1, np, W)
         tB = tB + omp_get_wtime() - t0
         t0 = omp_get_wtime()
         call phase_c()
@@ -698,19 +710,22 @@ contains
 
     !------------------------------------------------------------------------------------------
     ! GPU phase C: single-precision CGEMM blocks into the double-precision chi on the device
-    subroutine phase_c_gpu()
-      integer :: kc, ie, ix
+    subroutine phase_c_gpu(lpa, lpb)   ! pairs lpa .. lpb of the tile (rows NTK*(lpa-1)+1 .. NTK*lpb)
+      integer, intent(in) :: lpa, lpb
+      integer :: kc, ie, ix, r0, nrw
       kc = 2048                ! rows per single-precision CGEMM block (accuracy: SrVO3 eps^-1 4.7e-7 vs 6.9e-6 at 8192)
+      r0 = NTK*(lpa - 1)
+      nrw = NTK*(lpb - lpa + 1)
       if (lq0) then
-        rcg = chi_gpu_gemm(W, V, kc)
+        rcg = chi_gpu_gemm(W, V, kc, rows, r0, nrw)
         call gpu_check(rcg, 'chi_gpu_gemm')
         do ie = 1, nen
           do ix = 1, 3
-            Dacc(ie, ix) = Dacc(ie, ix) + sum(conjg(V(:, ix))*W(:, ie)*V(:, ix))
+            Dacc(ie, ix) = Dacc(ie, ix) + sum(conjg(V(r0+1:r0+nrw, ix))*W(r0+1:r0+nrw, ie)*V(r0+1:r0+nrw, ix))
           end do
         end do
       else
-        rcg = chi_gpu_gemm(W, W, kc)
+        rcg = chi_gpu_gemm(W, W, kc, rows, r0, nrw)
         call gpu_check(rcg, 'chi_gpu_gemm')
       end if
     end subroutine phase_c_gpu
@@ -740,12 +755,10 @@ contains
 
     !------------------------------------------------------------------------------------------
     ! phase B: tetrahedron weights x_pk(w) (same formulas, log ratios via vectorised log/atan2), times cRPA factor
-    ! and 1/NTK -> Wo(ik+NTK*(p-1), w) for the pairs p of tile itl
-    subroutine phase_b(itl, Wo)
-      integer, intent(in) :: itl
-      complex(8), intent(out) :: Wo(:, :)
-      integer :: npl
-      npl = tcount(itl)
+    ! and 1/NTK -> Wo(ik+NTK*(p-1), w) for the pairs p = lpa .. lpb of tile itl (other rows of Wo untouched)
+    subroutine phase_b(itl, lpa, lpb, Wo)
+      integer, intent(in) :: itl, lpa, lpb
+      complex(8), intent(inout) :: Wo(:, :)
       !$omp parallel default(shared)
       block
         complex(8), allocatable :: e1(:), e2(:), xow(:, :), ca1(:)
@@ -753,7 +766,7 @@ contains
         integer :: lp, ip, jb, ib, ik, ikq, row
         allocate(e1(NTK), e2(NTK), xow(nen, NTK), ca1(4*nen))
         !$omp do schedule(dynamic,1)
-        do lp = 1, npl
+        do lp = lpa, lpb
           ip = tpairs(tstart(itl) + lp - 1)
           jb = jpair(ip); ib = ipair(ip)
           do ik = 1, NTK

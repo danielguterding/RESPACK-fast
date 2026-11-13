@@ -10,5 +10,7 @@ int chi_gpu_q_begin(int a, int b, int c, const int *d) { (void)a; (void)b; (void
 int chi_gpu_tile_begin(int a, int b, int c, const int *d, const int *e) { (void)a; (void)b; (void)c; (void)d; (void)e; return nogpu(); }
 int chi_gpu_bands(int a, int b, const void *c, int d, const int *e, int f) { (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; return nogpu(); }
 int chi_gpu_pairs(int a, int b, int c, int d, double e) { (void)a; (void)b; (void)c; (void)d; (void)e; return nogpu(); }
-int chi_gpu_gemm(const void *a, const void *b, int c) { (void)a; (void)b; (void)c; return nogpu(); }
+int chi_gpu_gemm(const void *a, const void *b, int c, int d, int e, int f) {
+  (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; return nogpu();
+}
 int chi_gpu_q_end(void *a, void *b, void *c) { (void)a; (void)b; (void)c; return nogpu(); }

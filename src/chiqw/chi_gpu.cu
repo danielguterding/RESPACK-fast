@@ -716,8 +716,9 @@ extern "C" int chi_gpu_pairs(int ik0, int NTK, int ubJ, int ubI, double scl) {
 // CUDA, sm_80 and newer (rn_cuda): the same with hgemm_rn.cuh (L40S: 1.6 ms instead of 1.9 ms per block at NG 1963,
 // and the chunks are not accurate enough there: the tensor cores truncate 16x more than RDNA4 at K = 512).
 // Scales: |Y| <= mA, |Xr|, |Xi| <= 2 mA mW(ie); powers of two such that the scaled maxima stay below 2^13.
-static int gemm_mp(const zc *W, int kc) {
-  const int NG = g.NG, nen = g.nen, rows = g.rows;
+// W: host weights of the row range (leading dimension ldw), At: device pair densities of the range, rows rows
+static int gemm_mp(const zc *W, int ldw, const zc *At, int rows, int kc) {
+  const int NG = g.NG, nen = g.nen;
   // G dimension of Xhat, Yhat and T padded to P (multiple of fp16_pad, default 8): with an odd NG, cuBLAS on the
   // L40S picks unaligned FP16 kernels at 135 instead of 190 TFLOP/s (padding the leading dimensions alone does not
   // help). The padding rows of Xhat/Yhat are not written; they only reach the padding of T, which is not read.
@@ -725,7 +726,7 @@ static int gemm_mp(const zc *W, int kc) {
   const size_t nA = (size_t)NG * rows;
   CK(cudaMemsetAsync(g.amax, 0, sizeof(unsigned int), g.st));
   int nbl = grid1(nA) < 1024 ? grid1(nA) : 1024;
-  k_absmax<<<nbl, 256, 0, g.st>>>(nA, g.At, g.amax);
+  k_absmax<<<nbl, 256, 0, g.st>>>(nA, At, g.amax);
   CK(cudaGetLastError());
   unsigned int ua = 0;
   CK(cudaMemcpyAsync(&ua, g.amax, sizeof(ua), cudaMemcpyDeviceToHost, g.st));
@@ -742,7 +743,7 @@ static int gemm_mp(const zc *W, int kc) {
   }
   for (int ie = 0; ie < nen; ie++) {
     double m = 0.;
-    const zc *w = W + (size_t)rows * ie;
+    const zc *w = W + (size_t)ldw * ie;
     for (int r = 0; r < rows; r++) m = fmax(m, fmax(fabs(cuCreal(w[r])), fabs(cuCimag(w[r]))));
     g.mW[ie] = m;
   }
@@ -756,7 +757,7 @@ static int gemm_mp(const zc *W, int kc) {
   for (int r0 = 0; r0 < rows; r0 += kc) {
     const int nr = rows - r0 < kc ? rows - r0 : kc;
     const size_t nb = (size_t)NG * nr;
-    k_packY<<<grid1(nb), 256, 0, g.st>>>(nb, NG, P, nr, g.At, r0, sY, g.Yh);
+    k_packY<<<grid1(nb), 256, 0, g.st>>>(nb, NG, P, nr, At, r0, sY, g.Yh);
     for (int ie = 0; ie < nen; ie++) {
       if (!(g.mW[ie] > 0.0)) continue;
       frexp(2.0 * mA * g.mW[ie], &ex);
@@ -802,9 +803,12 @@ static int gemm_mp(const zc *W, int kc) {
   return 0;
 }
 
-// phase C: W(rows, nen) and (q=0) V(rows, 3) from the host; kc = rows per CGEMM block
-extern "C" int chi_gpu_gemm(const zc *W, const zc *V, int kc) {
-  const int NG = g.NG, nen = g.nen, rows = g.rows;
+// phase C for the rows row0 .. row0+nrw-1 of the tile (0-based): W(ldw, nen) and (q=0) V(ldw, 3) on the host,
+// the pair densities of these rows on the device; kc = rows per CGEMM block. The tile can be processed in
+// several row ranges (chi_fast.f90 overlaps the weights of the next range with this one).
+extern "C" int chi_gpu_gemm(const zc *Wh, const zc *Vh, int kc, int ldw, int row0, int nrw) {
+  const int NG = g.NG, nen = g.nen, rows = nrw;
+  const zc *At = g.At + (size_t)NG * row0, *W = Wh + row0, *V = Vh + row0;
   size_t nA = (size_t)NG * rows, nW = (size_t)rows * nen;
 #ifdef GPU_KC_MAX
   if (!g.gemm_mp && kc > GPU_KC_MAX) kc = GPU_KC_MAX;   // HIP CGEMM: shorter blocks for rocBLAS, see gpu_api.h
@@ -813,15 +817,16 @@ extern "C" int chi_gpu_gemm(const zc *W, const zc *V, int kc) {
   { const char *e = getenv("RESPACK_GPU_KC"); if (e && atoi(e) > 0) kc = atoi(e); }   // rows per CGEMM block (testing)
   if (kc < 1 || kc > rows) kc = rows;
   if (ensure(&g.W, &g.W_cap, nW)) return -1;
-  CK(cudaMemcpyAsync(g.W, W, nW * sizeof(zc), cudaMemcpyHostToDevice, g.st));
+  CK(cudaMemcpy2DAsync(g.W, (size_t)rows * sizeof(zc), W, (size_t)ldw * sizeof(zc), (size_t)rows * sizeof(zc), nen,
+                       cudaMemcpyHostToDevice, g.st));
   if (g.gemm_mp) {
-    if (gemm_mp(W, kc)) return -1;
+    if (gemm_mp(W, ldw, At, rows, kc)) return -1;
   } else {
     if (ensure(&g.A4, &g.A4_cap, nA)) return -1;
     if (ensure(&g.W4, &g.W4_cap, nW)) return -1;
     if (ensure(&g.Bt, &g.Bt_cap, (size_t)NG * kc)) return -1;
     if (ensure(&g.T4, &g.T4_cap, (size_t)NG * NG)) return -1;
-    k_d2f<<<grid1(nA), 256, 0, g.st>>>(nA, g.At, g.A4);
+    k_d2f<<<grid1(nA), 256, 0, g.st>>>(nA, At, g.A4);
     k_d2f<<<grid1(nW), 256, 0, g.st>>>(nW, g.W, g.W4);
     CK(cudaGetLastError());
     const cc one = make_cuComplex(1.f, 0.f), zero = make_cuComplex(0.f, 0.f);
@@ -843,7 +848,8 @@ extern "C" int chi_gpu_gemm(const zc *W, const zc *V, int kc) {
     if (ensure(&g.V, &g.V_cap, (size_t)rows * 3)) return -1;
     if (ensure(&g.xv, &g.xv_cap, (size_t)rows)) return -1;
     if (ensure(&g.tmp, &g.tmp_cap, (size_t)NG)) return -1;
-    CK(cudaMemcpyAsync(g.V, V, (size_t)rows * 3 * sizeof(zc), cudaMemcpyHostToDevice, g.st));
+    CK(cudaMemcpy2DAsync(g.V, (size_t)rows * sizeof(zc), V, (size_t)ldw * sizeof(zc), (size_t)rows * sizeof(zc), 3,
+                         cudaMemcpyHostToDevice, g.st));
     const zc zone = make_cuDoubleComplex(1., 0.), zzero = make_cuDoubleComplex(0., 0.);
     for (int ie = 0; ie < nen; ie++) {
       for (int ix = 0; ix < 3; ix++) {
@@ -851,11 +857,11 @@ extern "C" int chi_gpu_gemm(const zc *W, const zc *V, int kc) {
         zc *Yc = g.Y + (size_t)NG * (ie * 3 + ix), *Zc = g.Z + (size_t)NG * (ie * 3 + ix);
         // y(G) = sum_r conj(A_rG) w_r v_r = conj( sum_r At(G,r) conj(w_r v_r) )
         k_wv<<<grid1(rows), 256, 0, g.st>>>(rows, w, v, 0, g.xv);
-        CB(cublasZgemv(g.blas, CUBLAS_OP_N, NG, rows, &zone, g.At, NG, g.xv, 1, &zzero, g.tmp, 1));
+        CB(cublasZgemv(g.blas, CUBLAS_OP_N, NG, rows, &zone, At, NG, g.xv, 1, &zzero, g.tmp, 1));
         k_addconj<<<grid1(NG), 256, 0, g.st>>>(NG, g.tmp, Yc);
         // z(G) = sum_r A_rG w_r conj(v_r)
         k_wv<<<grid1(rows), 256, 0, g.st>>>(rows, w, v, 1, g.xv);
-        CB(cublasZgemv(g.blas, CUBLAS_OP_N, NG, rows, &zone, g.At, NG, g.xv, 1, &zone, Zc, 1));
+        CB(cublasZgemv(g.blas, CUBLAS_OP_N, NG, rows, &zone, At, NG, g.xv, 1, &zone, Zc, 1));
       }
     }
     CK(cudaGetLastError());

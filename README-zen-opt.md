@@ -515,16 +515,19 @@ CGEMM ∝ NG²·N_k·N_pair·N_ω and the FFTs ∝ N_pair·N_k·N_grid.
 ### Remaining GPU candidates
 
 Measured on a large molecular crystal: about 120 atoms per cell, 75 k points, FFT grid 90 × 48 × 72, SCF wave
-functions with 289 bands, 11,858 band pairs; one q with FP16 and the round-to-nearest kernel on one L40S, 8 CPU
-cores. Production runs with about 650 bands have about 8× as many pairs.
+functions with 289 bands, 11,858 band pairs; one q with FP16 and the round-to-nearest kernel on one L40S and 4
+physical CPU cores (8 hardware threads). Production runs with about 650 bands have about 8× as many pairs.
 
 | one q | `Ecut_for_eps` 3.5 Ry (NG 1231) | 5 Ry (NG 2100) | 5 Ry, CGEMM |
 |---|---|---|---|
 | pair densities (rotation, uploads, FFTs) | 18.9 s | 21.5 s | 21.6 s |
-| tetrahedron weights | 4.2 s (1 tile: not overlapped) | 4.3 s | 4.4 s |
+| tetrahedron weights | 4.2 s (before the sub-blocks: 1 tile, not overlapped) | 4.3 s | 4.4 s |
 | χ⁰ products | 16.6 s | 49.6 s | 73.3 s |
 | ε inversion / writing ε⁻¹ (in the background with several q) | 7.6 / 1.6 s | 36.3 / 4.9 s | 36.2 / 5.4 s |
 | total, including reading the wave functions | 90 s | 160 s | 184 s |
+
+With 8 physical cores and the sub-blocks below, the totals are 69 s and 128 s; the ε inversion takes 4.9 and
+23.8 s.
 
 **Tile size on the GPU path.** Each band's wave function is rotated on the CPU, uploaded and transformed once per
 tile that contains it, so small tiles repeat that work many times. The tile size used to follow the CPU path's
@@ -548,15 +551,21 @@ On a 16 GB card the same case gets about 3 tiles at 3.5 Ry and 6 at 5 Ry. On the
 and other jobs on the CPU, the pair densities took 173 s (3.5 Ry) and 198 s (5 Ry), and the χ⁰ products 56 s and
 158 s (CGEMM: 484 s).
 
-**Overlap of the tetrahedron weights.** With the GPU, the weights of tile t + 1 are computed in a second
-OpenMP thread while the main thread drives the χ⁰ products of tile t on the GPU. They start only after the pair
-densities of tile t: run concurrently with those, they slowed the CPU part of phase A (short parallel loops)
-5-fold. Only the weights of the first tile run alone. The results are bitwise identical. Effect at NG = 1963, one
-q, L40S (4 tiles): 54.6 s instead of 55.8 s (FP16) and 59.2 s instead of 61.3 s (CGEMM). With many tiles,
-practically all of the weights are hidden: production runs with about 650 bands have about 12 tiles per q on an
-L40S at NG = 2100. With a single tile, nothing is hidden. When the weights take longer than the χ⁰ products
-(small NG, e.g. the SrVO₃ and Si chains), the products are hidden instead. In the timing line, the tetrahedron
-time then runs concurrently, so the three phases no longer add up to the wall time.
+**Overlap of the tetrahedron weights.** With the GPU, phases B and C run in sub-blocks of about 32,768 rows.
+While the main thread drives the χ⁰ products of sub-block s on the GPU, a second OpenMP thread computes the
+weights of sub-block s + 1, or of the first sub-block of the next tile; all GPU calls stay on the main thread.
+`chi_gpu_gemm` takes the row range and copies only that part of W. The weights start only after the pair
+densities of a tile: run concurrently with those, they slowed the CPU part of phase A 5-fold. Only the first
+sub-block of the first tile runs alone, so this also works with one or two large tiles.
+- **Accuracy.** The FP16 scales are now chosen per sub-block. ε⁻¹ changes at the rounding level (NG = 1963:
+  1.7×10⁻⁷ against one block per tile, 8.3×10⁻⁷ against CPU double precision); the chains are unchanged.
+- **Gain on the molecular crystal.** About 4 s per q (3.6–3.7 s of weights hidden), about 30 s per q with
+  650 bands.
+- **Small NG.** When the weights take longer than the χ⁰ products (e.g. the SrVO₃ and Si chains), the products
+  are hidden instead.
+
+In the timing line, the tetrahedron time runs concurrently, so the three phases no longer add up to the wall
+time.
 
 **Remaining candidates.** With large tiles, the pair densities are 20–40 % of a q in this case. The χ⁰ products
 dominate at 5 Ry. GPU-resident irreducible wave functions (rotation on the GPU) would now save only the
