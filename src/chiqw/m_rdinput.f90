@@ -38,7 +38,7 @@ integer,public::file_num_eps_base_start
 !calc_num_k 
 integer,public::flg_fast!fork: 1=restructured pair loop (m_chi_fast), 0=original loop
 real(8),public::fast_mem_mb!fork: memory budget (MB) of one pair tile in m_chi_fast
-integer,public::fast_fft_sp!fork: 1=single-precision FFTs for the pair densities
+integer,public::fast_fft_sp!fork: 1=single-precision FFTs for the pair densities, -1=auto
 integer,public::fast_gemm_sp!fork: 1=chi0 accumulation as single-precision CGEMM blocks (double-precision sum)
 integer,public::flg_async_eps!fork: 1=eps inversion/output of a q point in a background thread (m_eps_async), -1=auto
 integer,public::n_calc_q!total number of calculated q pts
@@ -78,7 +78,7 @@ N_CALC_Q=0
 FLG_FAST=1!fork: restructured pair loop
 FAST_MEM_MB=4096.0d0!fork: MB per pair tile
 FAST_GEMM_SP=0!fork: double-precision ZGEMM
-FAST_FFT_SP=0!fork: double-precision FFTs
+FAST_FFT_SP=-1!fork: auto (CPU build: double-precision FFTs)
 FLG_ASYNC_EPS=-1!fork: auto (CPU build: off)
 !--
 !open(999,file='input.in')
