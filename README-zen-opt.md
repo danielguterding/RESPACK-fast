@@ -101,6 +101,7 @@ budget means larger tiles and fewer backward FFTs.
 | `cmake/FindFFTW3.cmake`, `CMakePresets.json` | new | FFTW3 finder, build presets |
 | `src/chiqw/chi_gpu.cu`, `chi_gpu_stub.c` | new | GPU path of the band-pair loop, stub without a GPU build |
 | `src/chiqw/gpu_api.h` | new | maps the CUDA names in `chi_gpu.cu` onto HIP/hipFFT/hipBLAS for the ROCm build |
+| `src/chiqw/fp16_rn/` | new | FP16 GEMM kernel with round-to-nearest accumulation for gfx1200 (patched hipBLASLt kernel, MIT License: `LICENSE-hipBLASLt.txt`), embedding (`fp16_rn_blob.c`) |
 | `local-tools/*`, `README-zen-opt.md` | new | build script, validation and benchmark tools, this document |
 
 All changed places in modified files are marked with `fork` comments. The full diff is
@@ -200,6 +201,9 @@ on NVIDIA GPUs. The kernels use no warp-level operations, so the wavefront size 
 Without `CMAKE_HIP_ARCHITECTURES`, CMake builds for the GPU(s) of the build machine. ROCm is looked up in
 `ROCM_PATH` (CMake or environment variable), default `/opt/rocm`. `RESPACK_CUDA` and `RESPACK_HIP` are
 mutually exclusive.
+
+For gfx1200, the build also assembles the FP16 round-to-nearest GEMM kernel (`src/chiqw/fp16_rn/`, used with
+`RESPACK_GPU_GEMM=fp16`) with ROCm's `llvm-mc` and `ld.lld`. `-DRESPACK_HIP_FP16_RN=OFF` leaves it out.
 
 **Running:** as on NVIDIA GPUs, one MPI rank per GPU (local rank modulo device count); restrict the visible
 GPUs with `HIP_VISIBLE_DEVICES` or `ROCR_VISIBLE_DEVICES`. On consumer Radeon GPUs, which are weak in
@@ -357,10 +361,53 @@ Against CPU double precision (double-precision FFTs for the chains):
 
 With `2x`, `k_packX` writes only the hi part of X.
 
-**Status:** experimental, validated on the RX 9060 XT. At NG ≈ 2000 the χ⁰ products are 2.6× faster than
-with CGEMM, at CGEMM-level accuracy. The remaining overhead is the output traffic of the β = 1 chunk calls
-(about 9 s at NG = 1963) plus packing and accumulation (about 4 s). A custom kernel with two-level
-accumulation in registers would remove most of it; the upper bound is about 35 % of the GEMM phase.
+**Round-to-nearest kernel for hi·hi (gfx1200, HIP build).** On the RX 9060 XT, hi·hi is no longer chunked. It
+runs as one call of an FP16 GEMM kernel whose matrix-unit results are accumulated with round-to-nearest vector
+adds (`src/chiqw/fp16_rn/`). The kernel is one of hipBLASLt's own FP16 kernels (MIT License, © AMD), taken from
+the installed library and patched in its assembly (`local-tools/tensile-patch/`):
+- **Patch.** Every accumulating `v_wmma_f32_16x16x16_f16` writes a fresh 16-term partial tile into a temporary
+  tile, and the accumulator is updated with 4 `v_dual_add_f32`.
+- **Accuracy.** No bias at any K; the rms error grows as √K (11 ε at K = 32768, against 731 ε bias without the
+  patch).
+- **Kernel choice.** The kernel was chosen from all 237 FP16 NT kernels of the library by sustained timing. The
+  card clocks down under load, so burst timings rank the kernels differently. For one β = 1 call at K = 16384
+  it takes 4.8 ms unpatched, against 5.2 ms for hipBLAS's choice, and 5.5 ms patched.
+- **Build.** The source is assembled at build time with ROCm's `llvm-mc` and `ld.lld` and embedded in
+  `calc_chiqw`. This happens when `CMAKE_HIP_ARCHITECTURES` contains gfx1200 (option `RESPACK_HIP_FP16_RN`,
+  default ON).
+- **Runtime.** The kernel is used on gfx1200 devices with NG ≥ 16 (the library kernel faults for M < 8).
+  `RESPACK_GPU_FP16_RN=0` selects the chunked hipBLAS path. Other GPUs and the CUDA build use the chunked path.
+- **Corrections.** These stay with hipBLAS. The best library kernel would be 3 % faster for them, not worth a
+  second embedded kernel.
+
+Per block and frequency at NG = 1963 (8192 rows; sustained, `tcombo.cpp`):
+
+| | corrections (K′ = 32768, β = 0) | hi·hi (K′ = 16384) | total |
+|---|---|---|---|
+| chunked hipBLAS path | 10.3 ms | 8.7 ms (32 calls, β = 1) | 18.9 ms |
+| hi·hi with the round-to-nearest kernel | 10.3 ms | 5.5 ms (one call) | 16.1 ms (−14 %) |
+| (hipBLAS, hi·hi in one biased call) | – | 5.2 ms | – |
+
+In `calc_chiqw` (NG = 1963, one q, two runs each):
+
+| | ε⁻¹ vs CPU double | χ⁰ products | total |
+|---|---|---|---|
+| chunked hipBLAS path (`RESPACK_GPU_FP16_RN=0`) | 1.11×10⁻⁶ | 30.7 s | 48.3 s |
+| round-to-nearest kernel (default on gfx1200) | 6.1×10⁻⁷ | 27.4 s | 45.0 s |
+
+The full chains agree as well:
+- **SrVO₃.** ε⁻¹ 2.5×10⁻⁶ (chunked 3.1×10⁻⁶); U(ω), J(ω) within 3×10⁻⁵ eV (chunked 6×10⁻⁵ eV).
+- **Si.** ε⁻¹ 1.3×10⁻⁶ (chunked 2.9×10⁻⁶); within 1×10⁻⁵ eV (chunked 4×10⁻⁵ eV).
+
+The static U₁₁ is identical in both. Both chains use single-precision FFTs, the default with the GPU.
+
+The remaining error comes from the corrections call (one β = 0 call per block, truncating) and from FP32
+rounding. Longer blocks make it worse and are not faster: 16384 rows give 1.7×10⁻⁶ and 28.3 s, 4096 rows give
+7.9×10⁻⁷ and 27.2 s. The default stays at 8192 rows.
+
+**Status:** experimental, validated on the RX 9060 XT. At NG ≈ 2000 the χ⁰ products are 3× faster than with
+CGEMM (27.4 s against 82.7 s), at CGEMM-level accuracy. The round-to-nearest kernel removed the chunk overhead.
+What remains besides the GEMMs is packing and accumulation (about 3 s at NG = 1963).
 
 **To do: evaluate the FP16 tensor cores on the L40S** (CUDA build, same switch). Measure accuracy against CPU
 double precision and speed against the CGEMM path (≈ 31 TFLOP/s) at SrVO₃ size and at large NG. If accurate,
@@ -513,3 +560,5 @@ per-directory Makefiles are unchanged but don't know about the fork's new files;
 | `local-tools/bench_tetra.f90`, `acc_tetra_quad.f90` | tetrahedron speed, and accuracy vs quad precision |
 | `local-tools/eps_freq_dev.py` | deviation of ε⁻¹ per frequency |
 | `local-tools/validate_si.sh`, `validate_full.sh` | end-to-end validation against the original |
+| `local-tools/accerr.cpp`, `gemmbench.cpp` | accumulation error of GEMM paths against an exact reference; GEMM rates for the χ⁰ shapes (HIP) |
+| `local-tools/tensile-patch/` | extract, reassemble, patch, check and time hipBLASLt's FP16 kernels (see its README) |

@@ -24,7 +24,8 @@
 // * experimental (RESPACK_GPU_GEMM=fp16): the chi products on the matrix units (tensor cores / WMMA)
 //   with FP16 inputs and FP32 accumulation. Each factor is scaled by an exact power of two and split
 //   into FP16 hi + lo parts; hi*hi + hi*lo + lo*hi are evaluated in one GEMM of the real block form
-//   (see chi_gpu_gemm_mp). Same accumulation into the double-precision chi.
+//   (see chi_gpu_gemm_mp). Same accumulation into the double-precision chi. On gfx1200 (HIP build), hi*hi uses an
+//   embedded GEMM kernel with round-to-nearest accumulation (fp16_rn/), otherwise hipBLAS/cuBLAS in K chunks.
 // * q=0: Y(G) += sum_r conj(A_rG) w_r v_r, Z(G) += sum_r A_rG w_r conj(v_r) in double precision
 //   (ZGEMV); the host assembles the head/wing-replaced chi from chi, Y, Z (and D on the CPU).
 // Conventions as cuFFT/FFTW: inverse (backward) unnormalised exp(+i...), forward exp(-i...).
@@ -85,6 +86,10 @@ static struct {
   hf *Xh; size_t Xh_cap;         // NG*4kc
   hf *Yh; size_t Yh_cap;         // 2NG*6kc
   float *Tf; size_t Tf_cap;      // NG*2NG
+#ifdef RESPACK_FP16_RN
+  hipModule_t rn_mod;            // fp16_rn/gemm_fp16_rn_gfx1200.s, loaded on gfx1200 (RESPACK_GPU_FP16_RN != 0)
+  hipFunction_t rn_fn;           // NULL: hi*hi in chunks with hipBLAS
+#endif
   unsigned int *amax;            // max |component| of At (float bits)
   double *mW; size_t mW_cap;     // host: max |component| of W(:, ie)
   // pruned forward FFTs of the pair products (per q): only the NG components of the eps sphere are needed
@@ -388,6 +393,40 @@ __global__ void k_accmp(size_t n, int NG, const float *__restrict__ T, double in
     chie[t] = make_cuDoubleComplex(cuCreal(chie[t]) + (double)T[t] * inv, cuCimag(chie[t]) + (double)T[t + nn] * inv);
 }
 
+#ifdef RESPACK_FP16_RN
+// FP16 GEMM with round-to-nearest accumulation (gfx1200): T(M, N) = X(M, K) Y(N, K)^T + beta T, FP32 T, all
+// column-major with leading dimensions M (X, T) and N (Y). Derived from a hipBLASLt kernel (MIT License, see
+// fp16_rn/); argument block and launch as recorded from hipBLASLt (tile 128 x 128, 128 threads per group).
+// The library kernel faults for M < 8: the caller requires M >= 16.
+extern "C" const unsigned char respack_fp16_rn_hsaco[];
+#define RN_KERNEL "respack_hgemm_nt_rn_gfx1200"
+struct __attribute__((packed)) rn_args {
+  unsigned int gemm_info, kinfo0, kinfo1, numWG, M, N, batch, K;
+  const void *D, *C, *A, *B;
+  unsigned int sD0, sD1, sC0, sC1, sA0, sA1, sB0, sB1;
+  float alpha, beta;
+  const void *scaleAlphaVec, *bias;
+  unsigned int biasType, strideBias;
+  float actAlpha, actBeta;
+  unsigned int actType;
+};
+static_assert(sizeof(rn_args) == 140, "argument block of the Tensile kernel");
+static int rn_gemm(const hf *X, const hf *Y, float *T, int M, int N, int K, float beta) {
+  rn_args a;
+  memset(&a, 0, sizeof a);
+  const unsigned int t0 = (M + 127) / 128, t1 = (N + 127) / 128;
+  a.gemm_info = 1; a.kinfo0 = 0x03200001; a.kinfo1 = 0x04010008;
+  a.numWG = t0; a.M = M; a.N = N; a.batch = 1; a.K = K;
+  a.D = T; a.C = T; a.A = X; a.B = Y;
+  a.sD0 = M; a.sD1 = 1; a.sC0 = M; a.sC1 = 1; a.sA0 = M; a.sA1 = 1; a.sB0 = N; a.sB1 = 1;
+  a.alpha = 1.f; a.beta = beta;
+  size_t sz = sizeof a;
+  void *extra[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &a, HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz, HIP_LAUNCH_PARAM_END};
+  CK(hipModuleLaunchKernel(g.rn_fn, t0, t1, 1, 128, 1, 1, 0, g.st, NULL, extra));
+  return 0;
+}
+#endif
+
 //------------------------------------------------------------------------------------------------
 static int local_rank(void) {
   const char *v[] = {"OMPI_COMM_WORLD_LOCAL_RANK", "MPI_LOCALRANKID", "SLURM_LOCALID", "MV2_COMM_WORLD_LOCAL_RANK"};
@@ -440,16 +479,43 @@ extern "C" int chi_gpu_init(int n1, int n2, int n3, int fbatch, int verbose, int
     if (e && strcmp(e, "2y") == 0) g.fp16_terms = 2;
   }
   CK(cudaMalloc((void **)&g.amax, sizeof(unsigned int)));
+#ifdef RESPACK_FP16_RN
+  g.rn_fn = NULL;
+  if (g.gemm_mp) {   // RESPACK_GPU_FP16_RN=0: chunked hipBLAS path instead
+    const char *e = getenv("RESPACK_GPU_FP16_RN");
+    hipDeviceProp_t pr;
+    CK(hipGetDeviceProperties(&pr, g.dev));
+    if (!(e && strcmp(e, "0") == 0) && strncmp(pr.gcnArchName, "gfx1200", 7) == 0 &&
+        (pr.gcnArchName[7] == 0 || pr.gcnArchName[7] == ':')) {
+      if (hipModuleLoadData(&g.rn_mod, respack_fp16_rn_hsaco) != hipSuccess ||
+          hipModuleGetFunction(&g.rn_fn, g.rn_mod, RN_KERNEL) != hipSuccess) {
+        fprintf(stderr, "chi_gpu: could not load the FP16 round-to-nearest kernel, using hipBLAS in chunks\n");
+        g.rn_fn = NULL;
+        (void)hipGetLastError();
+      }
+    }
+  }
+#endif
   g.init = 1;
   if (verbose) {
     cudaDeviceProp pr;
     CK(cudaGetDeviceProperties(&pr, g.dev));
     printf(" chi_gpu: local rank %d -> device %d (%s, %.1f GB), grid %d %d %d, FFT batch %d, %s FFTs\n", local_rank(),
            g.dev, pr.name, pr.totalGlobalMem / 1073741824.0, n1, n2, n3, g.fbatch, fft_sp ? "single-precision" : "double-precision");
-    if (g.gemm_mp)
-      printf(" chi_gpu: RESPACK_GPU_GEMM=fp16: chi products with FP16 hi/lo split (%s), FP32 accumulation, hi*hi in K"
-             " chunks of %d (experimental)\n", g.fp16_terms == 1 ? "2 terms, X without lo" : g.fp16_terms == 2 ?
-             "2 terms, Y without lo" : "3 terms", g.fp16_chunk);
+    if (g.gemm_mp) {
+      const char *terms = g.fp16_terms == 1 ? "2 terms, X without lo" : g.fp16_terms == 2 ? "2 terms, Y without lo" :
+                          "3 terms";
+      int rn = 0;
+#ifdef RESPACK_FP16_RN
+      rn = g.rn_fn != NULL;
+#endif
+      if (rn)
+        printf(" chi_gpu: RESPACK_GPU_GEMM=fp16: chi products with FP16 hi/lo split (%s), FP32 accumulation, hi*hi"
+               " in one call with round-to-nearest accumulation (gfx1200 kernel; experimental)\n", terms);
+      else
+        printf(" chi_gpu: RESPACK_GPU_GEMM=fp16: chi products with FP16 hi/lo split (%s), FP32 accumulation, hi*hi in"
+               " K chunks of %d (experimental)\n", terms, g.fp16_chunk);
+    }
     fflush(stdout);
   }
   return 0;
@@ -617,6 +683,7 @@ extern "C" int chi_gpu_pairs(int ik0, int NTK, int ubJ, int ubI, double scl) {
 // C = AB + beta*C rounds to nearest. Hence: the small corrections (hi*lo + lo*hi, 2^-11 smaller) in one call
 // (beta = 0), then hi*hi in K chunks of fp16_chunk columns, each continued with beta = 1.
 // fp16_chunk = 0: hi*hi in one call (biased; for comparison).
+// gfx1200 (rn_fn): hi*hi in one call of the round-to-nearest kernel (no bias, no chunks; about 15 % faster per block).
 // Scales: |Y| <= mA, |Xr|, |Xi| <= 2 mA mW(ie); powers of two such that the scaled maxima stay below 2^13.
 static int gemm_mp(const zc *W, int kc) {
   const int NG = g.NG, nen = g.nen, rows = g.rows;
@@ -672,6 +739,11 @@ static int gemm_mp(const zc *W, int kc) {
         CB(cublasGemmEx(g.blas, CUBLAS_OP_N, CUBLAS_OP_T, NG, L, kcor, &one, xc, CUDA_R_16F, NG, yc, CUDA_R_16F, L,
                         &zero, g.Tf, CUDA_R_32F, NG, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
       }
+#ifdef RESPACK_FP16_RN
+      if (g.rn_fn && NG >= 16) {
+        if (rn_gemm(g.Xh, g.Yh, g.Tf, NG, L, 2 * nr, 1.f)) return -1;
+      } else
+#endif
       for (int k0 = 0; k0 < 2 * nr; k0 += ch) {
         const int kk = 2 * nr - k0 < ch ? 2 * nr - k0 : ch;
         CB(cublasGemmEx(g.blas, CUBLAS_OP_N, CUBLAS_OP_T, NG, L, kk, &one, g.Xh + (size_t)NG * k0, CUDA_R_16F, NG,
