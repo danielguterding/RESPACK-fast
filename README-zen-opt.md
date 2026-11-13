@@ -329,6 +329,11 @@ no longer depends on the block length: SrVO₃ gives 1.147×10⁻⁶ with 512-ro
 blocks. At NG = 1963 the FP16 path is 2.4–2.6× faster than CGEMM in the χ⁰ products and 1.5× faster in
 total. The CPU part (ε inversion, writing ε⁻¹, setup) is about 55 s of the total.
 
+**Leaner packing.** The 2×2 real block form `[[Yr, −Yi], [Yi, Yr]]` is stored on the Y side, which is packed once
+per block. Per frequency only `[Xr | Xi]` (hi and lo) is written, with A read from the FP16 parts of Y. That is 16
+instead of 40 bytes of memory traffic per element and frequency. At NG = 1963, `k_packX` takes 1.37 s instead of
+3.07 s per q point and the GEMM phase 30.6 s instead of 31.8 s; ε⁻¹ is unchanged (1.085×10⁻⁶).
+
 **Status:** experimental, validated on the RX 9060 XT. At NG ≈ 2000 the χ⁰ products are 2.6× faster than
 with CGEMM, at CGEMM-level accuracy. The remaining overhead is the output traffic of the β = 1 chunk calls
 (about 9 s at NG = 1963) plus packing and accumulation (about 4 s). A custom kernel with two-level

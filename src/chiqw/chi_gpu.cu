@@ -252,45 +252,50 @@ __device__ __forceinline__ void split_h(float x, hf &h, hf &l) {
   l = __float2half_rn(x - __half2float(h));   // the difference is exact in float
 }
 
-// Yhat(NG, 6K), ld NG, K-blocks [h(Re) | h(Im) | l(Re) | l(Im) | h(Re) | h(Im)] of Y = At(:, r0:r0+K-1) * sY
+// Real block form of the complex product T = X Y^T on the Y side (packed once per block):
+//   Yt (2NG x 2K) = [[Yr, -Yi], [Yi, Yr]],  Xt (NG x 2K) = [Xr | Xi]  ->  Xt Yt^T = [Re T | Im T] (NG x 2NG)
+// Yhat (2NG x 6K, ld 2NG) = [Yt_h | Yt_l | Yt_h] of Y = At(:, r0:r0+K-1) * sY
 __global__ void k_packY(size_t n, int NG, int K, const zc *__restrict__ At, int r0, double sY, hf *__restrict__ Yh) {
-  const size_t B = (size_t)NG * K;
+  const size_t L = 2 * (size_t)NG, B = L * 2 * K;
   for (size_t t = blockIdx.x * (size_t)blockDim.x + threadIdx.x; t < n; t += (size_t)gridDim.x * blockDim.x) {
     size_t r = t / NG, gg = t - r * NG;
     zc a = At[gg + (size_t)NG * (r0 + r)];
     hf hr, lr, hi, li;
     split_h((float)(cuCreal(a) * sY), hr, lr);
     split_h((float)(cuCimag(a) * sY), hi, li);
-    size_t c = (size_t)NG * r + gg;
-    Yh[c] = hr; Yh[B + c] = hi; Yh[2 * B + c] = lr; Yh[3 * B + c] = li; Yh[4 * B + c] = hr; Yh[5 * B + c] = hi;
+    const size_t p00 = gg + L * r, p01 = gg + L * (K + r), p10 = NG + gg + L * r, p11 = NG + gg + L * (K + r);
+    const hf nhi = __hneg(hi), nli = __hneg(li);
+    Yh[p00] = hr; Yh[p01] = nhi; Yh[p10] = hi; Yh[p11] = hr;
+    Yh[B + p00] = lr; Yh[B + p01] = nli; Yh[B + p10] = li; Yh[B + p11] = lr;
+    Yh[2 * B + p00] = hr; Yh[2 * B + p01] = nhi; Yh[2 * B + p10] = hi; Yh[2 * B + p11] = hr;
   }
 }
 
-// Xhat(2NG, 6K), ld 2NG: three copies [h | h | l] of the real block form Xt = [[Xr, -Xi], [Xi, Xr]] (2NG x 2K)
-// of X(G, r) = conj(At(G, r0+r)) * W(r0+r) * sX
-__global__ void k_packX(size_t n, int NG, int K, const zc *__restrict__ At, int r0, const zc *__restrict__ Wcol,
-                        double sX, hf *__restrict__ Xh) {
-  const size_t L = 2 * (size_t)NG, B = L * 2 * K;
+// Xhat (NG x 4K, ld NG) = [Xt_h | Xt_l] of X(G, r) = conj(A(G, r)) * W(r0+r) * sX, with A taken from the FP16
+// hi + lo parts in Yhat (22 bits; 8 bytes read per element instead of 16, 8 bytes written instead of 24)
+__global__ void k_packX(size_t n, int NG, int K, const hf *__restrict__ Yh, int r0, const zc *__restrict__ Wcol,
+                        float s, hf *__restrict__ Xh) {
+  const size_t L = 2 * (size_t)NG, B = L * 2 * K, BX = (size_t)NG * 2 * K;
   for (size_t t = blockIdx.x * (size_t)blockDim.x + threadIdx.x; t < n; t += (size_t)gridDim.x * blockDim.x) {
     size_t r = t / NG, gg = t - r * NG;
-    zc x = cuCmul(cuConj(At[gg + (size_t)NG * (r0 + r)]), Wcol[r0 + r]);
-    hf hr, lr, hi, li;
-    split_h((float)(cuCreal(x) * sX), hr, lr);
-    split_h((float)(cuCimag(x) * sX), hi, li);
-    size_t p00 = gg + L * r, p01 = gg + L * (K + r), p10 = NG + gg + L * r, p11 = NG + gg + L * (K + r);
-    hf nhi = __hneg(hi), nli = __hneg(li);
-    Xh[p00] = hr; Xh[p01] = nhi; Xh[p10] = hi; Xh[p11] = hr;
-    Xh[B + p00] = hr; Xh[B + p01] = nhi; Xh[B + p10] = hi; Xh[B + p11] = hr;
-    Xh[2 * B + p00] = lr; Xh[2 * B + p01] = nli; Xh[2 * B + p10] = li; Xh[2 * B + p11] = lr;
+    const size_t p0 = gg + L * r, p1 = gg + L * (K + r);
+    const float ar = __half2float(Yh[p0]) + __half2float(Yh[B + p0]);        // A_r * sY
+    const float ai = -(__half2float(Yh[p1]) + __half2float(Yh[B + p1]));     // A_i * sY
+    const zc w = Wcol[r0 + r];
+    const float wr = (float)cuCreal(w), wi = (float)cuCimag(w);
+    hf hr, lr, hi, li;                                                       // s = sX / sY (power of two)
+    split_h((ar * wr + ai * wi) * s, hr, lr);
+    split_h((ar * wi - ai * wr) * s, hi, li);
+    const size_t q0 = gg + (size_t)NG * r, q1 = gg + (size_t)NG * (K + r);
+    Xh[q0] = hr; Xh[q1] = hi; Xh[BX + q0] = lr; Xh[BX + q1] = li;
   }
 }
 
-// chi(G, G') += (T(G, G') + i T(NG+G, G')) * inv, T(2NG, NG) in FP32
+// chi(G, G') += (T(G, G') + i T(G, NG+G')) * inv, T(NG, 2NG) = [Re | Im] in FP32
 __global__ void k_accmp(size_t n, int NG, const float *__restrict__ T, double inv, zc *__restrict__ chie) {
-  for (size_t t = blockIdx.x * (size_t)blockDim.x + threadIdx.x; t < n; t += (size_t)gridDim.x * blockDim.x) {
-    size_t gp = t / NG, gg = t - gp * NG, o = gg + 2 * (size_t)NG * gp;
-    chie[t] = make_cuDoubleComplex(cuCreal(chie[t]) + (double)T[o] * inv, cuCimag(chie[t]) + (double)T[o + NG] * inv);
-  }
+  const size_t nn = (size_t)NG * NG;
+  for (size_t t = blockIdx.x * (size_t)blockDim.x + threadIdx.x; t < n; t += (size_t)gridDim.x * blockDim.x)
+    chie[t] = make_cuDoubleComplex(cuCreal(chie[t]) + (double)T[t] * inv, cuCimag(chie[t]) + (double)T[t + nn] * inv);
 }
 
 //------------------------------------------------------------------------------------------------
@@ -442,13 +447,15 @@ extern "C" int chi_gpu_pairs(int ik0, int NTK, int ubJ, int ubI, double scl) {
 }
 
 // RESPACK_GPU_GEMM=fp16: chi(:,:,ie) += sum_r conj(A_rG) W_r,ie A_rG' with FP16 inputs on the matrix units.
-// Real block form T(2NG, NG) = Xt(2NG, 2K) Yt(NG, 2K)^T with Xt = [[Xr, -Xi], [Xi, Xr]], Yt = [Yr, Yi];
-// hi/lo split: T = Xt_h Yt_h^T + Xt_h Yt_l^T + Xt_l Yt_h^T (lo*lo dropped, ~2^-22).
+// Real block form T(NG, 2NG) = [Re | Im] = Xt(NG, 2K) Yt(2NG, 2K)^T with Xt = [Xr | Xi] (packed per frequency)
+// and Yt = [[Yr, -Yi], [Yi, Yr]] (packed once per block); hi/lo split: T = Xt_h Yt_h^T + Xt_h Yt_l^T + Xt_l Yt_h^T
+// (lo*lo dropped, ~2^-22). k_packX reads A from the FP16 parts of Yhat, so a frequency costs 16 bytes of
+// memory traffic per element of the block instead of 40.
 // The matrix units accumulate inside one GEMM call with a bias toward zero (truncation; measured on RDNA4,
 // reported for NVIDIA tensor cores): the error grows linearly with K for same-sign sums. The output step
 // C = AB + beta*C rounds to nearest. Hence: the small corrections (hi*lo + lo*hi, 2^-11 smaller) in one call
 // (beta = 0), then hi*hi in K chunks of fp16_chunk columns, each continued with beta = 1.
-// fp16_chunk = 0: all three products in one call with K' = 6K (biased; for comparison).
+// fp16_chunk = 0: hi*hi in one call (biased; for comparison).
 // Scales: |Y| <= mA, |Xr|, |Xi| <= 2 mA mW(ie); powers of two such that the scaled maxima stay below 2^13.
 static int gemm_mp(const zc *W, int kc) {
   const int NG = g.NG, nen = g.nen, rows = g.rows;
@@ -479,8 +486,8 @@ static int gemm_mp(const zc *W, int kc) {
   int ex;
   frexp(mA, &ex);
   const double sY = ldexp(1.0, 13 - ex);
-  if (ensure(&g.Xh, &g.Xh_cap, (size_t)2 * NG * 6 * kc)) return -1;
-  if (ensure(&g.Yh, &g.Yh_cap, (size_t)NG * 6 * kc)) return -1;
+  if (ensure(&g.Xh, &g.Xh_cap, (size_t)NG * 4 * kc)) return -1;
+  if (ensure(&g.Yh, &g.Yh_cap, (size_t)2 * NG * 6 * kc)) return -1;
   if (ensure(&g.Tf, &g.Tf_cap, (size_t)2 * NG * NG)) return -1;
   const float one = 1.f, zero = 0.f;
   for (int r0 = 0; r0 < rows; r0 += kc) {
@@ -491,22 +498,18 @@ static int gemm_mp(const zc *W, int kc) {
       if (!(g.mW[ie] > 0.0)) continue;
       frexp(2.0 * mA * g.mW[ie], &ex);
       const double sX = ldexp(1.0, 13 - ex);
-      k_packX<<<grid1(nb), 256, 0, g.st>>>(nb, NG, nr, g.At, r0, g.W + (size_t)rows * ie, sX, g.Xh);
-      if (g.fp16_chunk <= 0) {
-        CB(cublasGemmEx(g.blas, CUBLAS_OP_N, CUBLAS_OP_T, 2 * NG, NG, 6 * nr, &one, g.Xh, CUDA_R_16F, 2 * NG, g.Yh,
-                        CUDA_R_16F, NG, &zero, g.Tf, CUDA_R_32F, 2 * NG, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
-      } else {
-        // corrections: columns 2nr .. 6nr-1 = [Xt_h | Xt_l] [Yt_l | Yt_h]^T
-        CB(cublasGemmEx(g.blas, CUBLAS_OP_N, CUBLAS_OP_T, 2 * NG, NG, 4 * nr, &one, g.Xh + (size_t)2 * NG * 2 * nr,
-                        CUDA_R_16F, 2 * NG, g.Yh + (size_t)NG * 2 * nr, CUDA_R_16F, NG, &zero, g.Tf, CUDA_R_32F, 2 * NG,
-                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
-        // hi*hi: columns 0 .. 2nr-1 in chunks, each added with beta = 1 (round to nearest)
-        for (int k0 = 0; k0 < 2 * nr; k0 += g.fp16_chunk) {
-          const int kk = 2 * nr - k0 < g.fp16_chunk ? 2 * nr - k0 : g.fp16_chunk;
-          CB(cublasGemmEx(g.blas, CUBLAS_OP_N, CUBLAS_OP_T, 2 * NG, NG, kk, &one, g.Xh + (size_t)2 * NG * k0, CUDA_R_16F,
-                          2 * NG, g.Yh + (size_t)NG * k0, CUDA_R_16F, NG, &one, g.Tf, CUDA_R_32F, 2 * NG,
-                          CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
-        }
+      k_packX<<<grid1(nb), 256, 0, g.st>>>(nb, NG, nr, g.Yh, r0, g.W + (size_t)rows * ie, (float)(sX / sY), g.Xh);
+      // T (NG x 2NG) = Xhat Yhat^T. Corrections: [Xt_h | Xt_l] [Yt_l | Yt_h]^T (columns 0..4nr-1 of Xhat,
+      // 2nr..6nr-1 of Yhat), beta = 0; then hi*hi (columns 0..2nr-1) in chunks, each added with beta = 1.
+      const int L = 2 * NG, ch = (g.fp16_chunk > 0 && g.fp16_chunk < 2 * nr) ? g.fp16_chunk : 2 * nr;
+      CB(cublasGemmEx(g.blas, CUBLAS_OP_N, CUBLAS_OP_T, NG, L, 4 * nr, &one, g.Xh, CUDA_R_16F, NG,
+                      g.Yh + (size_t)L * 2 * nr, CUDA_R_16F, L, &zero, g.Tf, CUDA_R_32F, NG, CUBLAS_COMPUTE_32F,
+                      CUBLAS_GEMM_DEFAULT));
+      for (int k0 = 0; k0 < 2 * nr; k0 += ch) {
+        const int kk = 2 * nr - k0 < ch ? 2 * nr - k0 : ch;
+        CB(cublasGemmEx(g.blas, CUBLAS_OP_N, CUBLAS_OP_T, NG, L, kk, &one, g.Xh + (size_t)NG * k0, CUDA_R_16F, NG,
+                        g.Yh + (size_t)L * k0, CUDA_R_16F, L, &one, g.Tf, CUDA_R_32F, NG, CUBLAS_COMPUTE_32F,
+                        CUBLAS_GEMM_DEFAULT));
       }
       k_accmp<<<grid1((size_t)NG * NG), 256, 0, g.st>>>((size_t)NG * NG, NG, g.Tf, 1.0 / (sX * sY),
                                                         g.chi + (size_t)NG * NG * ie);
