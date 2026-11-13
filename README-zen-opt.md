@@ -514,34 +514,34 @@ CGEMM ∝ NG²·N_k·N_pair·N_ω and the FFTs ∝ N_pair·N_k·N_grid.
 
 ### Remaining GPU candidates
 
-The figures below are projected for a large molecular crystal (about 120 atoms per cell; NG ≈ 2150,
-N_pair ≈ 10⁵, N_k = 64, N_grid ≈ 3×10⁵, 70 ω) from the measured rates, not measured on such a system.
+The figures below are projected for a large molecular crystal (about 120 atoms per cell; NG ≈ 2100,
+N_pair ≈ 10⁵, N_k = 75, N_grid ≈ 3×10⁵, 70 ω) from the rates measured at NG = 1963, not measured on such a
+system.
 
-| part | where | projected cost per q | assessment |
+| part | where | projected cost per q (L40S) | status |
 |---|---|---|---|
-| χ⁰ products (CGEMM) | GPU | ≈ 9 min | done; FP16 split on the matrix units under evaluation (RX 9060 XT), L40S to do |
-| pair-density FFTs (`fast_fft_sp=1`) | GPU | ≈ 3–5 min | done |
-| **wave-function rotation (`make_C0`) + uploads** | **CPU, serial with the GPU** | **≈ 2.5–4 min** | **next candidate** |
-| tetrahedron weights | CPU | ≈ 1 min (8 cores) | overlap with GPU work rather than port |
-| ε inversion (70 ω) | CPU | ≈ 0.5 min | cuSOLVER: a few % |
-| writing ε⁻¹ | CPU / disk | ≈ 5 GB per q | no |
+| χ⁰ products | GPU | ≈ 6 min (FP16 split, round-to-nearest kernel) | done |
+| pair-density FFTs (`fast_fft_sp=1`, pruned) | GPU | ≈ 5–8 min including the rotation below | done |
+| wave-function rotation (`make_C0_map`) + uploads | CPU, serial with the GPU | part of the line above | next candidate: GPU-resident irreducible wave functions |
+| tetrahedron weights | CPU | ≈ 2 min (8 cores) | done: overlapped with the χ⁰ products of the previous tile |
+| ε inversion (70 ω), writing ε⁻¹ | CPU | ≈ 0.5 min, ≈ 5 GB per q | done: in the background (`flg_async_eps`) |
 | `calc_w3d` / `calc_j3d` | CPU | minutes per system | no |
-| `calc_wannier`, DFT (QE) | CPU | – | no (QE needs FP64; the L40S is FP64-weak) |
 
-**Why the rotation:** for every tile and k, the CPU rotates the tile's wave functions and uploads them while
-the GPU waits. That is a complex `exp` per coefficient, and the uploads repeat in every tile containing the
-band, about 480 GB per q in the projection. It also ties up CPU cores, which limit how many GPUs a shared node
-can drive.
+**Overlap of the tetrahedron weights.** With the GPU, the weights of tile t + 1 are computed in a second
+OpenMP thread while the main thread drives the χ⁰ products of tile t on the GPU. They start only after the pair
+densities of tile t: run concurrently with those, they slowed the CPU part of phase A (short parallel loops)
+5-fold. Only the weights of the first tile run alone. The results are bitwise identical. Effect at NG = 1963, one
+q, L40S (4 tiles): 54.6 s instead of 55.8 s (FP16) and 59.2 s instead of 61.3 s (CGEMM). With many tiles, as in
+the projection, practically all of the weights are hidden. When the weights take longer than the χ⁰ products
+(small NG, e.g. the SrVO₃ and Si chains), the products are hidden instead. In the timing line, the tetrahedron
+time then runs concurrently, so the three phases no longer add up to the wall time.
 
-**Planned steps, by effort:**
-1. **`exp` lookup table in `make_C0`.** The phase exp(−2πi(G·τ)/nnp) only takes nnp discrete values, so a
-   table of roots of unity replaces it exactly. This helps the CPU and GPU paths.
-2. **GPU-resident irreducible wave functions.** For the projected case this is about 10 GB, uploaded once
-   per q, with the rotation as a gather kernel on the GPU. That removes the uploads and the CPU work in phase A.
-3. **Overlap of the tetrahedron weights with the GPU work.** The weights are only needed in phase C.
-4. **cuSOLVER for the ε inversion.**
+**Next candidate: GPU-resident irreducible wave functions.** Upload them once per q and rotate them with a gather
+kernel on the GPU. That removes the CPU rotation and the repeated uploads in every tile containing a band. At
+`Ecut_for_psi` = 80 Ry and 650 bands on 24 irreducible k points, they take about 17 GB in single precision: this
+fits the L40S, but not a 16 GB card.
 
-Measure a q point of a real large system with Nsight Systems before implementing steps 2–4.
+Measure a q point of the real system before implementing it.
 
 ## Build
 

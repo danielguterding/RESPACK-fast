@@ -192,14 +192,15 @@ contains
     integer :: np, rows, nthr
     real(8) :: bytes_pair, bytes_thrA, budget, scl
     integer(8) :: npmax
-    complex(8), allocatable :: A(:, :), W(:, :), V(:, :)
+    complex(8), allocatable :: A(:, :), W(:, :), V(:, :), Wn(:, :)
     complex(4), allocatable :: A4(:, :)
     complex(8), allocatable :: chiT(:, :, :), Yh(:, :, :), Zh(:, :, :), Dacc(:, :)
     integer, allocatable :: ext0(:)
     integer(c_int) :: rcg
     integer, allocatable :: tj(:), ti(:), pjl(:), pil(:)
     integer :: ntj, nti
-    real(8) :: t0, tA, tB, tC
+    real(8) :: t0, t1, tA, tB, tC
+    integer :: itn, lev0
 
     if (ngrid == 0) then
       write(6,*) 'chi_fast_pairs: chi_fast_init not called'; stop
@@ -298,6 +299,21 @@ contains
         Dacc = zzero
       end if
     end if
+    ! With the GPU, the tetrahedron weights (CPU) of the next tile are computed in a second thread while the main
+    ! thread drives the chi products of this tile on the GPU (all GPU calls stay on the main thread). They start
+    ! after phase A, whose CPU part (rotation, short parallel loops) would otherwise compete for the cores; during
+    ! phase C the main thread mostly waits for the GPU. Phase B of the first tile runs alone.
+    if (use_gpu) then
+      lev0 = omp_get_max_active_levels()
+      if (lev0 < 2) call omp_set_max_active_levels(2)
+      itn = next_tile(0)
+      if (itn > 0) then
+        allocate(Wn(NTK*tcount(itn), nen))
+        t0 = omp_get_wtime()
+        call phase_b(itn, Wn)
+        tB = tB + omp_get_wtime() - t0
+      end if
+    end if
     do it = 1, ntile
       np = tcount(it)
       if (np == 0) cycle
@@ -318,7 +334,10 @@ contains
       end block
 
       if (use_gpu) then
-        allocate(A(1, 1), W(rows, nen))         ! pair densities live on the GPU
+        allocate(A(1, 1))                       ! pair densities live on the GPU
+        call move_alloc(Wn, W)                  ! weights of this tile, computed during the previous tile
+        itn = next_tile(it)
+        if (itn > 0) allocate(Wn(NTK*tcount(itn), nen))
       else
         allocate(A(rows, NGeps), W(rows, nen))
       end if
@@ -328,25 +347,36 @@ contains
         allocate(V(1, 1))
       end if
 
-      t0 = omp_get_wtime()
       if (use_gpu) then
+        t0 = omp_get_wtime()
         call phase_a_gpu()
-      else if (fft_sp) then
-        call phase_a_sp()
+        tA = tA + omp_get_wtime() - t0
+        !$omp parallel num_threads(2) default(shared)
+        if (omp_get_thread_num() == 0) then
+          t0 = omp_get_wtime()
+          call phase_c_gpu()
+          tC = tC + omp_get_wtime() - t0
+        else if (itn > 0) then
+          t1 = omp_get_wtime()
+          call phase_b(itn, Wn)
+          tB = tB + omp_get_wtime() - t1
+        end if
+        !$omp end parallel
       else
-        call phase_a()
-      end if
-      tA = tA + omp_get_wtime() - t0
-      t0 = omp_get_wtime()
-      call phase_b()
-      tB = tB + omp_get_wtime() - t0
-      t0 = omp_get_wtime()
-      if (use_gpu) then
-        call phase_c_gpu()
-      else
+        t0 = omp_get_wtime()
+        if (fft_sp) then
+          call phase_a_sp()
+        else
+          call phase_a()
+        end if
+        tA = tA + omp_get_wtime() - t0
+        t0 = omp_get_wtime()
+        call phase_b(it, W)
+        tB = tB + omp_get_wtime() - t0
+        t0 = omp_get_wtime()
         call phase_c()
+        tC = tC + omp_get_wtime() - t0
       end if
-      tC = tC + omp_get_wtime() - t0
 
       deallocate(A, W, V, pjl, pil)
     end do
@@ -378,7 +408,9 @@ contains
         call gpu_check(rcg, 'chi_gpu_q_end')
       end if
       deallocate(ext0)
+      if (lev0 < 2) call omp_set_max_active_levels(lev0)
     end if
+    ! with the GPU, the tetrahedron time runs concurrently (except for the first tile): the sum is not the wall time
     if (verbose) write(6,'(a,3f10.2)') ' chi_fast: time (s) pair densities / tetrahedron / zgemm ', tA, tB, tC
 
   contains
@@ -671,8 +703,27 @@ contains
     end subroutine gpu_check
 
     !------------------------------------------------------------------------------------------
-    ! phase B: tetrahedron weights x_pk(w) (same formulas, log ratios via vectorised log/atan2), times cRPA factor and 1/NTK -> W(ik+NTK*(p-1), w)
-    subroutine phase_b()
+    ! first non-empty tile after tile i (0: none)
+    integer function next_tile(i)
+      integer, intent(in) :: i
+      integer :: j
+      next_tile = 0
+      do j = i + 1, ntile
+        if (tcount(j) > 0) then
+          next_tile = j
+          return
+        end if
+      end do
+    end function next_tile
+
+    !------------------------------------------------------------------------------------------
+    ! phase B: tetrahedron weights x_pk(w) (same formulas, log ratios via vectorised log/atan2), times cRPA factor
+    ! and 1/NTK -> Wo(ik+NTK*(p-1), w) for the pairs p of tile itl
+    subroutine phase_b(itl, Wo)
+      integer, intent(in) :: itl
+      complex(8), intent(out) :: Wo(:, :)
+      integer :: npl
+      npl = tcount(itl)
       !$omp parallel default(shared)
       block
         complex(8), allocatable :: e1(:), e2(:), xow(:, :), ca1(:)
@@ -680,8 +731,8 @@ contains
         integer :: lp, ip, jb, ib, ik, ikq, row
         allocate(e1(NTK), e2(NTK), xow(nen, NTK), ca1(4*nen))
         !$omp do schedule(dynamic,1)
-        do lp = 1, np
-          ip = tpairs(tstart(it) + lp - 1)
+        do lp = 1, npl
+          ip = tpairs(tstart(itl) + lp - 1)
           jb = jpair(ip); ib = ipair(ip)
           do ik = 1, NTK
             e1(k3d(ik)) = cmplx(E_OCC(jb, numirr(ik)), 0d0, 8)
@@ -695,7 +746,7 @@ contains
             ikq = kpq(ik)
             row = ik + NTK*(lp - 1)
             fac = (1d0 - P_OCC(jb, ik)*P_VIR(ib, ikq))/dble(NTK)
-            W(row, :) = xow(:, k3d(ik))*fac
+            Wo(row, :) = xow(:, k3d(ik))*fac
           end do
         end do
         !$omp end do
