@@ -171,6 +171,14 @@ list is `all-major`.
 
   A `mpirun` started from an `salloc` shell sees all GPUs of the node.
 - **BLAS threads:** keep `OPENBLAS_NUM_THREADS=1`.
+- **Pruned forward FFTs:** after the forward FFT of a pair product, only the NG components of the ε sphere
+  are needed. The FFT runs as 1D passes: x for all lines, y only for the x columns that occur, z only for the
+  (x, y) pairs that occur. It is on automatically when it saves work; `RESPACK_GPU_PRUNE=0/1` forces it. Measured
+  on the RX 9060 XT for the SrVO₃ chain (NG = 81, 24³ grid; 5 of 24 x columns and 21 of 576 (x, y) pairs
+  needed): pair densities 15.1 → 9.8 s with single-precision FFTs and 31.3 → 19.1 s with double-precision FFTs.
+  Pruned and full FFTs agree to 1×10⁻¹² (double) and 1×10⁻⁷ (single). With a large ε sphere (NG = 1963 on
+  the same grid) there is nothing to prune. For a large cell with a small `Ecut_for_eps`, where the sphere
+  covers only about 10 % of each grid direction, the y and z passes shrink to about 15 %.
 - **ε inversion in the background:** with `flg_gpu=1`, `flg_async_eps` defaults to on (auto). The inversion of
   ε(ω) and the output of a q point run on the CPU while the GPU computes χ⁰ of the next q point. Only the last
   q point's inversion stays visible. Measured on an RX 9060 XT (SrVO₃, NG = 1963, 3 q points, 8 threads): the
