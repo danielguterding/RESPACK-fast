@@ -89,8 +89,9 @@ budget means larger tiles and fewer backward FFTs.
 | `src/chiqw/chi_fast.f90` | new | restructured band-pair loop (module `m_chi_fast`) |
 | `src/chiqw/m_tetrahedron_fast.F` | new (derived from `m_tetrahedron_20170325.F`) | vectorised log ratios, fused ± pass, fused normal tetrahedra |
 | `src/chiqw/chiqw_sub.F` | modified | new `make_C0_map` (per-k rotation map; `make_C0` unchanged) |
+| `src/chiqw/wfn_shared.f90` | new | module `m_wfn_shared` (wave functions shared by the ranks of a node, MPI-3 shared memory) |
 | `src/chiqw/eps_async.f90`, `thread_util.c` | new | module `m_eps_async` (q ≠ 0 post-processing, background thread via pthreads) |
-| `src/chiqw/chiqw.F` | modified | calls `m_chi_fast` for `flg_fast=1`, original loops kept for `flg_fast=0`; frequency loops of the ε inversion parallel (OpenMP) |
+| `src/chiqw/chiqw.F`, `config.h` | modified | calls `m_chi_fast` for `flg_fast=1`, original loops kept for `flg_fast=0`; frequency loops of the ε inversion parallel (OpenMP); single-precision wave functions on the GPU path, shared on the node; no band ring exchange with one rank per q group |
 | `src/chiqw/m_rdinput.f90` | modified | inputs `flg_fast`, `fast_mem_mb`, `flg_async_eps` |
 | `src/chiqw/CMakeLists.txt` | modified | FFTW3, new sources |
 | `src/calc_int/int_fast.f90` | new | module `m_int_fast` |
@@ -599,6 +600,49 @@ round-to-nearest kernel: 4 q points of the case above (3.5 Ry), 8 physical cores
 - Every rank holds all wave functions in double precision: 21.7 GB peak per rank here. With about 650 bands
   that is an estimated 45–50 GB per rank (wave functions alone about 36 GB). This matters on machines with
   less RAM.
+
+**Single-precision wave functions (GPU path).** With single-precision FFTs, `calc_chiqw` stores the wave
+functions as complex(4) (`OCC4`, `VIR4`; `RESPACK_WFN_DP=1` keeps double precision; the CPU path is unchanged).
+- **Memory.** The case above at 3.5 Ry needs 10.9 GB instead of 18.2 GB.
+- **Accuracy.** ε⁻¹ deviates by 1.9×10⁻⁹ from the double-precision wave functions (RX 9060 XT: 2.4×10⁻⁹); the
+  chains against CPU double precision are unchanged.
+- **q = 0.** The k·p and intra-band terms use double-precision copies of the coefficients they need.
+- **One rank per q group.** The band ring exchange is skipped there. It copied all virtual bands to the rank
+  itself through a full-size `VIR_new`, about 22 GB for 650 bands in double precision. The broadcast across q
+  groups is skipped as well, since every rank has read all bands itself.
+
+**Shared on the node (`m_wfn_shared`).** With one rank per q group, all ranks of a node need the same
+read-only wave functions. Node rank 0 reads them into an MPI-3 shared-memory window and the others map it
+(`RESPACK_WFN_SHARED=0` gives private copies; if the window cannot be created, private copies are used).
+4 q points on 2 L40S, results bitwise identical:
+
+| | wall time | memory of both ranks (PSS) |
+|---|---|---|
+| private copies | 111.5 s | 23.3 GB |
+| shared | 79.3 s | 15.0 GB |
+
+**Rotation on the GPU.** Per tile, the irreducible coefficients of the tile's bands (all k_irr, single precision)
+are copied once into a GPU cache: about 7 GB here on the L40S, 1.8–2.7 GB on a 16 GB card. Per k point the CPU
+only builds the rotation map (`make_C0_map`); `k_rotscatter` gathers, multiplies by the phase (in double
+precision, as on the CPU) and writes the band to the FFT grid.
+- **Tile size.** The cache counts in the tile budget: square tiles t × t with t² bytes per pair + 2t bytes per
+  band (cache and real-space grid) within the device budget. If a tile would have fewer than 256 pairs, the CPU
+  rotation is used (`RESPACK_GPU_ROT=0` forces it).
+- **Testing smaller cards.** `RESPACK_GPU_MEM_MB` caps the device memory assumed for the tile size.
+- **Results.** ε⁻¹ is bitwise identical to the CPU rotation for the same tiles; with other tiles it changes by
+  2–3×10⁻⁷ through the summation order.
+- **Effect.** The CPU rotation shrinks from 2.5–3.5 s to 0.4–0.9 s per q, and the copies to the GPU drop about
+  3-fold (once per tile instead of per k point).
+
+| one q, case above | L40S, rotation on CPU → GPU | RX 9060 XT, rotation on CPU → GPU |
+|---|---|---|
+| 3.5 Ry: pair densities | 6.3 → 5.6 s | 27.9 → 27.5 s |
+| 3.5 Ry: total | 48.4 → 47.3 s | 90.3 → 95.1 s (3 → 4 tiles) |
+| 5 Ry: pair densities | 7.4 → 6.2 s | 35.3 → 32.2 s |
+| 5 Ry: total | 107.5 → 105.7 s | 208.8 → 206.0 s |
+| 5 Ry, L40S capped at 16 GB (14 tiles) | 110.4 s | – |
+
+The main gain is in runs with several q, where the CPU rotation competed with the background ε inversion.
 
 **Overlap of the tetrahedron weights.** With the GPU, phases B and C run in sub-blocks of about 32,768 rows.
 While the main thread drives the χ⁰ products of sub-block s on the GPU, a second OpenMP thread computes the

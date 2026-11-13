@@ -1,5 +1,6 @@
       PROGRAM RPA_chiqw 
       use mpi
+      use m_wfn_shared
       use fft_3d 
       use m_tetrahedron
       use m_rdinput
@@ -1148,10 +1149,28 @@
       endif
       if(myrank_glb.eq.MPI_io_rank)write(6,*)'wave functions in ',
      +   merge('single','double',wf_sp),' precision'
+!fork: with one rank per q group the ranks of a node share one copy
+!fork: (m_wfn_shared); RESPACK_WFN_SHARED=0 switches it off
+      wf_shared=.false.
+      wf_leader=.true.
+      if(wf_sp.and.num_of_mpi_per_comm==1.and.nproc_glb>1)then
+       call get_environment_variable('RESPACK_WFN_SHARED',cenv,lenv,
+     +      ienv)
+       if(.not.(ienv==0.and.lenv>0.and.cenv(1:1)=='0'))then
+        wf_shared=wfn_shared_alloc(comm_glb,NTG,nbufo,nbufv,Nk_irr,
+     +            OCC4,VIR4,wf_leader)
+       endif
+       if(myrank_glb.eq.MPI_io_rank)write(6,*)'wave functions shared',
+     +    ' on the node: ',wf_shared
+      endif
       if(wf_sp)then
        allocate(OCC(1,1,1),VIR(1,1,1),VIR_new(1,1,1))
-       allocate(OCC4a(NTG,1:nbufo,Nk_irr));OCC4a=(0.0,0.0)
-       allocate(VIR4a(NTG,1:nbufv,Nk_irr));VIR4a=(0.0,0.0)
+       if(wf_shared)then
+        allocate(OCC4a(1,1,1),VIR4a(1,1,1))
+       else
+        allocate(OCC4a(NTG,1:nbufo,Nk_irr));OCC4a=(0.0,0.0)
+        allocate(VIR4a(NTG,1:nbufv,Nk_irr));VIR4a=(0.0,0.0)
+       endif
        if(nproc>1)then
         allocate(VIR4_new(NTG,1:nbufv,Nk_irr))
        else
@@ -1167,8 +1186,10 @@
        endif
        allocate(OCC4a(1,1,1),VIR4a(1,1,1),VIR4_new(1,1,1))
       endif
-      OCC4=>OCC4a
-      VIR4=>VIR4a
+      if(.not.wf_shared)then
+       OCC4=>OCC4a
+       VIR4=>VIR4a
+      endif
       call MPI_BARRIER(comm_glb,ierr)
 !--
 !OPEN(102,FILE='./dir-wfn/dat.wfn',FORM='unformatted') 
@@ -1181,6 +1202,8 @@
       endif 
       call system('pwd') 
       do ik=1,Nk_irr  
+!fork: shared copy: only the node leader reads
+       if(.not.wf_leader)exit
        if(myrank/=0)then!not master  
         dest=0
         pnocld=pno 
@@ -1302,6 +1325,7 @@
         enddo 
        endif  
       enddo 
+      if(wf_shared)call wfn_shared_sync()
 !MPI_Broadcast
       IF(num_of_comm.gt.1)then 
        id_sub_perp=MOD(myrank_glb,num_of_mpi_per_comm)  
@@ -2311,6 +2335,7 @@
        write(6,*)'#TOTAL TIME=',diff_time 
       endif 
       !--
+      call wfn_shared_free()
       call MPI_FINALIZE(ierr)
       STOP 
       END              

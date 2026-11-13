@@ -65,6 +65,11 @@ static struct {
   zc *f;                         // fbatch pair products, ngrid each
   zc *coef; size_t coef_cap;     // packed coefficients (ncoef, nb)
   cc *coef4; size_t coef4_cap;   // the same in single precision (chi_gpu_bands_sp)
+  // rotation on the GPU (chi_gpu_wcache_*, chi_gpu_bands_rot): irreducible coefficients of the tile's bands,
+  // layout [k_irr][slot][ntg], and the per-k rotation map (jmap, 1-based as in Fortran) and phases
+  cc *wc; size_t wc_cap; int wc_nb, wc_nk, wc_ntg;
+  int *jm; size_t jm_cap;
+  zc *pm; size_t pm_cap;
   int *idx; size_t idx_cap;      // scatter indices (0-based)
   // per q
   int NG, nen, lq0;
@@ -773,6 +778,57 @@ extern "C" int chi_gpu_bands_sp(int nb, int ldc, const cc *coef, int ncoef, cons
   return 0;
 }
 
+// Rotation on the GPU. Cache of the irreducible coefficients of the tile's bands (single precision):
+// wc[(ikr * nb + slot) * ntg + ig]. chi_gpu_wcache_put copies nrun consecutive slots of one k_irr from host
+// columns of length ntg (OCC4(:, b, ikr), b consecutive).
+extern "C" int chi_gpu_wcache_begin(int nb, int nk, int ntg) {
+  if (ensure(&g.wc, &g.wc_cap, (size_t)nb * nk * ntg)) return -1;
+  g.wc_nb = nb; g.wc_nk = nk; g.wc_ntg = ntg;
+  return 0;
+}
+extern "C" int chi_gpu_wcache_put(int slot0, int nrun, int ikr, const cc *src) {
+  cc *dst = g.wc + ((size_t)ikr * g.wc_nb + slot0) * g.wc_ntg;
+  CK(cudaMemcpyAsync(dst, src, (size_t)nrun * g.wc_ntg * sizeof(cc), cudaMemcpyHostToDevice, g.st));
+  return 0;
+}
+// u[ubase + b](idx[ig]) = rot(wc[ikr][slot0 + b][jmap[ig] - 1] * pmap[ig]) as c0_apply_s (product in double, rounded
+// once): trs = 1 as is, -1 conjugated, 0 zero (the grid is zeroed before)
+__global__ void k_rotscatter(size_t n, int ncoef, const cc *__restrict__ wc, const int *__restrict__ jmap,
+                             const zc *__restrict__ pmap, int trs, const int *__restrict__ idx, cc *__restrict__ u,
+                             size_t ngrid, int ntg) {
+  for (size_t t = blockIdx.x * (size_t)blockDim.x + threadIdx.x; t < n; t += (size_t)gridDim.x * blockDim.x) {
+    const size_t b = t / ncoef, ig = t - b * ncoef;
+    const cc s = wc[b * ntg + jmap[ig] - 1];
+    const zc p = pmap[ig];
+    const double re = (double)s.x * cuCreal(p) - (double)s.y * cuCimag(p);
+    const double im = (double)s.x * cuCimag(p) + (double)s.y * cuCreal(p);
+    u[b * ngrid + idx[ig]] = make_cuComplex((float)re, (float)(trs == -1 ? -im : im));
+  }
+}
+extern "C" int chi_gpu_bands_rot(int nb, int slot0, int ikr, int ncoef, const int *jmap, const zc *pmap, int trs,
+                                 const int *idx, int ubase) {
+  if (nb <= 0) return 0;
+  if (!g.fft_sp) return -4;
+  if (ensure(&g.jm, &g.jm_cap, (size_t)ncoef)) return -1;
+  if (ensure(&g.pm, &g.pm_cap, (size_t)ncoef)) return -1;
+  if (ensure(&g.idx, &g.idx_cap, (size_t)ncoef)) return -1;
+  CK(cudaMemcpyAsync(g.jm, jmap, ncoef * sizeof(int), cudaMemcpyHostToDevice, g.st));
+  CK(cudaMemcpyAsync(g.pm, pmap, ncoef * sizeof(zc), cudaMemcpyHostToDevice, g.st));
+  CK(cudaMemcpyAsync(g.idx, idx, ncoef * sizeof(int), cudaMemcpyHostToDevice, g.st));
+  cc *u0 = g.u4 + (size_t)ubase * g.ngrid;
+  CK(cudaMemsetAsync(u0, 0, g.ngrid * nb * sizeof(cc), g.st));
+  if (trs == 1 || trs == -1) {
+    const size_t n = (size_t)ncoef * nb;
+    k_rotscatter<<<grid1(n), 256, 0, g.st>>>(n, ncoef, g.wc + ((size_t)ikr * g.wc_nb + slot0) * g.wc_ntg, g.jm,
+                                             g.pm, trs, g.idx, u0, g.ngrid, g.wc_ntg);
+    CK(cudaGetLastError());
+  }
+  if (fft_many(u0, nb, 1, CUFFT_INVERSE)) return -2;
+  // the host buffers (jmap, pmap, idx) are reused by the caller for the next k point
+  CK(cudaStreamSynchronize(g.st));
+  return 0;
+}
+
 // pinned (page-locked) host memory for the coefficient uploads; NULL on failure
 extern "C" void *chi_gpu_host_alloc(size_t nbytes) {
   void *p = NULL;
@@ -1026,8 +1082,12 @@ extern "C" int chi_gpu_q_end(zc *chi_host, zc *Y_host, zc *Z_host) {
 
 extern "C" int chi_gpu_available(void) { return 1; }
 // total memory of the device used by this rank (MB), for the tile size in chi_fast.f90
+// RESPACK_GPU_MEM_MB caps it (e.g. to emulate a smaller card in tests)
 extern "C" double chi_gpu_mem_total_mb(void) {
   size_t fr = 0, tot = 0;
   if (cudaMemGetInfo(&fr, &tot) != cudaSuccess) return 0.0;
-  return (double)tot / 1048576.0;
+  double mb = (double)tot / 1048576.0;
+  const char *e = getenv("RESPACK_GPU_MEM_MB");
+  if (e && atof(e) > 0. && atof(e) < mb) mb = atof(e);
+  return mb;
 }

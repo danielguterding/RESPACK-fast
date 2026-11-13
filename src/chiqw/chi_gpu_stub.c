@@ -20,3 +20,12 @@ int chi_gpu_bands_sp(int nb, int ldc, const void *coef, int ncoef, const int *id
 }
 void *chi_gpu_host_alloc(size_t nbytes) { (void)nbytes; return 0; }
 void chi_gpu_host_free(void *p) { (void)p; }
+int chi_gpu_wcache_begin(int nb, int nk, int ntg) { (void)nb; (void)nk; (void)ntg; return nogpu(); }
+int chi_gpu_wcache_put(int slot0, int nrun, int ikr, const void *src) {
+  (void)slot0; (void)nrun; (void)ikr; (void)src; return nogpu();
+}
+int chi_gpu_bands_rot(int nb, int slot0, int ikr, int ncoef, const int *jmap, const void *pmap, int trs,
+                      const int *idx, int ubase) {
+  (void)nb; (void)slot0; (void)ikr; (void)ncoef; (void)jmap; (void)pmap; (void)trs; (void)idx; (void)ubase;
+  return nogpu();
+}

@@ -77,6 +77,22 @@ module m_chi_fast
       import :: c_ptr
       type(c_ptr), value :: p
     end subroutine chi_gpu_host_free
+    integer(c_int) function chi_gpu_wcache_begin(nb, nk, ntg) bind(C, name='chi_gpu_wcache_begin')
+      import :: c_int
+      integer(c_int), value :: nb, nk, ntg
+    end function chi_gpu_wcache_begin
+    integer(c_int) function chi_gpu_wcache_put(slot0, nrun, ikr, src) bind(C, name='chi_gpu_wcache_put')
+      import :: c_int, c_float_complex
+      integer(c_int), value :: slot0, nrun, ikr
+      complex(c_float_complex), intent(in) :: src(*)
+    end function chi_gpu_wcache_put
+    integer(c_int) function chi_gpu_bands_rot(nb, slot0, ikr, ncoef, jmap, pmap, trs, idx, ubase) &
+         bind(C, name='chi_gpu_bands_rot')
+      import :: c_int, c_double_complex
+      integer(c_int), value :: nb, slot0, ikr, ncoef, trs, ubase
+      integer(c_int), intent(in) :: jmap(*), idx(*)
+      complex(c_double_complex), intent(in) :: pmap(*)
+    end function chi_gpu_bands_rot
     integer(c_int) function chi_gpu_init(n1, n2, n3, fbatch, verbose, fft_sp) bind(C, name='chi_gpu_init')
       import :: c_int
       integer(c_int), value :: n1, n2, n3, fbatch, verbose, fft_sp
@@ -228,6 +244,8 @@ contains
     integer :: ntj, nti
     real(8) :: t0, t1, tA, tB, tC, tArot, tAbnd, tApair   ! phase A (GPU): rotation / bands / pairs (host wall)
     integer :: itn, lev0, spl, nsub, isub, lpa, lpb
+    logical :: gpu_rot                         ! wave-function rotation on the GPU (tile cache of irreducible bands)
+    real(8) :: bytes_band, tsq
 
     if (ngrid == 0) then
       write(6,*) 'chi_fast_pairs: chi_fast_init not called'; stop
@@ -305,6 +323,33 @@ contains
     bj = int(min(dble(nJ), max(1d0, sqrt(dble(npmax)))))
     bi = int(min(dble(nI), max(1d0, dble(npmax)/dble(bj))))
     if (bi == nI) bj = int(min(dble(nJ), max(1d0, dble(npmax)/dble(nI))))
+    ! GPU rotation: per band of the tile also its irreducible coefficients (all k_irr, single precision) and its
+    ! real-space grid on the GPU. Square tile t x t with t^2 bytes_pair + 2 t bytes_band <= budget; kept if the tile
+    ! has at least min(256, all) pairs, else the CPU rotation (RESPACK_GPU_ROT=0 forces it).
+    gpu_rot = use_gpu .and. fft_sp .and. wf_sp .and. .not. lq0
+    block
+      character(len=8) :: ev
+      integer :: lev, st
+      call get_environment_variable('RESPACK_GPU_ROT', ev, lev, st)
+      if (st == 0 .and. lev > 0) then
+        if (ev(1:1) == '0') gpu_rot = .false.
+      end if
+    end block
+    if (gpu_rot) then
+      bytes_band = 8d0*(dble(Nk_irr)*dble(NTG) + dble(ngrid))
+      tsq = (-bytes_band + sqrt(bytes_band**2 + budget*bytes_pair))/bytes_pair
+      bj = int(min(dble(nJ), max(1d0, tsq)))
+      bi = int(min(dble(nI), max(1d0, tsq)))
+      if (bi == nI) bj = int(min(dble(nJ), max(1d0, (budget - nI*bytes_band)/(nI*bytes_pair + bytes_band))))
+      if (bj == nJ) bi = int(min(dble(nI), max(1d0, (budget - nJ*bytes_band)/(nJ*bytes_pair + bytes_band))))
+      if (int(bj, 8)*int(bi, 8) < min(256_8, int(nJ, 8)*int(nI, 8)) .or. &
+          dble(bj)*dble(bi)*bytes_pair + dble(bj + bi)*bytes_band > budget) then
+        gpu_rot = .false.
+        bj = int(min(dble(nJ), max(1d0, sqrt(dble(npmax)))))
+        bi = int(min(dble(nI), max(1d0, dble(npmax)/dble(bj))))
+        if (bi == nI) bj = int(min(dble(nJ), max(1d0, dble(npmax)/dble(nI))))
+      end if
+    end if
     ! CPU path: per-thread real-space buffers of phase A must also fit (into the remaining 30 %)
     do
       if (use_gpu) exit
@@ -335,6 +380,8 @@ contains
     end do
     if (verbose) write(6,'(a,l2,a,i8,a,2i6,a,2i6,a,i6)') ' chi_fast: q0=', lq0, ' pairs=', N_PAIR, &
          ' bands(occ,vir)=', nJ, nI, ' tile=', bj, bi, ' ntile=', ntile
+    if (verbose .and. gpu_rot) write(6,'(a,f8.2,a)') " chi_fast: wave-function rotation on the GPU, cache of the" &
+         //" irreducible bands per tile ", 8d0*dble(Nk_irr)*dble(NTG)*dble(bj + bi)/1073741824d0, " GB"
 
     tA = 0d0; tB = 0d0; tC = 0d0; tArot = 0d0; tAbnd = 0d0; tApair = 0d0
     allocate(tj(bj), ti(bi))
@@ -669,11 +716,39 @@ contains
       logical :: sp_up
       integer(c_int), allocatable :: idxJ(:), idxI(:), pj0(:), pi0(:)
       integer, allocatable :: jmapJ(:), jmapI(:)
-      integer :: ik, ikq, ikir, iop, ikirq, iopq, jl, il, ig, lp
+      integer :: ik, ikq, ikir, iop, ikirq, iopq, jl, il, ig, lp, ikr, l0
       real(8) :: ta0
       ! single-precision uploads with single-precision FFTs; q = 0 keeps double precision (k.p terms from cJ, cI)
       sp_up = fft_sp .and. .not. lq0
-      if (sp_up) then
+      if (gpu_rot) then
+        ! irreducible coefficients of the tile's bands to the GPU, consecutive bands in one copy
+        ta0 = omp_get_wtime()
+        rcg = chi_gpu_wcache_begin(ntj + nti, Nk_irr, NTG)
+        call gpu_check(rcg, 'chi_gpu_wcache_begin')
+        do ikr = 1, Nk_irr
+          l0 = 1
+          do jl = 1, ntj
+            if (jl == ntj) then
+              rcg = chi_gpu_wcache_put(l0 - 1, jl - l0 + 1, ikr - 1, OCC4(1, tj(l0), ikr))
+            else if (tj(jl + 1) /= tj(jl) + 1) then
+              rcg = chi_gpu_wcache_put(l0 - 1, jl - l0 + 1, ikr - 1, OCC4(1, tj(l0), ikr))
+              l0 = jl + 1
+            end if
+          end do
+          l0 = 1
+          do il = 1, nti
+            if (il == nti) then
+              rcg = chi_gpu_wcache_put(ntj + l0 - 1, il - l0 + 1, ikr - 1, VIR4(1, ti(l0), ikr))
+            else if (ti(il + 1) /= ti(il) + 1) then
+              rcg = chi_gpu_wcache_put(ntj + l0 - 1, il - l0 + 1, ikr - 1, VIR4(1, ti(l0), ikr))
+              l0 = il + 1
+            end if
+          end do
+        end do
+        call gpu_check(rcg, 'chi_gpu_wcache_put')
+        tAbnd = tAbnd + omp_get_wtime() - ta0
+        allocate(cJ(1, 1), cI(1, 1))
+      else if (sp_up) then
         call pinned_c4(int(NTG, 8)*int(ntj + nti, 8))
         if (c_associated(pin_ptr)) then
           call c_f_pointer(pin_ptr, c4, [NTG, ntj + nti])
@@ -700,7 +775,9 @@ contains
              nnp, L1, L2, L3, packing(-L1, -L2, -L3, ikir), jmapJ, pmapJ)
         call make_C0_map(NTG, trs(ikq), NG0(ikq), KG0(1, 1, ikq), RW(1, ikq), rginv(1, 1, iopq), pg(1, iopq), &
              nnp, L1, L2, L3, packing(-L1, -L2, -L3, ikirq), jmapI, pmapI)
-        if (sp_up) then
+        if (gpu_rot) then
+          continue                     ! rotation on the GPU (chi_gpu_bands_rot)
+        else if (sp_up) then
           !$omp parallel do schedule(static)
           do jl = 1, ntj
             if (wf_sp) then
@@ -747,7 +824,12 @@ contains
         end do
         tArot = tArot + omp_get_wtime() - ta0
         ta0 = omp_get_wtime()
-        if (sp_up) then
+        if (gpu_rot) then
+          rcg = chi_gpu_bands_rot(ntj, 0, ikir - 1, NG0(ik), jmapJ, pmapJ, trs(ik), idxJ, 0)
+          call gpu_check(rcg, 'chi_gpu_bands_rot (occ)')
+          rcg = chi_gpu_bands_rot(nti, ntj, ikirq - 1, NG0(ikq), jmapI, pmapI, trs(ikq), idxI, ntj)
+          call gpu_check(rcg, 'chi_gpu_bands_rot (vir)')
+        else if (sp_up) then
           rcg = chi_gpu_bands_sp(ntj, NTG, c4(:, 1:ntj), NG0(ik), idxJ, 0)
           call gpu_check(rcg, 'chi_gpu_bands_sp (occ)')
           rcg = chi_gpu_bands_sp(nti, NTG, c4(:, ntj + 1:ntj + nti), NG0(ikq), idxI, ntj)
