@@ -4,10 +4,15 @@
 // (10-bit mantissa in [0.5,1), optionally random sign) -> all products exact in FP32, reference sum exact in double.
 // Reported per method and K: max and rms of |T - Tref| / sum_k |x y| and the mean signed error (bias) in units of eps32.
 // Build (ROCm): hipcc -O3 --offload-arch=<gfx...> -std=c++17 accerr.cpp -o accerr -lhipblas -lopenblas
+// Build (CUDA): g++ -O3 -DTOOLS_CUDA -I$CUDA/include accerr.cpp -o accerr -L$CUDA/lib64 -lcublas -lcudart -lopenblas
+#ifdef TOOLS_CUDA
+#include "hip2cuda.h"   // NVIDIA: same source with CUDA/cuBLAS
+#else
 #define HIPBLAS_V2
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <hipblas/hipblas.h>
+#endif
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>

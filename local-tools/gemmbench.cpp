@@ -1,13 +1,18 @@
 // Part of the zen-opt fork of RESPACK. Copyright (C) 2026 Daniel Guterding.
 // GNU General Public License, version 3 (see GPL/GPLv3.txt).
-// GEMM microbenchmark for the chi0 products on an AMD GPU (hipBLAS):
+// GEMM microbenchmark for the chi0 products (hipBLAS, or cuBLAS with -DTOOLS_CUDA):
 //   T(NG,NG) = Bt(NG,K) * A(NG,K)^T, complex single precision, as in chi_gpu_gemm
 // variants: CGEMM; CGEMM strided-batched over omega; real 4M as one SGEMM (2NG x NG x 2K);
 // 3M (3 SGEMMs NG x NG x K); BF16 / FP16 GemmEx with FP32 accumulation (2NG x NG x 2K, one pass).
 // Build (ROCm): hipcc -O3 --offload-arch=<gfx...> -std=c++17 gemmbench.cpp -o gemmbench -lhipblas
+// Build (CUDA): g++ -O3 -DTOOLS_CUDA -I$CUDA/include gemmbench.cpp -o gemmbench -L$CUDA/lib64 -lcublas -lcudart
+#ifdef TOOLS_CUDA
+#include "hip2cuda.h"   // NVIDIA: same source with CUDA/cuBLAS
+#else
 #define HIPBLAS_V2
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
+#endif
 #include <cstdio>
 #include <cstdlib>
 #include <vector>

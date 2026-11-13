@@ -101,6 +101,7 @@ budget means larger tiles and fewer backward FFTs.
 | `cmake/FindFFTW3.cmake`, `CMakePresets.json` | new | FFTW3 finder, build presets |
 | `src/chiqw/chi_gpu.cu`, `chi_gpu_stub.c` | new | GPU path of the band-pair loop, stub without a GPU build |
 | `src/chiqw/gpu_api.h` | new | maps the CUDA names in `chi_gpu.cu` onto HIP/hipFFT/hipBLAS for the ROCm build |
+| `src/chiqw/hgemm_rn.cuh` | new | FP16 GEMM with round-to-nearest accumulation for NVIDIA GPUs (sm_80 and newer) |
 | `src/chiqw/fp16_rn/` | new | FP16 GEMM kernel with round-to-nearest accumulation for gfx1200 (patched hipBLASLt kernel, MIT License: `LICENSE-hipBLASLt.txt`), embedding (`fp16_rn_blob.c`) |
 | `local-tools/*`, `README-zen-opt.md` | new | build script, validation and benchmark tools, this document |
 
@@ -376,7 +377,8 @@ the installed library and patched in its assembly (`local-tools/tensile-patch/`)
   `calc_chiqw`. This happens when `CMAKE_HIP_ARCHITECTURES` contains gfx1200 (option `RESPACK_HIP_FP16_RN`,
   default ON).
 - **Runtime.** The kernel is used on gfx1200 devices with NG ≥ 16 (the library kernel faults for M < 8).
-  `RESPACK_GPU_FP16_RN=0` selects the chunked hipBLAS path. Other GPUs and the CUDA build use the chunked path.
+  `RESPACK_GPU_FP16_RN=0` selects the chunked hipBLAS path, which other AMD GPUs use. The CUDA build has its own
+  kernel (see “FP16 split on the L40S”).
 - **Corrections.** These stay with hipBLAS. The best library kernel would be 3 % faster for them, not worth a
   second embedded kernel.
 
@@ -409,12 +411,71 @@ rounding. Longer blocks make it worse and are not faster: 16384 rows give 1.7×1
 CGEMM (27.4 s against 82.7 s), at CGEMM-level accuracy. The round-to-nearest kernel removed the chunk overhead.
 What remains besides the GEMMs is packing and accumulation (about 3 s at NG = 1963).
 
-**To do: evaluate the FP16 tensor cores on the L40S** (CUDA build, same switch). Measure accuracy against CPU
-double precision and speed against the CGEMM path (≈ 31 TFLOP/s) at SrVO₃ size and at large NG. If accurate,
-the FP16 tensor-core rate should give at least a 2× gain there as well. NVIDIA tensor cores are reported to
-truncate in their internal accumulation too (Fasi, Higham, Mikaitis, Pranesh, PeerJ Comput. Sci. 7, e330
-(2021)). So first run `accerr.cpp` (CUDA port) on the L40S and choose the chunk length from it. Not yet
-compiled or run with CUDA.
+**Padding of the G dimension (both GPUs).** The FP16 operands and T use a G dimension P = NG rounded up to a
+multiple of 8 (`RESPACK_GPU_FP16_PAD`, default 8; padding rows are not written and not read back):
+- **L40S.** With an odd NG, cuBLAS picks unaligned FP16 kernels: 135 instead of 190–200 TFLOP/s. Padding only
+  the leading dimensions does not help. At NG = 1963 the χ⁰ products of the chunked path take 7.8 s instead of
+  10.9 s.
+- **RX 9060 XT.** The corrections call takes 8.5 instead of 9.9 ms per block and frequency, and the χ⁰ products
+  7 % less time; ε⁻¹ is unchanged.
+
+### FP16 split on the L40S (CUDA build)
+
+The same switch (`RESPACK_GPU_GEMM=fp16`) on an L40S. CUDA 13.0, one GPU, 8 cores of an EPYC 9454; the CUDA
+versions of `accerr.cpp` and `gemmbench.cpp` build with `-DTOOLS_CUDA` (`local-tools/hip2cuda.h`).
+
+**The tensor cores truncate, and much more than RDNA4 at short K.** Same-sign data, `accerr.cpp`, bias in units
+of 2⁻²⁴:
+
+| | K = 128 | 512 | 2048 | 16384 |
+|---|---|---|---|---|
+| L40S, FP16 GemmEx, one call | −8.6 | −73 | −28 (other kernel) | −371 |
+| L40S, chunks of 256 / 64, β = 1 | −8.6 / −1.9 | −28 / −1.9 | −28 / −1.9 | −28 / −1.9 |
+| RX 9060 XT, one call | – | −4.4 | −37 | −360 |
+
+With chunks of 512, as on the RX 9060 XT, ε⁻¹ deviates by 2.9×10⁻⁵ (SrVO₃ chain) and 3.8×10⁻⁶ (Si), 7–9× more
+than with CGEMM. Shorter chunks would cost too much output traffic.
+
+**Kernel with round-to-nearest accumulation (`src/chiqw/hgemm_rn.cuh`).** Own CUDA code, used for hi·hi on
+compute capability ≥ 8.0; `RESPACK_GPU_FP16_RN=0` selects the chunked cuBLAS path.
+- **Accumulation.** Every `mma.sync` m16n8k16 starts from zero, and its 16-term result is added to the FP32
+  accumulator with an ordinary FADD (round to nearest).
+- **Tiles.** 128 × 256 (or 128 × 128 for N < 1024) by 32, 8 warps of 64 × 64, a 4-stage `cp.async` pipeline,
+  XOR-swizzled shared memory read with `ldmatrix.trans`, and warp fragments double-buffered.
+- **Split K.** When the output tiles do not fill the GPU, K is split and the partial results are added in a
+  second kernel (round to nearest).
+- **Tests.** `local-tools/hgemm_rn_test.cu`:
+  - error against an exact reference: bias 0.0, rms 1–8 units of 2⁻²⁴ up to K = 16384;
+  - 192 edge cases (M from 8 to 1968, K from 1 to 20000, β = 1, padded leading dimensions) agree with cuBLAS;
+  - sustained timing at the `gemm_mp` shapes.
+
+Per block and frequency (8192 rows, sustained):
+
+| | NG = 1963 | NG = 583 | NG = 61 |
+|---|---|---|---|
+| corrections, cuBLAS (K′ = 32768, β = 0) | 2.53 ms (200 TFLOP/s) | 0.25 ms | 0.015 ms |
+| hi·hi, cuBLAS in chunks of 512 | 1.88 ms | 0.28 ms | 0.149 ms |
+| hi·hi, cuBLAS in one call (biased) | 1.32 ms | 0.13 ms | 0.011 ms |
+| hi·hi, round-to-nearest kernel | 1.65 ms (154 TFLOP/s) | 0.22 ms | 0.018 ms |
+| (kernel with plain tensor-core accumulation) | 1.38 ms | 0.19 ms | 0.016 ms |
+| CGEMM path (4 CGEMMs of 2048 rows) | ≈ 6 ms (41 TFLOP/s) | 0.68 ms | – |
+
+In `calc_chiqw` on the L40S:
+
+| | CGEMM (default) | FP16, chunks of 512, not padded | FP16, chunks of 512 | FP16, round-to-nearest kernel | FP16 `2x` |
+|---|---|---|---|---|---|
+| NG = 1963, one q: ε⁻¹ vs CPU double | 1.8×10⁻⁶ | 5.1×10⁻⁶ | 5.1×10⁻⁶ | 7.8×10⁻⁷ | 1.1×10⁻⁵ |
+| NG = 1963, one q: χ⁰ products | 12.06 s | 10.89 s | 7.80 s | 7.30 s | 5.79 s |
+| NG = 1963, one q: total | 61.3 s | 59.9 s | 56.1 s | 55.8 s | 55.2 s |
+| SrVO₃ chain (`Ecut_for_eps` 5 Ry): ε⁻¹ / χ⁰ products | 4.0×10⁻⁶ / 2.5 s | 2.1×10⁻⁵ / 8.4 s | 2.9×10⁻⁵ / 6.6 s | 4.5×10⁻⁶ / 3.2 s | – |
+| Si chain: ε⁻¹ / χ⁰ products | 4.4×10⁻⁷ / 0.5 s | 3.8×10⁻⁶ / 1.6 s | 3.8×10⁻⁶ / 1.3 s | 4.0×10⁻⁷ / 0.6 s | – |
+| U(ω), J(ω): max. deviation (SrVO₃ / Si) | 6×10⁻⁵ / 1×10⁻⁵ eV | 8×10⁻⁵ / 1×10⁻⁵ eV | 1.9×10⁻⁴ / 2×10⁻⁵ eV | 6×10⁻⁵ / 1×10⁻⁵ eV | – |
+
+With the round-to-nearest kernel, the FP16 path on the L40S is as accurate as CGEMM, and at NG = 1963 more
+accurate. There its χ⁰ products are 1.65× faster. (CPU double precision on the same 8 cores: 2338 s.) At the small NG of the chains (56–70) it is slightly slower than CGEMM: CGEMM is the
+better choice there. The total of one q is dominated by the CPU (ε inversion and output on 8 cores, about
+45 s). With several q, the asynchronous ε post-processing (`flg_async_eps`) overlaps that with the GPU work of
+the next q.
 
 ### Validation (GPU vs CPU double precision; L40S, CUDA 13.0)
 
@@ -560,5 +621,6 @@ per-directory Makefiles are unchanged but don't know about the fork's new files;
 | `local-tools/bench_tetra.f90`, `acc_tetra_quad.f90` | tetrahedron speed, and accuracy vs quad precision |
 | `local-tools/eps_freq_dev.py` | deviation of ε⁻¹ per frequency |
 | `local-tools/validate_si.sh`, `validate_full.sh` | end-to-end validation against the original |
-| `local-tools/accerr.cpp`, `gemmbench.cpp` | accumulation error of GEMM paths against an exact reference; GEMM rates for the χ⁰ shapes (HIP) |
+| `local-tools/accerr.cpp`, `gemmbench.cpp`, `mpbench.cpp` | accumulation error of GEMM paths against an exact reference; GEMM rates for the χ⁰ shapes; one block and frequency of the FP16 path (HIP, or CUDA with `-DTOOLS_CUDA` and `hip2cuda.h`) |
+| `local-tools/hgemm_rn_test.cu` | accuracy, edge cases and sustained timing of `hgemm_rn.cuh` (CUDA) |
 | `local-tools/tensile-patch/` | extract, reassemble, patch, check and time hipBLASLt's FP16 kernels (see its README) |
