@@ -46,6 +46,17 @@ same speed (10.0 ms, 50 TFLOP/s at K = 32768).
 | original: rms / bias | 5.2 / −4.4 | 37 / −37 | 175 / −175 | 731 / −731 |
 | patched: rms / bias | 1.5 / 0.0 | 2.9 / 0.0 | 5.7 / 0.0 | 11.3 / 0.0 |
 
+Timing (`tkern`: 20 warm-up launches, then the best of 5 × 10). The additions cost issue slots, not latency:
+
+| K = 32768 | time |
+|---|---|
+| original | 10.12 ms (49.9 TFLOP/s) |
+| patched, adds 1 / 2 / 4 WMMA later (`--depth`) | 12.7–12.9 / 12.7–12.9 / 12.6–12.8 ms (+26 %) |
+| patched, single `v_add_f32` (`--single`) | 14.0–14.2 ms (+40 %) |
+
+Fewer adds per WMMA would need longer chains in the temporary tiles, but the 4×4-tile kernel has no registers left
+for a second accumulator. Earlier single-shot timings:
+
 | time | K = 512 | 4096 | 16384 (β = 1) | 32768 |
 |---|---|---|---|---|
 | original | 0.27 ms | 1.65 ms | 5.72 ms | 10.04 ms |

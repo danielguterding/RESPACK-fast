@@ -81,6 +81,7 @@ static struct {
   // RESPACK_GPU_GEMM=fp16 (gemm_mp)
   int gemm_mp;
   int fp16_chunk;                // K columns per hi*hi GemmEx call (0: one call)
+  int fp16_terms;                // 3: hi*hi + hi*lo + lo*hi; 2: X (1) or Y (2) without its lo part
   hf *Xh; size_t Xh_cap;         // NG*4kc
   hf *Yh; size_t Yh_cap;         // 2NG*6kc
   float *Tf; size_t Tf_cap;      // NG*2NG
@@ -362,7 +363,7 @@ __global__ void k_packY(size_t n, int NG, int K, const zc *__restrict__ At, int 
 // Xhat (NG x 4K, ld NG) = [Xt_h | Xt_l] of X(G, r) = conj(A(G, r)) * W(r0+r) * sX, with A taken from the FP16
 // hi + lo parts in Yhat (22 bits; 8 bytes read per element instead of 16, 8 bytes written instead of 24)
 __global__ void k_packX(size_t n, int NG, int K, const hf *__restrict__ Yh, int r0, const zc *__restrict__ Wcol,
-                        float s, hf *__restrict__ Xh) {
+                        float s, int lo, hf *__restrict__ Xh) {   // lo = 0: hi part only (RESPACK_GPU_FP16_TERMS=2x)
   const size_t L = 2 * (size_t)NG, B = L * 2 * K, BX = (size_t)NG * 2 * K;
   for (size_t t = blockIdx.x * (size_t)blockDim.x + threadIdx.x; t < n; t += (size_t)gridDim.x * blockDim.x) {
     size_t r = t / NG, gg = t - r * NG;
@@ -375,7 +376,8 @@ __global__ void k_packX(size_t n, int NG, int K, const hf *__restrict__ Yh, int 
     split_h((ar * wr + ai * wi) * s, hr, lr);
     split_h((ar * wi - ai * wr) * s, hi, li);
     const size_t q0 = gg + (size_t)NG * r, q1 = gg + (size_t)NG * (K + r);
-    Xh[q0] = hr; Xh[q1] = hi; Xh[BX + q0] = lr; Xh[BX + q1] = li;
+    Xh[q0] = hr; Xh[q1] = hi;
+    if (lo) { Xh[BX + q0] = lr; Xh[BX + q1] = li; }
   }
 }
 
@@ -431,6 +433,12 @@ extern "C" int chi_gpu_init(int n1, int n2, int n3, int fbatch, int verbose, int
   }
   { const char *e = getenv("RESPACK_GPU_GEMM"); g.gemm_mp = (e && strcmp(e, "fp16") == 0); }
   { const char *e = getenv("RESPACK_GPU_FP16_CHUNK"); g.fp16_chunk = (e && *e) ? atoi(e) : 512; }
+  {   // RESPACK_GPU_FP16_TERMS: 3 (default), 2x (X without lo: hi*hi + hi(X)*lo(Y)), 2y (Y without lo)
+    const char *e = getenv("RESPACK_GPU_FP16_TERMS");
+    g.fp16_terms = 0;
+    if (e && strcmp(e, "2x") == 0) g.fp16_terms = 1;
+    if (e && strcmp(e, "2y") == 0) g.fp16_terms = 2;
+  }
   CK(cudaMalloc((void **)&g.amax, sizeof(unsigned int)));
   g.init = 1;
   if (verbose) {
@@ -439,8 +447,9 @@ extern "C" int chi_gpu_init(int n1, int n2, int n3, int fbatch, int verbose, int
     printf(" chi_gpu: local rank %d -> device %d (%s, %.1f GB), grid %d %d %d, FFT batch %d, %s FFTs\n", local_rank(),
            g.dev, pr.name, pr.totalGlobalMem / 1073741824.0, n1, n2, n3, g.fbatch, fft_sp ? "single-precision" : "double-precision");
     if (g.gemm_mp)
-      printf(" chi_gpu: RESPACK_GPU_GEMM=fp16: chi products with FP16 hi/lo split, FP32 accumulation, hi*hi in K chunks of %d"
-             " (experimental)\n", g.fp16_chunk);
+      printf(" chi_gpu: RESPACK_GPU_GEMM=fp16: chi products with FP16 hi/lo split (%s), FP32 accumulation, hi*hi in K"
+             " chunks of %d (experimental)\n", g.fp16_terms == 1 ? "2 terms, X without lo" : g.fp16_terms == 2 ?
+             "2 terms, Y without lo" : "3 terms", g.fp16_chunk);
     fflush(stdout);
   }
   return 0;
@@ -650,13 +659,19 @@ static int gemm_mp(const zc *W, int kc) {
       if (!(g.mW[ie] > 0.0)) continue;
       frexp(2.0 * mA * g.mW[ie], &ex);
       const double sX = ldexp(1.0, 13 - ex);
-      k_packX<<<grid1(nb), 256, 0, g.st>>>(nb, NG, nr, g.Yh, r0, g.W + (size_t)rows * ie, (float)(sX / sY), g.Xh);
+      k_packX<<<grid1(nb), 256, 0, g.st>>>(nb, NG, nr, g.Yh, r0, g.W + (size_t)rows * ie, (float)(sX / sY),
+                                           g.fp16_terms != 1, g.Xh);
       // T (NG x 2NG) = Xhat Yhat^T. Corrections: [Xt_h | Xt_l] [Yt_l | Yt_h]^T (columns 0..4nr-1 of Xhat,
       // 2nr..6nr-1 of Yhat), beta = 0; then hi*hi (columns 0..2nr-1) in chunks, each added with beta = 1.
       const int L = 2 * NG, ch = (g.fp16_chunk > 0 && g.fp16_chunk < 2 * nr) ? g.fp16_chunk : 2 * nr;
-      CB(cublasGemmEx(g.blas, CUBLAS_OP_N, CUBLAS_OP_T, NG, L, 4 * nr, &one, g.Xh, CUDA_R_16F, NG,
-                      g.Yh + (size_t)L * 2 * nr, CUDA_R_16F, L, &zero, g.Tf, CUDA_R_32F, NG, CUBLAS_COMPUTE_32F,
-                      CUBLAS_GEMM_DEFAULT));
+      {   // corrections: 3 terms [Xt_h | Xt_l] [Yt_l | Yt_h]^T; 2x: Xt_h Yt_l^T only; 2y: Xt_l Yt_h^T only
+        const hf *xc = g.Xh, *yc = g.Yh + (size_t)L * 2 * nr;
+        int kcor = 4 * nr;
+        if (g.fp16_terms == 1) kcor = 2 * nr;
+        if (g.fp16_terms == 2) { xc = g.Xh + (size_t)NG * 2 * nr; yc = g.Yh + (size_t)L * 4 * nr; kcor = 2 * nr; }
+        CB(cublasGemmEx(g.blas, CUBLAS_OP_N, CUBLAS_OP_T, NG, L, kcor, &one, xc, CUDA_R_16F, NG, yc, CUDA_R_16F, L,
+                        &zero, g.Tf, CUDA_R_32F, NG, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+      }
       for (int k0 = 0; k0 < 2 * nr; k0 += ch) {
         const int kk = 2 * nr - k0 < ch ? 2 * nr - k0 : ch;
         CB(cublasGemmEx(g.blas, CUBLAS_OP_N, CUBLAS_OP_T, NG, L, kk, &one, g.Xh + (size_t)NG * k0, CUDA_R_16F, NG,

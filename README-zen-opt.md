@@ -342,6 +342,21 @@ per block. Per frequency only `[Xr | Xi]` (hi and lo) is written, with A read fr
 instead of 40 bytes of memory traffic per element and frequency. At NG = 1963, `k_packX` takes 1.37 s instead of
 3.07 s per q point and the GEMM phase 30.6 s instead of 31.8 s; ε⁻¹ is unchanged (1.085×10⁻⁶).
 
+**Fast mode with two products (`RESPACK_GPU_FP16_TERMS=2x`).** X is used with its hi part only, which drops the
+lo(X)·hi(Y) product (`2y` drops hi(X)·lo(Y) instead). That is a third less GEMM work, but 10–30× less accurate. Use
+it for exploratory runs (convergence parameters, Wannier windows); production runs use the default of three products.
+Against CPU double precision (double-precision FFTs for the chains):
+
+| | 3 products (default) | `2x` | `2y` |
+|---|---|---|---|
+| ε⁻¹, SrVO₃ chain | 1.2×10⁻⁶ | 2.1×10⁻⁵ | 2.5×10⁻⁵ |
+| ε⁻¹, Si chain | 3.2×10⁻⁶ | 6.9×10⁻⁵ | 9.2×10⁻⁵ |
+| U(ω), J(ω), Si: max. deviation | 4×10⁻⁵ eV | 3.3×10⁻⁴ eV | 3.2×10⁻⁴ eV |
+| static U₁₁ | identical | identical | Si: last digit |
+| NG = 1963, one q: ε⁻¹ / χ⁰ products / total | 1.1×10⁻⁶ / 30.6 s / 48.1 s | 9.0×10⁻⁶ / 22.5 s / 40 s | 1.1×10⁻⁵ / 23.0 s / 40 s |
+
+With `2x`, `k_packX` writes only the hi part of X.
+
 **Status:** experimental, validated on the RX 9060 XT. At NG ≈ 2000 the χ⁰ products are 2.6× faster than
 with CGEMM, at CGEMM-level accuracy. The remaining overhead is the output traffic of the β = 1 chunk calls
 (about 9 s at NG = 1963) plus packing and accumulation (about 4 s). A custom kernel with two-level

@@ -68,10 +68,15 @@ int main(int argc, char **argv) {
   for (size_t i = 0; i < r0.size(); i++) if (r0[i] != r1[i]) { ndiff++; mx = fmax(mx, fabs(r0[i] - r1[i])); }
   // timing (beta = 0 so that repeats give the same result)
   a.beta = 0.f;
-  CK(hipEventRecord(e0)); for (int i = 0; i < 10; i++) CK(hipExtModuleLaunchKernel(f, t0 * 128, t1, 1, 128, 1, 1, 0, 0, NULL, extra, NULL, NULL, 0));
-  CK(hipEventRecord(e1)); CK(hipEventSynchronize(e1)); float ms1; CK(hipEventElapsedTime(&ms1, e0, e1));
-  CK(hipEventRecord(e0)); for (int i = 0; i < 10; i++) hipblasGemmEx(h, HIPBLAS_OP_N, HIPBLAS_OP_T, M, N, K, &alpha, X, HIP_R_16F, M, Y, HIP_R_16F, N, &a.beta, T0, HIP_R_32F, M, HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
-  CK(hipEventRecord(e1)); CK(hipEventSynchronize(e1)); float ms0; CK(hipEventElapsedTime(&ms0, e0, e1));
+  // timing: warm-up (GPU clocks), then the best of 5 rounds of 10 launches each
+  float ms1 = 1e30f, ms0 = 1e30f, ms;
+  for (int i = 0; i < 20; i++) CK(hipExtModuleLaunchKernel(f, t0 * 128, t1, 1, 128, 1, 1, 0, 0, NULL, extra, NULL, NULL, 0));
+  for (int r = 0; r < 5; r++) {
+    CK(hipEventRecord(e0)); for (int i = 0; i < 10; i++) CK(hipExtModuleLaunchKernel(f, t0 * 128, t1, 1, 128, 1, 1, 0, 0, NULL, extra, NULL, NULL, 0));
+    CK(hipEventRecord(e1)); CK(hipEventSynchronize(e1)); CK(hipEventElapsedTime(&ms, e0, e1)); ms1 = fminf(ms1, ms);
+    CK(hipEventRecord(e0)); for (int i = 0; i < 10; i++) hipblasGemmEx(h, HIPBLAS_OP_N, HIPBLAS_OP_T, M, N, K, &alpha, X, HIP_R_16F, M, Y, HIP_R_16F, N, &a.beta, T0, HIP_R_32F, M, HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
+    CK(hipEventRecord(e1)); CK(hipEventSynchronize(e1)); CK(hipEventElapsedTime(&ms, e0, e1)); ms0 = fminf(ms0, ms);
+  }
   double fl = 2.0 * M * N * (double)K;
   printf("%s: K %d beta %g | differing elements vs hipblasGemmEx: %zu of %zu (max |d| %.3g) | %.3f ms (%.1f TFLOP/s) vs hipBLAS %.3f ms\n",
          co, K, beta, ndiff, r0.size(), mx, ms1 / 10, fl / (ms1 / 10 * 1e-3) / 1e12, ms0 / 10);
