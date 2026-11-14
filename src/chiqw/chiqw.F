@@ -73,8 +73,8 @@
       call MPI_Bcast(fast_wfn_sp,1,MPI_INTEGER,0,comm_glb,ierr)
 !fork: auto -> off in the CPU build (all cores compute chi0 anyway)
       if(flg_async_eps<0) flg_async_eps=0
-!fork: auto -> double-precision FFTs in the CPU build
-      if(fast_fft_sp<0) fast_fft_sp=0
+!fork: auto -> single-precision FFTs (fast_fft_sp=0 for double)
+      if(fast_fft_sp<0) fast_fft_sp=1
 !--
 !      call MPI_FINALIZE(ierr)
 !      stop

@@ -78,10 +78,10 @@ FILE_NUM_EPS_BASE_START=600000
 N_CALC_Q=0
 FLG_FAST=1!fork: restructured pair loop
 FAST_MEM_MB=4096.0d0!fork: MB per pair tile
-FAST_GEMM_SP=0!fork: double-precision ZGEMM
-FAST_FFT_SP=-1!fork: auto (CPU build: double-precision FFTs)
+FAST_GEMM_SP=1!fork: single-precision CGEMM blocks, double-precision sum (0: ZGEMM)
+FAST_FFT_SP=-1!fork: auto (single-precision FFTs)
 FLG_ASYNC_EPS=-1!fork: auto (CPU build: off)
-FAST_WFN_SP=-1!fork: auto (CPU: double precision)
+FAST_WFN_SP=-1!fork: auto (single precision together with single-precision FFTs)
 !--
 !open(999,file='input.in')
 !read(999,nml=param_chiqw)
