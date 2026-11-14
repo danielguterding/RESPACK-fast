@@ -42,13 +42,14 @@ integer,public::fast_fft_sp!fork: 1=single-precision FFTs for the pair densities
 integer,public::flg_gpu!fork: 1=CUDA path for the pair loop (needs -DRESPACK_CUDA=ON)
 integer,public::fast_gemm_sp!fork: 1=chi0 accumulation as single-precision CGEMM blocks (double-precision sum)
 integer,public::flg_async_eps!fork: 1=eps inversion/output of a q point in a background thread (m_eps_async), -1=auto
+integer,public::fast_wfn_sp!fork: 1=wave functions stored in single precision (half the memory), 0=double, -1=auto
 integer,public::n_calc_q!total number of calculated q pts
 integer,public,allocatable::calc_num_k(:)!calc_num_k(n_calc_q) 
 namelist/param_chiqw/N_CALC_BAND,Ecut_for_eps,shift_ef,Max_excitation_energy,& 
 Green_func_delt,ttrhdrn_dmna,ttrhdrn_dmnr,MPI_io_rank,MPI_num_proc_per_qcomm,&
 MPI_num_qcomm,Num_freq_grid,Lower_bound_energy_window,Upper_bound_energy_window,&
 flg_cRPA,flg_calc_type,file_num_log_start,file_num_chi_start,file_num_eps_start,&
-file_num_chi_base_start,file_num_eps_base_start,n_calc_q,flg_fast,fast_mem_mb,fast_gemm_sp,flg_gpu,fast_fft_sp,flg_async_eps 
+file_num_chi_base_start,file_num_eps_base_start,n_calc_q,flg_fast,fast_mem_mb,fast_gemm_sp,flg_gpu,fast_fft_sp,flg_async_eps,fast_wfn_sp 
 contains
 subroutine read_input(nproc)  
 integer::nproc 
@@ -82,6 +83,7 @@ FAST_GEMM_SP=0!fork: double-precision ZGEMM
 FLG_GPU=0!fork: CPU path
 FAST_FFT_SP=-1!fork: auto (single-precision FFTs with flg_gpu=1)
 FLG_ASYNC_EPS=-1!fork: auto (on with flg_gpu=1)
+FAST_WFN_SP=-1!fork: auto (single precision together with single-precision FFTs)
 !--
 !open(999,file='input.in')
 !read(999,nml=param_chiqw)

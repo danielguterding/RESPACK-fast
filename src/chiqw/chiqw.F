@@ -71,6 +71,7 @@
       call MPI_Bcast(flg_gpu,1,MPI_INTEGER,0,comm_glb,ierr)
       call MPI_Bcast(fast_fft_sp,1,MPI_INTEGER,0,comm_glb,ierr)
       call MPI_Bcast(flg_async_eps,1,MPI_INTEGER,0,comm_glb,ierr)
+      call MPI_Bcast(fast_wfn_sp,1,MPI_INTEGER,0,comm_glb,ierr)
 !fork: auto -> on with flg_gpu=1 (the CPU is idle while the GPU
 ! computes chi0), off otherwise (all cores compute chi0)
       if(flg_async_eps<0)then
@@ -1138,11 +1139,13 @@
       flush(6) 
       !-- 
       call MPI_BARRIER(comm_glb,ierr)
-!fork: single-precision wave functions on the GPU path (it uses
-!fork: single-precision FFTs): half the memory; RESPACK_WFN_DP=1 keeps
-!fork: double precision. The ring buffer VIR_new is only needed for
-!fork: more than one rank per q group (band distribution).
-      wf_sp=(flg_fast==1.and.flg_gpu==1.and.fast_fft_sp==1)
+!fork: single-precision wave functions (fast_wfn_sp=1; -1 = auto: with
+!fork: single-precision FFTs, fast_fft_sp=1): half the memory; the
+!fork: rotation and everything after it stay in double precision.
+!fork: RESPACK_WFN_DP=1 forces double precision. The ring buffer VIR_new
+!fork: is only needed for more than one rank per q group.
+      wf_sp=(flg_fast==1.and.(fast_wfn_sp==1.or.
+     +      (fast_wfn_sp<0.and.fast_fft_sp==1)))
       call get_environment_variable('RESPACK_WFN_DP',cenv,lenv,ienv)
       if(ienv==0.and.lenv>0)then
        if(cenv(1:1)=='1')wf_sp=.false.
