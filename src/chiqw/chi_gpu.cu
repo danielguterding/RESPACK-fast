@@ -27,6 +27,11 @@
 //   (see chi_gpu_gemm_mp). Same accumulation into the double-precision chi. hi*hi runs in one call of a GEMM
 //   kernel with round-to-nearest accumulation: hgemm_rn.cuh (CUDA, sm_80 and newer) or the patched hipBLASLt
 //   kernel in fp16_rn/ (HIP, gfx1200); otherwise hipBLAS/cuBLAS in K chunks.
+// * RDNA2 (gfx103x, HIP; default there, RESPACK_GPU_GEMM=blas: hipBLAS): chi products with the fused kernels of
+//   chi0_rdna2.h instead of a CGEMM per frequency (conj(A) W formed while the operand is loaded, same precision
+//   model: FP32 blocks of GPU_KC_MAX rows added to the double-precision chi) and the q=0 products below in one
+//   pass over A for all frequencies (k_yz_at) instead of ZGEMV -- no BLAS calls, so it also runs natively on
+//   integrated GPUs without rocBLAS kernels (Radeon 680M/660M, gfx1035).
 // * q=0: Y(G) += sum_r conj(A_rG) w_r v_r, Z(G) += sum_r A_rG w_r conj(v_r) in double precision
 //   (ZGEMV); the host assembles the head/wing-replaced chi from chi, Y, Z (and D on the CPU).
 // Conventions as cuFFT/FFTW: inverse (backward) unnormalised exp(+i...), forward exp(-i...).
@@ -35,6 +40,8 @@
 #include "gpu_api.h"
 #ifndef RESPACK_HIP
 #include "hgemm_rn.cuh"   // FP16 GEMM with round-to-nearest accumulation (mma.sync, sm_80 and newer)
+#else
+#include "chi0_rdna2.h"   // fused chi products for RDNA2 (gfx103x), no BLAS
 #endif
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,7 +60,7 @@ typedef cuComplex cc;
 typedef __half hf;
 
 static struct {
-  int init, dev, verbose;
+  int init, dev, verbose, sync_up;
   int n1, n2, n3, fbatch;
   size_t ngrid;
   int fft_sp;                    // fast_fft_sp=1: single-precision FFTs/products (C2C)
@@ -89,6 +96,10 @@ static struct {
   zc *tmp; size_t tmp_cap;       // NG
   cc *Bt; size_t Bt_cap;         // NG*kc
   cc *T4; size_t T4_cap;         // NG*NG
+  // fused RDNA2 path (chi0_rdna2.h; default on gfx103x, RESPACK_GPU_GEMM=blas: hipBLAS instead): chi products and
+  // the q=0 matrix-vector products without BLAS
+  int fused;
+  zc *part; size_t part_cap;     // per-slab copies of chi (row ranges split over workgroups)
   // RESPACK_GPU_GEMM=fp16 (gemm_mp)
   int gemm_mp;
   int fp16_chunk;                // K columns per hi*hi GemmEx call (0: one call)
@@ -132,6 +143,23 @@ static int ensure(T **p, size_t *cap, size_t n) {
   *p = NULL; *cap = 0;
   CK(cudaMalloc((void **)p, n * sizeof(T)));
   *cap = n;
+  return 0;
+}
+
+// Uploads from host memory. On integrated AMD GPUs (g.sync_up, see chi_gpu_init) each copy has completed before
+// the next one is issued: with ROCm 7.2.0 on a Radeon 680M (gfx1035, run as gfx1030), back-to-back
+// hipMemcpyAsync copies from pageable host memory sometimes arrived with data of the preceding copy (copies from
+// pinned memory were not affected); the GPU then read corrupted scatter indices in k_rotscatter and faulted.
+// Every API function below synchronizes the stream before it returns and no upload overlaps with running GPU
+// work, so the extra waits cost nothing. Discrete GPUs keep the plain asynchronous copies.
+static int h2d(void *dst, const void *src, size_t n) {
+  CK(cudaMemcpyAsync(dst, src, n, cudaMemcpyHostToDevice, g.st));
+  if (g.sync_up) CK(cudaStreamSynchronize(g.st));
+  return 0;
+}
+static int h2d_2d(void *dst, size_t dpitch, const void *src, size_t spitch, size_t width, size_t height) {
+  CK(cudaMemcpy2DAsync(dst, dpitch, src, spitch, width, height, cudaMemcpyHostToDevice, g.st));
+  if (g.sync_up) CK(cudaStreamSynchronize(g.st));
   return 0;
 }
 
@@ -567,6 +595,14 @@ extern "C" int chi_gpu_init(int n1, int n2, int n3, int fbatch, int verbose, int
   if (ndev < 1) { fprintf(stderr, "chi_gpu: no " GPU_RT_NAME " device\n"); return -10; }
   g.dev = local_rank() % ndev;
   CK(cudaSetDevice(g.dev));
+  {   // integrated AMD GPU (APU): wait for each upload, see h2d(); RESPACK_GPU_SYNC_UPLOADS=0/1 overrides
+    int integ = 0;
+#ifdef RESPACK_HIP
+    CK(hipDeviceGetAttribute(&integ, hipDeviceAttributeIntegrated, g.dev));
+#endif
+    const char *e = getenv("RESPACK_GPU_SYNC_UPLOADS");
+    g.sync_up = (e && *e) ? (atoi(e) != 0) : (integ != 0);
+  }
   g.n1 = n1; g.n2 = n2; g.n3 = n3;
   {   // twiddles of the fused x pass (exact: computed in double precision, rounded once)
     cc *tw = (cc *)malloc((size_t)n1 * sizeof(cc));
@@ -606,6 +642,19 @@ extern "C" int chi_gpu_init(int n1, int n2, int n3, int fbatch, int verbose, int
     CK(cudaMalloc((void **)&g.f, g.ngrid * g.fbatch * sizeof(zc)));
   }
   { const char *e = getenv("RESPACK_GPU_GEMM"); g.gemm_mp = (e && strcmp(e, "fp16") == 0); }
+  g.fused = 0;
+#ifdef RESPACK_HIP
+  {   // RDNA2 (gfx103x, also gfx1035 run as gfx1030): fused kernel unless RESPACK_GPU_GEMM=blas or fp16
+    const char *e = getenv("RESPACK_GPU_GEMM");
+    hipDeviceProp_t pr;
+    CK(hipGetDeviceProperties(&pr, g.dev));
+    const int rdna2 = strncmp(pr.gcnArchName, "gfx103", 6) == 0;
+    g.fused = rdna2 && !g.gemm_mp && !(e && strcmp(e, "blas") == 0);
+    if (e && strcmp(e, "fused") == 0 && !rdna2)
+      fprintf(stderr, "chi_gpu: RESPACK_GPU_GEMM=fused needs an RDNA2 GPU (gfx103x), not %s; using hipBLAS\n",
+              pr.gcnArchName);
+  }
+#endif
   { const char *e = getenv("RESPACK_GPU_FP16_CHUNK"); g.fp16_chunk = (e && *e) ? atoi(e) : 512; }
   { const char *e = getenv("RESPACK_GPU_FP16_PAD"); g.fp16_pad = (e && atoi(e) > 0) ? atoi(e) : 8; }
   {   // RESPACK_GPU_FP16_TERMS: 3 (default), 2x (X without lo: hi*hi + hi(X)*lo(Y)), 2y (Y without lo)
@@ -647,6 +696,12 @@ extern "C" int chi_gpu_init(int n1, int n2, int n3, int fbatch, int verbose, int
     CK(cudaGetDeviceProperties(&pr, g.dev));
     printf(" chi_gpu: local rank %d -> device %d (%s, %.1f GB), grid %d %d %d, FFT batch %d, %s FFTs\n", local_rank(),
            g.dev, pr.name, pr.totalGlobalMem / 1073741824.0, n1, n2, n3, g.fbatch, fft_sp ? "single-precision" : "double-precision");
+    if (g.sync_up) printf(" chi_gpu: uploads from host memory one at a time (integrated GPU; RESPACK_GPU_SYNC_UPLOADS=0 turns this off)\n");
+#ifdef RESPACK_HIP
+    if (g.fused)
+      printf(" chi_gpu: chi products with the fused RDNA2 kernel (no BLAS; FP32 blocks of %d rows added to the"
+             " double-precision chi; RESPACK_GPU_GEMM=blas: hipBLAS)\n", GPU_KC_MAX);
+#endif
     if (g.gemm_mp) {
       const char *terms = g.fp16_terms == 1 ? "2 terms, X without lo" : g.fp16_terms == 2 ? "2 terms, Y without lo" :
                           "3 terms";
@@ -768,8 +823,7 @@ extern "C" int chi_gpu_tile_begin(int rows, int nu, int np, const int *pj, const
   }
   if (ensure(&g.pj, &g.pj_cap, (size_t)np)) return -1;
   if (ensure(&g.pi, &g.pi_cap, (size_t)np)) return -1;
-  CK(cudaMemcpyAsync(g.pj, pj, np * sizeof(int), cudaMemcpyHostToDevice, g.st));
-  CK(cudaMemcpyAsync(g.pi, pi, np * sizeof(int), cudaMemcpyHostToDevice, g.st));
+  if (h2d(g.pj, pj, np * sizeof(int)) || h2d(g.pi, pi, np * sizeof(int))) return -1;
   CK(cudaStreamSynchronize(g.st));
   return 0;
 }
@@ -780,9 +834,8 @@ extern "C" int chi_gpu_bands(int nb, int ldc, const zc *coef, int ncoef, const i
   if (nb <= 0) return 0;
   if (ensure(&g.coef, &g.coef_cap, (size_t)ncoef * nb)) return -1;
   if (ensure(&g.idx, &g.idx_cap, (size_t)ncoef)) return -1;
-  CK(cudaMemcpy2DAsync(g.coef, ncoef * sizeof(zc), coef, (size_t)ldc * sizeof(zc), ncoef * sizeof(zc), nb,
-                       cudaMemcpyHostToDevice, g.st));
-  CK(cudaMemcpyAsync(g.idx, idx, ncoef * sizeof(int), cudaMemcpyHostToDevice, g.st));
+  if (h2d_2d(g.coef, ncoef * sizeof(zc), coef, (size_t)ldc * sizeof(zc), ncoef * sizeof(zc), nb)) return -1;
+  if (h2d(g.idx, idx, ncoef * sizeof(int))) return -1;
   size_t n = (size_t)ncoef * nb;
   if (g.fft_sp) {
     cc *u0 = g.u4 + (size_t)ubase * g.ngrid;
@@ -810,9 +863,8 @@ extern "C" int chi_gpu_bands_sp(int nb, int ldc, const cc *coef, int ncoef, cons
   if (!g.fft_sp) return -4;
   if (ensure(&g.coef4, &g.coef4_cap, (size_t)ncoef * nb)) return -1;
   if (ensure(&g.idx, &g.idx_cap, (size_t)ncoef)) return -1;
-  CK(cudaMemcpy2DAsync(g.coef4, ncoef * sizeof(cc), coef, (size_t)ldc * sizeof(cc), ncoef * sizeof(cc), nb,
-                       cudaMemcpyHostToDevice, g.st));
-  CK(cudaMemcpyAsync(g.idx, idx, ncoef * sizeof(int), cudaMemcpyHostToDevice, g.st));
+  if (h2d_2d(g.coef4, ncoef * sizeof(cc), coef, (size_t)ldc * sizeof(cc), ncoef * sizeof(cc), nb)) return -1;
+  if (h2d(g.idx, idx, ncoef * sizeof(int))) return -1;
   size_t n = (size_t)ncoef * nb;
   cc *u0 = g.u4 + (size_t)ubase * g.ngrid;
   CK(cudaMemsetAsync(u0, 0, g.ngrid * nb * sizeof(cc), g.st));
@@ -834,8 +886,7 @@ extern "C" int chi_gpu_wcache_begin(int nb, int nk, int ntg) {
 }
 extern "C" int chi_gpu_wcache_put(int slot0, int nrun, int ikr, const cc *src) {
   cc *dst = g.wc + ((size_t)ikr * g.wc_nb + slot0) * g.wc_ntg;
-  CK(cudaMemcpyAsync(dst, src, (size_t)nrun * g.wc_ntg * sizeof(cc), cudaMemcpyHostToDevice, g.st));
-  return 0;
+  return h2d(dst, src, (size_t)nrun * g.wc_ntg * sizeof(cc));
 }
 // u[ubase + b](idx[ig]) = rot(wc[ikr][slot0 + b][jmap[ig] - 1] * pmap[ig]) as c0_apply_s (product in double, rounded
 // once): trs = 1 as is, -1 conjugated, 0 zero (the grid is zeroed before)
@@ -858,9 +909,8 @@ extern "C" int chi_gpu_bands_rot(int nb, int slot0, int ikr, int ncoef, const in
   if (ensure(&g.jm, &g.jm_cap, (size_t)ncoef)) return -1;
   if (ensure(&g.pm, &g.pm_cap, (size_t)ncoef)) return -1;
   if (ensure(&g.idx, &g.idx_cap, (size_t)ncoef)) return -1;
-  CK(cudaMemcpyAsync(g.jm, jmap, ncoef * sizeof(int), cudaMemcpyHostToDevice, g.st));
-  CK(cudaMemcpyAsync(g.pm, pmap, ncoef * sizeof(zc), cudaMemcpyHostToDevice, g.st));
-  CK(cudaMemcpyAsync(g.idx, idx, ncoef * sizeof(int), cudaMemcpyHostToDevice, g.st));
+  if (h2d(g.jm, jmap, ncoef * sizeof(int)) || h2d(g.pm, pmap, ncoef * sizeof(zc)) ||
+      h2d(g.idx, idx, ncoef * sizeof(int))) return -1;
   cc *u0 = g.u4 + (size_t)ubase * g.ngrid;
   CK(cudaMemsetAsync(u0, 0, g.ngrid * nb * sizeof(cc), g.st));
   if (trs == 1 || trs == -1) {
@@ -1032,6 +1082,47 @@ static int gemm_mp(const zc *W, int ldw, const zc *At, int rows, int kc) {
   return 0;
 }
 
+#ifdef RESPACK_HIP
+// chi += sum_r conj(A4(G, r)) W4(r, ie) A4(G', r) with the fused RDNA2 kernels (chi0_rdna2.h). A4: NG x rows,
+// W4: rows x nen (single precision), rows a multiple of CHI0_KC (zero weights in the padding rows); FP32 blocks of
+// L rows (multiple of CHI0_KC). N tiles of width 8 TN, TN <= 11, chosen so that they cover NG with fewer than
+// 8 padding columns each. With fewer than about 384 tiles (12 CUs x 2-4 workgroups x a few rounds) the rows are
+// split over z slabs of whole FP32 blocks; slab z > 0 adds into its own copy of chi (g.part, at most 256 MB), the
+// copies are added to chi afterwards (no atomics).
+static int chi0_fused(int rows, int L, const cc *A4, const cc *W4) {
+  const int NG = g.NG, nen = g.nen, TNMAX = 11;
+  const int nt = (NG + 8 * TNMAX - 1) / (8 * TNMAX), tn = (NG + 8 * nt - 1) / (8 * nt);
+  const int mt = (NG * nen + 63) / 64, tiles = mt * nt;
+  const size_t ncopy = (size_t)NG * NG * nen;
+  const int nblk = (rows + L - 1) / L;
+  int z = tiles >= 384 ? 1 : (384 + tiles - 1) / tiles;
+  if (z > nblk) z = nblk;
+  while (z > 1 && (size_t)(z - 1) * ncopy * sizeof(zc) > ((size_t)256 << 20)) z--;
+  const int Lz = (nblk + z - 1) / z * L;
+  z = (rows + Lz - 1) / Lz;
+  if (z > 1) {
+    if (ensure(&g.part, &g.part_cap, (size_t)(z - 1) * ncopy)) return -1;
+    CK(cudaMemsetAsync(g.part, 0, (size_t)(z - 1) * ncopy * sizeof(zc), g.st));
+  }
+  const dim3 grid(mt, nt, z);
+  const float2 *a = (const float2 *)A4, *w = (const float2 *)W4;
+  double2 *c = (double2 *)g.chi, *pp = (double2 *)g.part;
+  switch (tn) {
+#define CHI0_TN(t) case t: k_chi0_rdna2<t><<<grid, 128, 0, g.st>>>(NG, nen, rows, L, Lz, a, w, c, pp, ncopy); break;
+    CHI0_TN(1) CHI0_TN(2) CHI0_TN(3) CHI0_TN(4) CHI0_TN(5) CHI0_TN(6) CHI0_TN(7) CHI0_TN(8) CHI0_TN(9) CHI0_TN(10)
+    CHI0_TN(11)
+#undef CHI0_TN
+    default: return -1;
+  }
+  CK(cudaGetLastError());
+  if (z > 1) {
+    k_addparts<<<grid1(ncopy), 256, 0, g.st>>>(ncopy, z - 1, (const double2 *)g.part, (double2 *)g.chi);
+    CK(cudaGetLastError());
+  }
+  return 0;
+}
+#endif
+
 // phase C for the rows row0 .. row0+nrw-1 of the tile (0-based): W(ldw, nen) and (q=0) V(ldw, 3) on the host,
 // the pair densities of these rows on the device; kc = rows per CGEMM block. The tile can be processed in
 // several row ranges (chi_fast.f90 overlaps the weights of the next range with this one).
@@ -1046,10 +1137,29 @@ extern "C" int chi_gpu_gemm(const zc *Wh, const zc *Vh, int kc, int ldw, int row
   { const char *e = getenv("RESPACK_GPU_KC"); if (e && atoi(e) > 0) kc = atoi(e); }   // rows per CGEMM block (testing)
   if (kc < 1 || kc > rows) kc = rows;
   if (ensure(&g.W, &g.W_cap, nW)) return -1;
-  CK(cudaMemcpy2DAsync(g.W, (size_t)rows * sizeof(zc), W, (size_t)ldw * sizeof(zc), (size_t)rows * sizeof(zc), nen,
-                       cudaMemcpyHostToDevice, g.st));
+  if (h2d_2d(g.W, (size_t)rows * sizeof(zc), W, (size_t)ldw * sizeof(zc), (size_t)rows * sizeof(zc), nen)) return -1;
   if (g.gemm_mp) {
     if (gemm_mp(W, ldw, At, rows, kc)) return -1;
+#ifdef RESPACK_HIP
+  } else if (g.fused) {
+    // FP32 blocks of kc rows (rounded down to whole chunks of CHI0_KC); rows in pieces that keep the 32-bit byte
+    // offsets of the kernel's buffer loads below 2^31; each piece converted to single precision and padded with
+    // zero rows to a multiple of CHI0_KC
+    const int L = kc >= CHI0_KC ? kc / CHI0_KC * CHI0_KC : CHI0_KC;
+    const long long lim = (0x7fffffffLL / 8 - NG) / (NG > nen ? NG : nen);
+    const int cmax = (int)(lim / L * L);
+    if (cmax < L) { fprintf(stderr, "chi_gpu: NG %d, nen %d too large for the fused kernel\n", NG, nen); return -1; }
+    for (int c0 = 0; c0 < rows; c0 += cmax) {
+      const int nr = rows - c0 < cmax ? rows - c0 : cmax, nrp = (nr + CHI0_KC - 1) / CHI0_KC * CHI0_KC;
+      if (ensure(&g.A4, &g.A4_cap, (size_t)NG * nrp)) return -1;
+      if (ensure(&g.W4, &g.W4_cap, (size_t)nrp * nen)) return -1;
+      k_d2f_pad<<<grid1((size_t)NG * nrp), 256, 0, g.st>>>(NG, nr, nrp, (const double2 *)At, (size_t)c0, (float2 *)g.A4);
+      k_w2f_pad<<<grid1((size_t)nrp * nen), 256, 0, g.st>>>(nen, nr, nrp, (const double2 *)g.W, rows, (size_t)c0,
+                                                            (float2 *)g.W4);
+      CK(cudaGetLastError());
+      if (chi0_fused(nrp, L, g.A4, g.W4)) return -1;
+    }
+#endif
   } else {
     if (ensure(&g.A4, &g.A4_cap, nA)) return -1;
     if (ensure(&g.W4, &g.W4_cap, nW)) return -1;
@@ -1077,20 +1187,35 @@ extern "C" int chi_gpu_gemm(const zc *Wh, const zc *Vh, int kc, int ldw, int row
     if (ensure(&g.V, &g.V_cap, (size_t)rows * 3)) return -1;
     if (ensure(&g.xv, &g.xv_cap, (size_t)rows)) return -1;
     if (ensure(&g.tmp, &g.tmp_cap, (size_t)NG)) return -1;
-    CK(cudaMemcpy2DAsync(g.V, (size_t)rows * sizeof(zc), V, (size_t)ldw * sizeof(zc), (size_t)rows * sizeof(zc), 3,
-                         cudaMemcpyHostToDevice, g.st));
-    const zc zone = make_cuDoubleComplex(1., 0.), zzero = make_cuDoubleComplex(0., 0.);
-    for (int ie = 0; ie < nen; ie++) {
-      for (int ix = 0; ix < 3; ix++) {
-        const zc *w = g.W + (size_t)rows * ie, *v = g.V + (size_t)rows * ix;
-        zc *Yc = g.Y + (size_t)NG * (ie * 3 + ix), *Zc = g.Z + (size_t)NG * (ie * 3 + ix);
-        // y(G) = sum_r conj(A_rG) w_r v_r = conj( sum_r At(G,r) conj(w_r v_r) )
-        k_wv<<<grid1(rows), 256, 0, g.st>>>(rows, w, v, 0, g.xv);
-        CB(cublasZgemv(g.blas, CUBLAS_OP_N, NG, rows, &zone, At, NG, g.xv, 1, &zzero, g.tmp, 1));
-        k_addconj<<<grid1(NG), 256, 0, g.st>>>(NG, g.tmp, Yc);
-        // z(G) = sum_r A_rG w_r conj(v_r)
-        k_wv<<<grid1(rows), 256, 0, g.st>>>(rows, w, v, 1, g.xv);
-        CB(cublasZgemv(g.blas, CUBLAS_OP_N, NG, rows, &zone, At, NG, g.xv, 1, &zone, Zc, 1));
+    if (h2d_2d(g.V, (size_t)rows * sizeof(zc), V, (size_t)ldw * sizeof(zc), (size_t)rows * sizeof(zc), 3)) return -1;
+#ifdef RESPACK_HIP
+    if (g.fused) {   // all frequencies and directions in one pass over At (k_yz_at), no BLAS
+      const size_t ny = (size_t)NG * 3 * nen;
+      if (ensure(&g.tmp, &g.tmp_cap, ny)) return -1;
+      CK(cudaMemsetAsync(g.tmp, 0, ny * sizeof(zc), g.st));
+      int sp = rows / 4096;
+      if (sp < 1) sp = 1;
+      if (sp > 64) sp = 64;
+      k_yz_at<<<dim3((NG + 31) / 32, (nen + 7) / 8, sp), 256, 0, g.st>>>(NG, rows, nen, (const double2 *)At,
+          (const double2 *)g.W, (const double2 *)g.V, (double2 *)g.tmp, (double2 *)g.Z);
+      k_addconj<<<grid1(ny), 256, 0, g.st>>>(ny, g.tmp, g.Y);
+      CK(cudaGetLastError());
+    } else
+#endif
+    {
+      const zc zone = make_cuDoubleComplex(1., 0.), zzero = make_cuDoubleComplex(0., 0.);
+      for (int ie = 0; ie < nen; ie++) {
+        for (int ix = 0; ix < 3; ix++) {
+          const zc *w = g.W + (size_t)rows * ie, *v = g.V + (size_t)rows * ix;
+          zc *Yc = g.Y + (size_t)NG * (ie * 3 + ix), *Zc = g.Z + (size_t)NG * (ie * 3 + ix);
+          // y(G) = sum_r conj(A_rG) w_r v_r = conj( sum_r At(G,r) conj(w_r v_r) )
+          k_wv<<<grid1(rows), 256, 0, g.st>>>(rows, w, v, 0, g.xv);
+          CB(cublasZgemv(g.blas, CUBLAS_OP_N, NG, rows, &zone, At, NG, g.xv, 1, &zzero, g.tmp, 1));
+          k_addconj<<<grid1(NG), 256, 0, g.st>>>(NG, g.tmp, Yc);
+          // z(G) = sum_r A_rG w_r conj(v_r)
+          k_wv<<<grid1(rows), 256, 0, g.st>>>(rows, w, v, 1, g.xv);
+          CB(cublasZgemv(g.blas, CUBLAS_OP_N, NG, rows, &zone, At, NG, g.xv, 1, &zone, Zc, 1));
+        }
       }
     }
     CK(cudaGetLastError());

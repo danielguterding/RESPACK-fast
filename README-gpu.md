@@ -23,8 +23,10 @@ inputs, validation and the CPU build. Unless marked otherwise, everything below 
 - **χ⁰ products.** By default CGEMM blocks (cuBLAS/hipBLAS), each added to a double-precision χ(G,G′,ω) kept on
   the GPU; this is the precision model of `fast_gemm_sp=1` on the CPU. With `RESPACK_GPU_GEMM=fp16` they run on
   the matrix units as an FP16 split with round-to-nearest accumulation (own kernel on NVIDIA GPUs with compute
-  capability ≥ 8.0, patched hipBLASLt kernel on gfx1200).
-- **q = 0 head/wing terms.** Double-precision ZGEMV on the GPU, summed over tiles and assembled on the host.
+  capability ≥ 8.0, patched hipBLASLt kernel on gfx1200). On AMD RDNA2 GPUs (gfx103x) an own fused kernel is
+  the default instead (see “Integrated and RDNA2 GPUs” below); it needs no BLAS.
+- **q = 0 head/wing terms.** Double-precision ZGEMV on the GPU (on RDNA2: one own kernel for all frequencies),
+  summed over tiles and assembled on the host.
 - **Tetrahedron weights.** On the CPU, in sub-blocks that overlap with the χ⁰ products on the GPU.
 - **ε inversion and output.** On the CPU, in the background while the GPU computes the next q point
   (`flg_async_eps`, auto = on with `flg_gpu=1`).
@@ -72,7 +74,7 @@ cmake --install build/native-cuda --prefix $HOME/.local/respack-gpu     # option
 ### AMD (ROCm/HIP)
 
 - **ROCm** with HIP, hipFFT (rocFFT) and hipBLAS (rocBLAS), including their CMake package files. Tested only
-  with ROCm 7.2.1. The code uses the hipBLAS v2 API (`HIPBLAS_V2`, the default from ROCm 7.0); ROCm 6.x has
+  with ROCm 7.2.1 (RX 9060 XT) and 7.2.0 (Radeon 680M). The code uses the hipBLAS v2 API (`HIPBLAS_V2`, the default from ROCm 7.0); ROCm 6.x has
   not been tested.
 - **For the FP16 round-to-nearest kernel on gfx1200:** `llvm-mc` and `ld.lld` from ROCm's LLVM
   (`$ROCM_PATH/llvm/bin`). The kernel source was taken from the hipBLASLt of ROCm 7.2.1; it is assembled at build
@@ -92,6 +94,10 @@ cmake --install build/hip --prefix $HOME/.local/respack-gpu     # optional
 - The configure step prints `-- HIP: <clang version>, architectures gfx1200, ROCm /opt/rocm`.
 - For gfx1200, the build also assembles the FP16 round-to-nearest GEMM kernel (`src/chiqw/fp16_rn/`, used with
   `RESPACK_GPU_GEMM=fp16`). `-DRESPACK_HIP_FP16_RN=OFF` leaves it out.
+- **Integrated RDNA2 GPUs** (Radeon 680M/660M, gfx1035): build for the native architecture,
+  `-DCMAKE_HIP_ARCHITECTURES=gfx1035`, and run without `HSA_OVERRIDE_GFX_VERSION`. rocBLAS has no kernels for
+  gfx1035, but this path makes no BLAS calls (hipBLAS is still linked). hipFFT/rocFFT compile their kernels for
+  gfx1035 at run time.
 
 ### Check the build
 
@@ -99,6 +105,8 @@ On a machine with the GPU:
 - With `flg_gpu=1`, the log of `calc_chiqw` names the device, e.g.
   `chi_gpu: local rank 0 -> device 0 (NVIDIA L40S, 47.4 GB), grid 24 24 24, FFT batch 1024, single-precision FFTs`
   or `chi_gpu: local rank 0 -> device 0 (AMD Radeon RX 9060 XT, 15.9 GB), grid …`.
+- On RDNA2 GPUs the log says `chi_gpu: chi products with the fused RDNA2 kernel (no BLAS; …)`, and on integrated
+  GPUs also `chi_gpu: uploads from host memory one at a time (integrated GPU; …)`.
 - With `RESPACK_GPU_GEMM=fp16`, the next line ends in `hi*hi in one call with round-to-nearest accumulation
   (mma.sync kernel; experimental)` on NVIDIA or `(gfx1200 kernel; experimental)` on gfx1200. If it says
   `hi*hi in K chunks of 512` instead, the round-to-nearest kernel is not used.
@@ -109,16 +117,16 @@ On a machine with the GPU:
 
 ### Tested with
 
-| | NVIDIA (CUDA build) | AMD (HIP build) |
-|---|---|---|
-| GPU | L40S (compute capability 8.9, 48 GB), driver 580.82.07 | Radeon RX 9060 XT (gfx1200, 16 GB), in-kernel `amdgpu` driver |
-| GPU software | CUDA 13.0 (nvcc V13.0.88), with its cuFFT and cuBLAS | ROCm 7.2.1: HIP 7.2.53211, AMD clang 22.0.0git, hipBLAS 3.2.0, rocBLAS 5.2.0, hipFFT 1.0.22, rocFFT 1.0.36 (packages for Ubuntu 24.04) |
-| CPU, OS | AMD EPYC 9454; Ubuntu 24.04.5, Linux 6.8 | AMD Ryzen 9 9950X3D, 62 GB; Ubuntu 26.04.1, Linux 7.0 |
-| compilers | GCC and gfortran 13.3.0 (also the host compiler of nvcc) | GCC and gfortran 15.2.0 |
-| CMake | 3.28.3 | 4.2.3 |
-| MPI | Open MPI 4.1.6 | Open MPI 5.0.10 |
-| BLAS/LAPACK, FFTW | OpenBLAS 0.3.26, FFTW 3.3.10 (Ubuntu packages) | OpenBLAS 0.3.32, FFTW 3.3.10 (Ubuntu packages) |
-| configuration | preset `native` with `-DRESPACK_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89` | preset `hip` with `-DCMAKE_HIP_ARCHITECTURES=gfx1200 -DRESPACK_NATIVE=ON` |
+| | NVIDIA (CUDA build) | AMD (HIP build) | AMD, integrated (HIP build) |
+|---|---|---|---|
+| GPU | L40S (compute capability 8.9, 48 GB), driver 580.82.07 | Radeon RX 9060 XT (gfx1200, 16 GB), in-kernel `amdgpu` driver | Radeon 680M (gfx1035, 12 CUs, shares the system memory), in-kernel `amdgpu` driver |
+| GPU software | CUDA 13.0 (nvcc V13.0.88), with its cuFFT and cuBLAS | ROCm 7.2.1: HIP 7.2.53211, AMD clang 22.0.0git, hipBLAS 3.2.0, rocBLAS 5.2.0, hipFFT 1.0.22, rocFFT 1.0.36 (packages for Ubuntu 24.04) | ROCm 7.2.0: HIP 7.2.26015, AMD clang 22.0.0git, hipFFT 1.0.22, rocFFT 1.0.36 (hipBLAS 3.2.0 linked, not called) |
+| CPU, OS | AMD EPYC 9454; Ubuntu 24.04.5, Linux 6.8 | AMD Ryzen 9 9950X3D, 62 GB; Ubuntu 26.04.1, Linux 7.0 | AMD Ryzen 7 PRO 6850U, 30 GB; Ubuntu 24.04.5, Linux 6.8 |
+| compilers | GCC and gfortran 13.3.0 (also the host compiler of nvcc) | GCC and gfortran 15.2.0 | GCC and gfortran 13.3.0 |
+| CMake | 3.28.3 | 4.2.3 | 3.28.3 |
+| MPI | Open MPI 4.1.6 | Open MPI 5.0.10 | Open MPI 4.1.6 |
+| BLAS/LAPACK, FFTW | OpenBLAS 0.3.26, FFTW 3.3.10 (Ubuntu packages) | OpenBLAS 0.3.32, FFTW 3.3.10 (Ubuntu packages) | OpenBLAS 0.3.34, FFTW 3.3.11 (built from source) |
+| configuration | preset `native` with `-DRESPACK_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89` | preset `hip` with `-DCMAKE_HIP_ARCHITECTURES=gfx1200 -DRESPACK_NATIVE=ON` | preset `hip` with `-DCMAKE_HIP_ARCHITECTURES=gfx1035 -DRESPACK_ARCH=znver3 -DRESPACK_LTO=ON` |
 
 Other CUDA and ROCm versions and other GPUs have not been tested.
 
@@ -157,12 +165,13 @@ Other CUDA and ROCm versions and other GPUs have not been tested.
 | `fast_fft_sp` (`&param_chiqw`) | −1 (auto = 1) | single-precision FFTs, CPU and GPU; 0: double precision |
 | `flg_async_eps` (`&param_chiqw`) | −1 (auto) | ε inversion and output of a q point in a background thread; auto = on with `flg_gpu=1` |
 | `fast_mem_mb` (`&param_chiqw`) | 4096 | tile budget of the CPU path |
-| `RESPACK_GPU_GEMM` | unset (CGEMM) | `fp16`: χ⁰ products on the matrix units (FP16 split, three products) |
+| `RESPACK_GPU_GEMM` | unset (CGEMM; on RDNA2 the fused kernel) | `fp16`: χ⁰ products on the matrix units (FP16 split, three products); `blas`: CGEMM also on RDNA2 (needs rocBLAS kernels for the GPU) |
 | `RESPACK_GPU_FP16_RN` | on where available | round-to-nearest kernel for hi·hi (NVIDIA compute capability ≥ 8.0, AMD gfx1200); 0: chunked library path |
 | `RESPACK_GPU_FP16_CHUNK` | 512 | K chunk of the chunked library path |
 | `RESPACK_GPU_FP16_TERMS` | 3 | `2x`, `2y`: drop one correction product (faster, 10–30× less accurate; exploratory runs only) |
 | `RESPACK_GPU_FP16_PAD` | 8 | the G dimension of the FP16 operands is padded to a multiple of this |
-| `RESPACK_GPU_KC` | 2048 (CUDA CGEMM), 512 (HIP CGEMM), 8192 (FP16) | GEMM block length in rows; for testing only |
+| `RESPACK_GPU_KC` | 2048 (CUDA CGEMM), 512 (HIP CGEMM and RDNA2 kernel), 8192 (FP16) | GEMM block length in rows; for testing only |
+| `RESPACK_GPU_SYNC_UPLOADS` | 1 on integrated AMD GPUs, else 0 | 1: wait for each upload from host memory (works around a ROCm 7.2.0 problem on APUs, see “Integrated and RDNA2 GPUs”) |
 | `RESPACK_GPU_TILE_MB` | auto | tile budget in MB (default: 60 % of the device memory left after χ and 2 GB of buffers) |
 | `RESPACK_GPU_MEM_MB` | device memory | caps the device memory assumed for the tile size |
 | `RESPACK_GPU_ROT` | auto | wave-function rotation on the GPU; 0: on the CPU |
@@ -217,6 +226,17 @@ the block length. For SrVO₃ with double-precision FFTs, ε⁻¹ deviates from 
 3.8×10⁻⁶ at 2048 rows, 8.4×10⁻⁷ at 512 and 2.2×10⁻⁷ at 128. The CGEMM time is 13.0 s, 16.6 s and 33.1 s. At
 512 rows the accuracy matches cuBLAS at 2048 rows.
 
+### AMD Radeon 680M, integrated (ROCm 7.2.0, native gfx1035 build; Ryzen 7 PRO 6850U, 1 rank × 8 threads)
+
+Fused RDNA2 kernel (default on this GPU), single-precision FFTs (default):
+
+| test | ε⁻¹ (all q) | U(ω), J(ω) | static U, U′, J |
+|---|---|---|---|
+| SrVO₃ cRPA | 2.9×10⁻⁶ | ≤ 3×10⁻⁵ eV | ≤ 5×10⁻⁷ eV |
+| Si cRPA | 1.0×10⁻⁶ | ≤ 1×10⁻⁵ eV | ≤ 1×10⁻⁷ eV |
+
+The same as with rocBLAS CGEMM on this GPU (run as gfx1030, see below): 3.0×10⁻⁶ and 1.1×10⁻⁶.
+
 ## Performance (SrVO₃, `Ecut_for_eps` = 20 Ry, NG = 583, one q, 805 pairs, 216 k, 70 ω; 8 cores per run)
 
 | | χ⁰ products | total `calc_chiqw` |
@@ -237,6 +257,73 @@ tetrahedron weights, ε inversion and output. For large systems the GPU share gr
 CGEMM ∝ NG²·N_k·N_pair·N_ω and the FFTs ∝ N_pair·N_k·N_grid.
 
 For a large system see “Large systems” below.
+
+## Integrated and RDNA2 GPUs (fused χ⁰ kernel, `src/chiqw/chi0_rdna2.h`)
+
+rocBLAS has no kernels for integrated RDNA2 GPUs such as the Radeon 680M (gfx1035). Run as gfx1030
+(`HSA_OVERRIDE_GFX_VERSION=10.3.0`), its CGEMM reaches 0.2–0.6 TFLOP/s for the χ⁰ shapes on a 680M, about as much as
+the 8 CPU cores of the same chip. On RDNA2 GPUs (gfx103x) the χ⁰ products therefore run in an own kernel by default:
+
+- **One GEMM for all frequencies:** M = (G, ω) with m = G + NG·ω, N = G′, K = rows. The left operand conj(A)·W is
+  formed while it is written into shared memory, so there is no CGEMM per frequency and no packed operand.
+- **Tiles:** 128 threads, tile 64 × 8·TN, thread tile 4 × TN complex. TN (≤ 11) is chosen per q point so that the
+  N tiles cover NG with fewer than 8 padding columns each (one tile up to NG = 88).
+- **Memory path:** branch-free buffer loads (reads past the end return 0), the next chunk prefetched in registers,
+  double-buffered shared memory with one barrier per chunk that does not wait for the global loads.
+- **Precision model unchanged:** FP32 over blocks of 512 rows (`GPU_KC_MAX`), each block added to the
+  double-precision χ. When there are too few tiles to fill the GPU, the rows are split over workgroups; each
+  part adds into its own copy of χ, and the copies are summed at the end (no atomics).
+- **q = 0:** the head/wing products for all frequencies in one pass over the pair densities (`k_yz_at`, double
+  precision) instead of 6·N_ω ZGEMV calls.
+
+With these two kernels the RDNA2 path makes no BLAS calls, so a native gfx1035 build works without
+`HSA_OVERRIDE_GFX_VERSION`.
+
+Kernel efficiency on the Radeon 680M, measured with rocprofv3: useful FLOP per GPU-active cycle relative to the FP32
+peak of 1536 FLOP per cycle (12 CUs × 64 lanes × 2). Standalone benchmark, 70 frequencies, blocks of 1024 rows:
+
+| NG | TN | useful FLOP / peak | VALU busy | useful share of the VALU instructions |
+|---|---|---|---|---|
+| 56 | 7 | 82 % | 87 % | 95 % |
+| 64 | 8 | 88 % | 91 % | 97 % |
+| 72 | 9 | 80 % | 84 % | 96 % |
+| 77 | 10 | 80 % | 86 % | 92 % |
+| 81 | 11 | 76 % | 86 % | 88 % |
+| 89 | 6 (2 tiles) | 78 % | 88 % | 88 % |
+| 583 | 11 (7 tiles) | 69–82 % | 90 % | 91 % |
+
+The loss is about 10–15 % idle VALU cycles plus the padding columns and about 4 % other instructions. A pure FMA
+loop reaches 86 % of the peak on this GPU. The 680M shares a 15–30 W budget with the CPU. Under load it runs at about
+1.3–1.6 GHz (1.6–2.1 TFLOP/s for these kernels). For large NG the power limit also skips clock cycles that the
+reported clock does not show (NG = 1231: 1.77 GHz reported, 1.07 GHz of active cycles), and runs vary between
+two speeds. Convert measured rates with the active cycles, not with the reported clock.
+
+**Uploads on integrated GPUs:** with ROCm 7.2.0 on the 680M, back-to-back `hipMemcpyAsync` copies from pageable
+host memory sometimes delivered the data of the preceding copy (copies from pinned memory were not affected); the
+GPU then read wrong scatter indices and stopped with a memory fault. On integrated GPUs each upload therefore waits
+until it has completed (`RESPACK_GPU_SYNC_UPLOADS`, default 1 on integrated AMD GPUs). Discrete GPUs keep the
+asynchronous copies.
+
+Whole runs on the 680M (Ryzen 7 PRO 6850U, 8 threads; phases summed over q):
+
+| | `calc_chiqw` | pair densities | tetrahedron | χ⁰ products |
+|---|---|---|---|---|
+| SrVO₃, CPU (`fast_gemm_sp=1`, default) | 103.0 s | 31.5 s | 35.3 s | 27.4 s |
+| SrVO₃, 680M, rocBLAS CGEMM (run as gfx1030) | 109.1 s | 32.4 s | 47.6 s | 61.4 s |
+| SrVO₃, 680M, fused kernel | 77.3 s | 24.0 s | 42.9 s | 12.4 s |
+| Si, CPU (`fast_gemm_sp=1`, default) | 15.7 s | 1.2 s | 6.3 s | 1.2 s |
+| Si, 680M, rocBLAS CGEMM (run as gfx1030) | 24.3 s | 6.8 s | 7.9 s | 4.9 s |
+| Si, 680M, fused kernel | 21.1 s | 5.0 s | 8.3 s | 0.6 s |
+
+On this GPU the χ⁰ products are no longer the limit. What remains:
+- **Tetrahedron weights** run on the CPU (8 threads). On an APU they share the power budget with the GPU.
+- **Pair densities** (rocprofv3 traces): for SrVO₃ (24³ grid) the GPU spends 11.7 s in `k_prodx4`, 6 s in FFTs
+  and 2 s in the other kernels. `k_prodx4` is neither bandwidth- nor compute-bound on the 680M: 1.4 GB/s read from
+  memory, 73 % L2 hits, VALU busy 46 %. It is latency-bound, with little work per workgroup: one pair and 32 grid
+  lines of 24 points, 14 400 workgroups per call. On integrated GPUs the log's “bands (upload, FFT)” time also
+  contains the wait for the preceding pair kernels, because the synchronized uploads wait for them.
+- **Small systems:** Si (15³ grid) is slower on the 680M than on the CPU. A run makes about 118 000 rocFFT and
+  20 000 other kernel launches and 28 000 stream synchronizations; the GPU is busy for 4.6 s of 21 s.
 
 ## χ⁰ products on the matrix units: FP16 split (experimental, `RESPACK_GPU_GEMM=fp16`)
 
@@ -662,6 +749,8 @@ dominate at 5 Ry. The larger levers are:
   and would need validation against the original code.
 - **ε inversion on the GPU** (cuSOLVER/rocSOLVER). It runs on the CPU, in the background while the GPU computes the
   next q; this only pays off if the CPU becomes the limit.
+- **Integrated GPUs:** pinned staging buffers for the uploads instead of waiting for each copy; more work per
+  workgroup in `k_prodx4` (several pairs or more lines per workgroup); fewer, larger FFT launches for small grids.
 
 ## Modified files (GPLv3 §5a; modifications by Daniel Guterding, November 2026)
 
@@ -669,7 +758,8 @@ In addition to those listed in [README-zen-opt.md](README-zen-opt.md):
 
 | file | status | change |
 |---|---|---|
-| `src/chiqw/chi_gpu.cu` | new | GPU part of the band-pair loop: wave-function cache and rotation (`k_rotscatter`), bands on the FFT grid, fused pair products and x pass (`k_prodx4`), batched and pruned FFTs, gather of the ε sphere, CGEMM blocks or FP16 split into a double-precision χ on the GPU, q = 0 head/wing terms, device-memory query |
+| `src/chiqw/chi_gpu.cu` | new | GPU part of the band-pair loop: wave-function cache and rotation (`k_rotscatter`), bands on the FFT grid, fused pair products and x pass (`k_prodx4`), batched and pruned FFTs, gather of the ε sphere, CGEMM blocks, FP16 split or the fused RDNA2 kernel into a double-precision χ on the GPU, q = 0 head/wing terms, synchronized uploads on integrated GPUs, device-memory query |
+| `src/chiqw/chi0_rdna2.h` | new | fused χ⁰ kernel for RDNA2 GPUs (gfx103x) and the q = 0 head/wing kernel without BLAS |
 | `src/chiqw/chi_gpu_stub.c` | new | stubs for builds without a GPU (`flg_gpu=1` then stops with a message) |
 | `src/chiqw/gpu_api.h` | new | maps the CUDA names in `chi_gpu.cu` onto HIP/hipFFT/hipBLAS for the ROCm build |
 | `src/chiqw/hgemm_rn.cuh` | new | FP16 GEMM with round-to-nearest accumulation for NVIDIA GPUs (compute capability ≥ 8.0) |
