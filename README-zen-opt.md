@@ -591,7 +591,27 @@ memory traffic was the limit. Effect on the case above:
 ε⁻¹ changes at the rounding level (fused against not fused: 1.1×10⁻⁷). Against CPU double precision: SrVO₃
 chain 4.3×10⁻⁶ (4.6×10⁻⁶ before), Si chain 4.1×10⁻⁷; U(ω), J(ω) unchanged. The pair densities are now split
 about evenly between the CPU rotation (about 3–5 s, overlapped) and the GPU. The kernel reaches about 12
-TFLOP/s; a two-stage DFT (90 = 9 × 10) would need about 5× fewer operations.
+TFLOP/s.
+
+**Two-stage x DFT.** The needed x frequencies form one block around 0 (19–21 of 90), so `k_prodx4` splits
+n1 = P·Q (x = p + P q):
+- stage 1, in place in shared memory: h[p][r] = Σ_q f[p + P q] e^(−2πi rq/Q);
+- stage 2: out(k) = Σ_p e^(−2πi kp/n1) h[p][k mod Q].
+
+This needs n1·Q + nsx·P instead of nsx·n1 operations per line (Q = 5: 828 instead of 1890). Q is the divisor of
+n1 up to 16 with the least work, chosen per q; `RESPACK_GPU_PRODX_Q=1` gives the direct DFT. L40S, the case
+above:
+
+| one q | kernel (Nsight) | pair densities | total |
+|---|---|---|---|
+| 3.5 Ry, direct | – | 7.0 s | 52.2 s |
+| 3.5 Ry, two stages (Q = 5) | – | 4.4 s | 47.6 s |
+| 5 Ry, direct | 4.0 s | 7.3 s | 110.0 s |
+| 5 Ry, two stages | 2.9 s | 5.3 s | 108.6 s |
+
+The kernel gains 1.36×, less than the 2.3× fewer operations, so part of it is memory-bound. ε⁻¹ two stages
+against direct: 7–9×10⁻⁸. Chains against CPU double precision: SrVO₃ 4.4×10⁻⁶, Si 4.1×10⁻⁷; U(ω), J(ω) unchanged
+(small grids choose Q = 2 and 3).
 
 **Several GPUs (q-parallel, `MPI_num_qcomm`, one rank per GPU).** Tested with the FP16 path and the
 round-to-nearest kernel: 4 q points of the case above (3.5 Ry), 8 physical cores per rank.

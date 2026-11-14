@@ -110,6 +110,7 @@ static struct {
   int prune, nsx, npxy;          // distinct x columns, distinct (x, y) pairs of the sphere
   int *sxl;                      // nsx: x values
   int fusex;                     // single precision: pair products + x pass + x gather in one kernel (k_prodx4)
+  int prodq;                     // stage-1 length Q of k_prodx4 (divisor of n1; 1 = direct DFT)
   cc *twx;                       // n1: exp(-2 pi i x / n1) (forward), for k_prodx4
   int *pxs, *pxy;                // npxy: index into sxl, y value
   int *gp, *gz;                  // NG: (x, y) pair index and z of each G
@@ -301,18 +302,22 @@ __global__ void k_scatter4(size_t n, int ncoef, const zc *__restrict__ coef, con
 //   B[b][y + n2*(s + nsx*z)] = sum_x conj(u_I(x,y,z)) u_J(x,y,z) exp(-2 pi i sxl[s] x / n1),  pair b = p - p0
 // replaces k_products4 + x-pass FFT + k_prx (which write and re-read the full product grid). Block: pair
 // blockIdx.x, lines (y, z) l0 .. l0+lpb-1 (blockIdx.y), 128 threads. The product of the block's lines is formed while
-// loading (coalesced, both bands) into shared memory; then thread (line l, group g) computes the frequencies
-// s = g, g+4, ... as a direct DFT with an exact twiddle table. Pair-fastest block order: concurrently running blocks
-// share the same lines of the batch's bands in L2.
+// loading (coalesced, both bands) into shared memory. Pair-fastest block order: concurrently running blocks share the
+// same lines of the batch's bands in L2.
+// Transform in two stages with n1 = P Q (x = p + P q), only the needed outputs k = sxl[s]:
+//   stage 1, in place: f[p + P r] <- h[p][r] = sum_q f[p + P q] exp(-2 pi i r q / Q)          (n1 Q per line)
+//   stage 2: out(k) = sum_p exp(-2 pi i k p / n1) h[p][k mod Q]                             (nsx P per line)
+// Q = 1 is the direct DFT (nsx n1 per line); exact twiddles from one table of n1 roots.
 #define PRODX_T 128
 #define PRODX_G 4      // groups of threads per line (PRODX_T / lpb = PRODX_G with lpb = 32)
 #define PRODX_ACC 8    // frequencies per thread and pass
+#define PRODX_QMAX 16  // largest stage-1 length
 __global__ void __launch_bounds__(PRODX_T)
 k_prodx4(int p0, const int *__restrict__ pj, const int *__restrict__ pi, const cc *__restrict__ u, int ubJ, int ubI,
-         size_t ngrid, int n1, int n2, int n3, int nsx, const int *__restrict__ sxl, const cc *__restrict__ twx,
+         size_t ngrid, int n1, int n2, int n3, int nsx, const int *__restrict__ sxl, const cc *__restrict__ twx, int Q,
          cc *__restrict__ B) {
   extern __shared__ float2 sm[];
-  const int lpb = PRODX_T / PRODX_G, ld = n1 + 1;
+  const int lpb = PRODX_T / PRODX_G, ld = n1 + 1, P = n1 / Q;
   cc *f = (cc *)sm;                   // lpb x ld
   cc *tw = f + (size_t)lpb * ld;      // n1
   const int b = blockIdx.x, p = p0 + b, nlines = n2 * n3, l0 = blockIdx.y * lpb;
@@ -326,24 +331,52 @@ k_prodx4(int p0, const int *__restrict__ pj, const int *__restrict__ pi, const c
   for (int x = threadIdx.x; x < n1; x += PRODX_T) tw[x] = twx[x];
   __syncthreads();
   const int l = threadIdx.x % lpb, g = threadIdx.x / lpb;
-  if (l >= nl) return;
+  const bool act = l < nl;            // all threads reach the barrier of stage 1
+  cc *fl = f + l * ld;
+  if (Q > 1) {   // stage 1: the Q values of one p in registers, results back to the same Q places
+    if (act) {
+      for (int pp = g; pp < P; pp += PRODX_G) {
+        cc v[PRODX_QMAX];
+#pragma unroll
+        for (int q = 0; q < PRODX_QMAX; q++)
+          if (q < Q) v[q] = fl[pp + P * q];
+        for (int r = 0; r < Q; r++) {
+          float ar = 0.f, ai = 0.f;
+          int id = 0;
+#pragma unroll
+          for (int q = 0; q < PRODX_QMAX; q++) {
+            if (q < Q) {
+              const cc w = tw[id * P];
+              ar = fmaf(v[q].x, w.x, fmaf(-v[q].y, w.y, ar));
+              ai = fmaf(v[q].x, w.y, fmaf(v[q].y, w.x, ai));
+              id += r;
+              if (id >= Q) id -= Q;
+            }
+          }
+          fl[pp + P * r] = make_cuComplex(ar, ai);
+        }
+      }
+    }
+    __syncthreads();
+  }
+  if (!act) return;
   const int L = l0 + l, y = L % n2, z = L / n2;
   const size_t per = (size_t)nsx * n2 * n3;
   cc *Bb = B + (size_t)b * per + y + (size_t)n2 * (size_t)nsx * z;
-  const cc *fl = f + l * ld;
-  for (int s0 = g; s0 < nsx; s0 += PRODX_G * PRODX_ACC) {
-    int k[PRODX_ACC], idx[PRODX_ACC];
+  for (int s0 = g; s0 < nsx; s0 += PRODX_G * PRODX_ACC) {   // stage 2
+    int k[PRODX_ACC], idx[PRODX_ACC], ro[PRODX_ACC];
     float ar[PRODX_ACC], ai[PRODX_ACC];
 #pragma unroll
     for (int j = 0; j < PRODX_ACC; j++) {
       const int sj = s0 + PRODX_G * j;
       k[j] = sj < nsx ? sxl[sj] : 0;
+      ro[j] = P * (k[j] % Q);
       idx[j] = 0; ar[j] = 0.f; ai[j] = 0.f;
     }
-    for (int x = 0; x < n1; x++) {
-      const cc v = fl[x];
+    for (int pp = 0; pp < P; pp++) {
 #pragma unroll
       for (int j = 0; j < PRODX_ACC; j++) {
+        const cc v = fl[pp + ro[j]];
         const cc w = tw[idx[j]];
         ar[j] = fmaf(v.x, w.x, fmaf(-v.y, w.y, ar[j]));
         ai[j] = fmaf(v.x, w.y, fmaf(v.y, w.x, ai[j]));
@@ -673,6 +706,15 @@ extern "C" int chi_gpu_q_begin(int NG, int nen, int lq0, const int *ext) {
     const char *e = getenv("RESPACK_GPU_PRUNE");
     g.prune = e && *e ? atoi(e) : (rel < 1.6);
     g.nsx = nsx; g.npxy = npxy;
+    {   // k_prodx4: Q | n1 with the least work n1 Q + nsx n1 / Q (RESPACK_GPU_PRODX_Q overrides; 1 = direct)
+      int best = 1;
+      double cbest = (double)nsx * n1;
+      for (int q = 2; q <= PRODX_QMAX; q++)
+        if (n1 % q == 0 && (double)n1 * q + (double)nsx * (n1 / q) < cbest) { cbest = (double)n1 * q + (double)nsx * (n1 / q); best = q; }
+      const char *e = getenv("RESPACK_GPU_PRODX_Q");
+      if (e && atoi(e) >= 1 && atoi(e) <= PRODX_QMAX && n1 % atoi(e) == 0) best = atoi(e);
+      g.prodq = best;
+    }
     if (g.prune) {
       if (g.sxl) CK(cudaFree(g.sxl));
       if (g.pxs) CK(cudaFree(g.pxs));
@@ -693,10 +735,14 @@ extern "C" int chi_gpu_q_begin(int NG, int nen, int lq0, const int *ext) {
       if (ensure(&g.Bp, &g.Bp_cap, (size_t)g.fbatch * nsx * n2 * g.n3 * es)) return -1;
       if (ensure(&g.Cp, &g.Cp_cap, (size_t)g.fbatch * npxy * g.n3 * es)) return -1;
     }
-    if (g.verbose)
+    if (g.verbose) {
+      char fx[96] = "";
+      if (g.prune && g.fft_sp && g.fusex)
+        snprintf(fx, sizeof fx, "; products + x pass fused, x DFT in %s (Q = %d)", g.prodq > 1 ? "two stages" : "one stage",
+                 g.prodq);
       printf(" chi_gpu: NG %d, pruned FFTs %s (x columns %d of %d, (x,y) pairs %d of %d; y+z passes %.2f of a full pass)%s\n",
-             NG, g.prune ? "on" : "off", nsx, n1, npxy, n1 * n2, rel,
-             g.prune && g.fft_sp && g.fusex ? "; products + x pass fused" : "");
+             NG, g.prune ? "on" : "off", nsx, n1, npxy, n1 * n2, rel, fx);
+    }
     free(xm); free(sxl); free(gp); free(gz); free(pm); free(pxs); free(pxy);
   }
   size_t nchi = (size_t)NG * NG * nen;
@@ -853,7 +899,7 @@ extern "C" int chi_gpu_pairs(int ik0, int NTK, int ubJ, int ubI, double scl) {
         const dim3 grd(m, (n2 * n3 + lpb - 1) / lpb);
         const size_t shm = (size_t)(lpb * (n1 + 1) + n1) * sizeof(cc);
         k_prodx4<<<grd, PRODX_T, shm, g.st>>>(p0, g.pj, g.pi, g.u4, ubJ, ubI, g.ngrid, n1, n2, n3, nsx, g.sxl, g.twx,
-                                              (cc *)g.Bp);
+                                              g.prodq, (cc *)g.Bp);
         CK(cudaGetLastError());
       } else {
         if (sp) k_products4<<<grid1(n), 256, 0, g.st>>>(n, g.ngrid, p0, g.pj, g.pi, g.u4, ubJ, ubI, g.f4);
