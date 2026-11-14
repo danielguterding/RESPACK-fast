@@ -166,7 +166,8 @@ ZGEMM 51 s. Use 1 MPI process × 8 OpenMP threads (2 × 4 is ≈ 10 % slower; re
 - CMake ≥ 3.18 (presets need ≥ 3.21; tested with 3.28 and 4.4);
 - MPI with Fortran bindings;
 - BLAS/LAPACK;
-- FFTW3 (double precision, with the Fortran interface file `fftw3.f03`).
+- FFTW3 in double and single precision (`libfftw3` and `libfftw3f`; single precision is the default for the
+  χ⁰ FFTs), with the Fortran interface file `fftw3.f03`. The distribution packages below contain both.
 
 For example:
 
