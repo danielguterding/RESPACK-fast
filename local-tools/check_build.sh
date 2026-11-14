@@ -20,9 +20,11 @@ cp -r "$REF/dir-wan" .
 python3 -I - "$REF/input.in" "$Q" > input.in <<'PY'
 import sys
 lines = open(sys.argv[1]).read().split('\n'); q = sys.argv[2]; out = []; inq = False; done = False
+txt = open(sys.argv[1]).read().lower()
+dp = [k + '=0,' for k in ('fast_gemm_sp', 'fast_fft_sp') if k not in txt]   # double precision unless set
 for l in lines:
     if l.strip().lower().startswith('&param_chiqw'):
-        out += [l, 'flg_calc_type=2,', 'n_calc_q=1,']; inq = True; continue
+        out += [l, 'flg_calc_type=2,', 'n_calc_q=1,'] + dp; inq = True; continue
     out.append(l)
     if inq and not done and '/' in l.split('!')[0]:
         out.append(q); done = True

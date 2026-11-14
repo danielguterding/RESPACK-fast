@@ -47,9 +47,16 @@ The fork computes the same quantity this way:
    - Non-degenerate tetrahedra use a fused kernel: 6 instead of 12 logarithms, frequency-independent
      denominators inverted once, and powers as explicit products.
 
-`fast_gemm_sp` (default 0): if 1, the χ⁰ accumulation runs as single-precision CGEMM blocks of
+**Precision.** By default the χ⁰ part runs in single precision: CGEMM accumulation, FFTs and wave functions
+(below). For a fully double-precision run set `fast_gemm_sp=0, fast_fft_sp=0`. The deviations of the
+single-precision default are well below the method's own rounding noise (SrVO₃: ε⁻¹ 1.9×10⁻⁶
+relative, U(ω), J(ω) ≤ 2×10⁻⁵ eV, static U, U′, J identical), and it is not bitwise reproducible between runs
+(about 1×10⁻⁷, from the multithreaded single-precision BLAS). SrVO₃ (`Ecut_for_eps` 5 Ry, all q, 8 threads):
+χ⁰ 96.5 s instead of 139.8 s in double precision.
+
+`fast_gemm_sp` (default 1): the χ⁰ accumulation runs as single-precision CGEMM blocks of
 about 4096 rows, and each block result is added to a double-precision χ. This halves the GEMM time on
-CPUs and is the precision model for a GPU port.
+CPUs and is the precision model for a GPU port. 0 gives ZGEMM.
 
 | test | ε⁻¹ vs `fast_gemm_sp=0` | U(ω), J(ω) | static U, U′, J |
 |---|---|---|---|
@@ -58,16 +65,17 @@ CPUs and is the precision model for a GPU port.
 
 These deviations are about 200× smaller than the method's own rounding noise.
 
-`fast_fft_sp` (default −1 = auto: 0 on the CPU, 1 with `flg_gpu=1`): if 1, the pair densities are computed with single-precision FFTs (`fftwf`)
+`fast_fft_sp` (default −1, auto = 1): the pair densities are computed with single-precision FFTs (`fftwf`)
 and stored in double precision. The q = 0 k·p terms stay in double precision. This needs `libfftw3f`.
+0 gives double-precision FFTs.
 
 | test (with `fast_gemm_sp=1`) | ε⁻¹ vs double precision | U(ω), J(ω) | static U, U′, J |
 |---|---|---|---|
 | SrVO₃ cRPA | 1.8×10⁻⁶ relative | ≤ 2×10⁻⁵ eV | identical |
 | Si cRPA | 2.8×10⁻⁷ relative | ≤ 1×10⁻⁵ eV | identical |
 
-On a CPU this gives about 1.3× for the pair densities on small grids that fit in cache. The large gain
-is on GPUs.
+On a CPU this gives about 1.3× for the pair densities on small grids that fit in cache, 1.6× together
+with single-precision wave functions (SrVO₃: 28.6 s instead of 45.7 s). The large gain is on GPUs.
 
 `fast_mem_mb` (default 4096) is the memory budget for one tile of pair densities and weights. A larger
 budget means larger tiles and fewer backward FFTs.
@@ -83,7 +91,7 @@ budget means larger tiles and fewer backward FFTs.
    instead of 58.9 s, χ⁰ total 139.8 s instead of 152.6 s.
 8. **Single-precision wave functions (`fast_wfn_sp=1`).** The wave functions are stored as complex(4), which
    halves their memory; rotation and everything after it stay in double precision. Default −1 (auto): single
-   precision together with single-precision FFTs (`fast_fft_sp=1`), otherwise double precision. ε⁻¹ deviates by 7×10⁻⁸ (Si) and 2×10⁻⁸ (SrVO₃), U(ω), J(ω) by at most 1×10⁻⁵ eV.
+   precision together with single-precision FFTs (`fast_fft_sp=1`, the default), otherwise double precision. ε⁻¹ deviates by 7×10⁻⁸ (Si) and 2×10⁻⁸ (SrVO₃), U(ω), J(ω) by at most 1×10⁻⁵ eV.
    `RESPACK_WFN_DP=1` forces double precision.
 9. **One rank per q group (`MPI_num_qcomm` = number of ranks).**
    - The band ring exchange within a q group is skipped. With one rank it only copied all virtual bands to the
@@ -113,7 +121,7 @@ budget means larger tiles and fewer backward FFTs.
 | `src/chiqw/eps_async.f90`, `thread_util.c` | new | module `m_eps_async` (q ≠ 0 post-processing, background thread via pthreads) |
 | `src/chiqw/wfn_shared.f90` | new | module `m_wfn_shared` (wave functions shared by the ranks of a node, MPI-3 shared memory) |
 | `src/chiqw/chiqw.F`, `config.h` | modified | calls `m_chi_fast` for `flg_fast=1`, original loops kept for `flg_fast=0`; frequency loops of the ε inversion parallel (OpenMP); single-precision wave functions (`fast_wfn_sp`), shared on the node; no band ring exchange with one rank per q group |
-| `src/chiqw/m_rdinput.f90` | modified | inputs `flg_fast`, `fast_mem_mb`, `flg_async_eps`, `fast_wfn_sp` |
+| `src/chiqw/m_rdinput.f90` | modified | inputs `flg_fast`, `fast_mem_mb`, `flg_async_eps`, `fast_gemm_sp`, `fast_fft_sp`, `fast_wfn_sp` |
 | `src/chiqw/CMakeLists.txt` | modified | FFTW3, new sources |
 | `src/calc_int/int_fast.f90` | new | module `m_int_fast` |
 | `src/calc_int/calc_intW.F`, `calc_intJ.F` | modified | call `m_int_fast` for `flg_fast=1`; original loops kept; exp(−iq·R) table in `calc_intW.F` |
@@ -173,7 +181,7 @@ ZGEMM 51 s. Use 1 MPI process × 8 OpenMP threads (2 × 4 is ≈ 10 % slower; re
 
 The other switches also apply on the GPU:
 - `fast_fft_sp` runs the pair-density FFTs in single precision (cuFFT C2C, 3× faster on an L40S). It defaults to
-  −1 (auto), which means on with `flg_gpu=1` and off on the CPU. ε⁻¹ changes by about 3×10⁻⁶. Set
+  −1 (auto), which means on, as on the CPU. ε⁻¹ changes by about 3×10⁻⁶. Set
   `fast_fft_sp=0` for double-precision FFTs on the GPU.
 - `fast_mem_mb` sets the tile size.
 
@@ -782,7 +790,7 @@ per-directory Makefiles are unchanged but don't know about the fork's new files;
 | `local-tools/build.sh` | configure, build and install with a preset |
 | `local-tools/run_chain_cmp.sh` | full chain with extra `&param_chiqw` entries vs a reference run (also under Slurm) |
 | `local-tools/validate_sp_gemm.sh` | accuracy of `fast_gemm_sp=1` vs double precision (full chains) |
-| `local-tools/check_build.sh` | quick numerical check of a build against a reference run (one q of `calc_chiqw`, `calc_w3d`/`calc_j3d`) |
+| `local-tools/check_build.sh` | quick numerical check of a build against a reference run (one q of `calc_chiqw`, `calc_w3d`/`calc_j3d`; double precision unless the reference input sets `fast_gemm_sp`/`fast_fft_sp`) |
 | `local-tools/cmp_epsqw.py` | compare `dir-eps/qNNN/dat.epsqw.600` of two runs |
 | `local-tools/bench_tetra.f90`, `acc_tetra_quad.f90` | tetrahedron speed, and accuracy vs quad precision |
 | `local-tools/eps_freq_dev.py` | deviation of ε⁻¹ per frequency |

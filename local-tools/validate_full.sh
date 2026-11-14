@@ -10,7 +10,7 @@
 set -uo pipefail
 B=$HOME/local/build/respack-20240804-zen3-20261112
 T=$B/test-SrVO3; S=$B/test-Si
-ORIG=$HOME/local/respack/bin
+ORIG=$HOME/local/respack-20240804/bin   # the original RESPACK (~/local/respack is the fork)
 FORK=$HOME/local/build/respack-fork-zen3/src
 CMPE=$HOME/local/src/respack-fork/local-tools/cmp_epsqw.py
 CMPR=$(cd "$(dirname "$0")" && pwd)/compare_runs.py
@@ -21,6 +21,8 @@ run_chain() {  # dir, chiqw-bin, int-bin-dir, np, omp, qe-dir, wan-src
   local R=$1 CQ=$2 IB=$3 NP=$4 NT=$5 QE=$6 WS=$7
   rm -rf $R; mkdir -p $R; cd $R
   ln -s $QE/dir-wfn dir-wfn; cp -r $WS/dir-wan $WS/dir-model .; cp $QE/input.in .
+  # the fork in double precision (its default is single precision; the original would reject the entries)
+  [[ $CQ != $ORIG/* ]] && sed -i '0,/&param_chiqw/I{s/&param_chiqw/&\nfast_gemm_sp=0,\nfast_fft_sp=0,/I}' input.in
   s=$(date +%s.%N); OMP_NUM_THREADS=$NT /usr/bin/mpirun -np $NP --bind-to none $CQ < input.in > log.chiqw 2>&1; e=$(date +%s.%N)
   echo "  chiqw ($NP x $NT): $(python3 -c "print(round($e-$s,1))") s"
   if [[ -n $IB ]]; then
