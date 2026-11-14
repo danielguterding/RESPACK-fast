@@ -46,6 +46,8 @@ module m_chi_fast
   type(c_ptr), save :: plan_bw = c_null_ptr, plan_fw = c_null_ptr
   type(c_ptr), save :: plan_bw4 = c_null_ptr, plan_fw4 = c_null_ptr   ! fast_fft_sp=1 (fftwf)
   logical, save :: fft_sp = .false.
+  type(c_ptr), save :: plan_x = c_null_ptr   ! pruned forward FFT: x pass over all (y, z) lines of the grid
+  type(c_ptr), save :: plan_x4 = c_null_ptr  ! the same in single precision (fast_fft_sp=1)
   real(8), save :: mem_budget_mb = 4096d0
   logical, save :: verbose = .false.
   logical, save :: gemm_sp = .false.   ! fast_gemm_sp=1: single-precision CGEMM blocks, double-precision accumulation
@@ -116,6 +118,7 @@ contains
     ! Fortran array u(n1,n2,n3) <-> FFTW row-major (n3,n2,n1)
     plan_bw = fftw_plan_dft_3d(n3, n2, n1, buf, buf, FFTW_BACKWARD, FFTW_MEASURE)
     plan_fw = fftw_plan_dft_3d(n3, n2, n1, buf, buf, FFTW_FORWARD, FFTW_MEASURE)
+    plan_x = fftw_plan_many_dft(1, [n1], n2*n3, buf, [n1], 1, n1, buf, [n1], 1, n1, FFTW_FORWARD, FFTW_MEASURE)
     call fftw_free(p)
     fft_sp = lfft_sp
     if (fft_sp .and. .not. lgpu) then
@@ -123,6 +126,7 @@ contains
       call c_f_pointer(p, buf4, [ldg])
       plan_bw4 = fftwf_plan_dft_3d(n3, n2, n1, buf4, buf4, FFTW_BACKWARD, FFTW_MEASURE)
       plan_fw4 = fftwf_plan_dft_3d(n3, n2, n1, buf4, buf4, FFTW_FORWARD, FFTW_MEASURE)
+      plan_x4 = fftwf_plan_many_dft(1, [n1], n2*n3, buf4, [n1], 1, n1, buf4, [n1], 1, n1, FFTW_FORWARD, FFTW_MEASURE)
       call fftwf_free(p)
       if (.not. c_associated(plan_bw4) .or. .not. c_associated(plan_fw4)) then
         write(6,*) 'chi_fast_init: FFTW (single precision) planning failed'; stop
@@ -154,7 +158,7 @@ contains
 
   !---------------------------------------------------------------------------------------------
   subroutine chi_fast_pairs(lq0, NTK, NTG, Nk_irr, nbufo, nbufv, NTB, N_PAIR, ipair, jpair, &
-       OCC, VIR, E_OCC, E_VIR, P_OCC, P_VIR, &
+       OCC, VIR, d8, OCC4, VIR4, d4, wf_sp, E_OCC, E_VIR, P_OCC, P_VIR, &
        SK0, q, numirr, numrot, trs, NG0, KG0, RW, rginv, pg, nsymq, nnp, L1, L2, L3, packing, &
        LG0, NGeps, No_G_0, b1, b2, b3, MAT_NL, off_v, off_o, &
        dmna, dmnr, nkb1, nkb2, nkb3, imt1, index_kpt, Ef, delt, nen, em, &
@@ -162,7 +166,12 @@ contains
     logical, intent(in) :: lq0
     integer, intent(in) :: NTK, NTG, Nk_irr, nbufo, nbufv, NTB, N_PAIR
     integer, intent(in) :: ipair(N_PAIR), jpair(N_PAIR)
-    complex(8), intent(in) :: OCC(NTG, nbufo, Nk_irr), VIR(NTG, nbufv, Nk_irr)
+    ! wave functions in double (OCC, VIR) or, with wf_sp, in single precision (OCC4, VIR4); the unused pair is a
+    ! placeholder. d8, d4: (NTG, nbufo, nbufv, Nk_irr) of the arrays as passed
+    integer, intent(in) :: d8(4), d4(4)
+    complex(8), intent(in) :: OCC(d8(1), d8(2), d8(4)), VIR(d8(1), d8(3), d8(4))
+    complex(4), intent(in) :: OCC4(d4(1), d4(2), d4(4)), VIR4(d4(1), d4(3), d4(4))
+    logical, intent(in) :: wf_sp
     real(8), intent(in) :: E_OCC(nbufo, Nk_irr), E_VIR(nbufv, Nk_irr)
     complex(8), intent(in) :: P_OCC(nbufo, NTK), P_VIR(nbufv, NTK)
     real(8), intent(in) :: SK0(3, NTK), q(3)
@@ -200,6 +209,12 @@ contains
     integer, allocatable :: tj(:), ti(:), pjl(:), pil(:)
     integer :: ntj, nti
     real(8) :: t0, tA, tB, tC
+    ! pruned forward FFT (the NGeps components of the eps sphere only): x pass over all lines, gather of the needed x
+    ! columns (y contiguous), y pass, gather of the needed (x, y) pairs (z contiguous), z pass
+    logical :: prune
+    integer :: nsx, npxy
+    integer, allocatable :: sxl(:), pxs(:), pxy(:), gp(:), gz(:)
+    type(c_ptr) :: plan_y, plan_z
 
     if (ngrid == 0) then
       write(6,*) 'chi_fast_pairs: chi_fast_init not called'; stop
@@ -223,6 +238,66 @@ contains
     do t = 1, NGeps
       ext(t) = gidx(-LG0(1, t), -LG0(2, t), -LG0(3, t))
     end do
+    block
+      integer, allocatable :: xm(:), pm(:)
+      integer :: e0, x, y, k
+      real(8) :: rel
+      character(len=8) :: ev
+      integer :: lev, st
+      type(c_ptr) :: pb
+      complex(c_double_complex), pointer :: bb(:)
+      complex(c_float_complex), pointer :: bb4(:)
+      allocate(xm(0:n1 - 1), sxl(n1), gp(NGeps), gz(NGeps))
+      xm = -1
+      nsx = 0
+      do t = 1, NGeps
+        x = mod(ext(t) - 1, n1)
+        if (xm(x) < 0) xm(x) = 1
+      end do
+      do x = 0, n1 - 1
+        if (xm(x) > 0) then
+          xm(x) = nsx; nsx = nsx + 1; sxl(nsx) = x
+        end if
+      end do
+      allocate(pm(0:nsx*n2 - 1), pxs(nsx*n2), pxy(nsx*n2))
+      pm = -1
+      npxy = 0
+      do t = 1, NGeps
+        e0 = ext(t) - 1
+        x = mod(e0, n1); y = mod(e0/n1, n2)
+        k = xm(x) + nsx*y
+        if (pm(k) < 0) then
+          pm(k) = npxy; npxy = npxy + 1; pxs(npxy) = xm(x); pxy(npxy) = y
+        end if
+        gp(t) = pm(k); gz(t) = e0/(n1*n2)
+      end do
+      ! y and z passes relative to a full pass; as on the GPU: worthwhile below ~1.6 (RESPACK_CPU_PRUNE=0/1 forces)
+      rel = (dble(nsx)*n2*n3 + dble(npxy)*n3)/dble(ngrid)
+      prune = rel < 1.6d0
+      call get_environment_variable('RESPACK_CPU_PRUNE', ev, lev, st)
+      if (st == 0 .and. lev > 0) prune = ev(1:1) == '1'
+      if (use_gpu) prune = .false.     ! the GPU path prunes on the GPU (chi_gpu.cu)
+      plan_y = c_null_ptr; plan_z = c_null_ptr
+      if (prune .and. fft_sp) then    ! y and z plans in single precision for phase_a_sp
+        pb = fftwf_alloc_complex(int(max(nsx*n2*n3, npxy*n3), c_size_t))
+        call c_f_pointer(pb, bb4, [max(nsx*n2*n3, npxy*n3)])
+        plan_y = fftwf_plan_many_dft(1, [n2], nsx*n3, bb4, [n2], 1, n2, bb4, [n2], 1, n2, FFTW_FORWARD, FFTW_MEASURE)
+        plan_z = fftwf_plan_many_dft(1, [n3], npxy, bb4, [n3], 1, n3, bb4, [n3], 1, n3, FFTW_FORWARD, FFTW_MEASURE)
+        call fftwf_free(pb)
+        if (.not. c_associated(plan_y) .or. .not. c_associated(plan_z) .or. .not. c_associated(plan_x4)) prune = .false.
+      else if (prune) then
+        pb = fftw_alloc_complex(int(max(nsx*n2*n3, npxy*n3), c_size_t))
+        call c_f_pointer(pb, bb, [max(nsx*n2*n3, npxy*n3)])
+        plan_y = fftw_plan_many_dft(1, [n2], nsx*n3, bb, [n2], 1, n2, bb, [n2], 1, n2, FFTW_FORWARD, FFTW_MEASURE)
+        plan_z = fftw_plan_many_dft(1, [n3], npxy, bb, [n3], 1, n3, bb, [n3], 1, n3, FFTW_FORWARD, FFTW_MEASURE)
+        call fftw_free(pb)
+        if (.not. c_associated(plan_y) .or. .not. c_associated(plan_z) .or. .not. c_associated(plan_x)) prune = .false.
+      end if
+      if (verbose .and. .not. use_gpu) write(6,'(a,i6,a,a,a,i4,a,i4,a,i6,a,i6,a,f5.2,a)') ' chi_fast: NG', NGeps, ', pruned forward FFTs ', &
+           merge('on ', 'off', prune), ' (x columns', nsx, ' of', n1, ', (x,y) pairs', npxy, ' of', n1*n2, &
+           '; y+z passes', rel, ' of a full pass)'
+      deallocate(xm, pm)
+    end block
     allocate(k3d(NTK))
     do ikb3 = 1, nkb3
       do ikb2 = 1, nkb2
@@ -380,6 +455,13 @@ contains
       deallocate(ext0)
     end if
     if (verbose) write(6,'(a,3f10.2)') ' chi_fast: time (s) pair densities / tetrahedron / zgemm ', tA, tB, tC
+    if (fft_sp) then
+      if (c_associated(plan_y)) call fftwf_destroy_plan(plan_y)
+      if (c_associated(plan_z)) call fftwf_destroy_plan(plan_z)
+    else
+      if (c_associated(plan_y)) call fftw_destroy_plan(plan_y)
+      if (c_associated(plan_z)) call fftw_destroy_plan(plan_z)
+    end if
 
   contains
 
@@ -388,8 +470,8 @@ contains
     subroutine phase_a()
       !$omp parallel default(shared)
       block
-        type(c_ptr) :: pbuf
-        complex(c_double_complex), pointer :: ubuf(:, :)
+        type(c_ptr) :: pbuf, pbc
+        complex(c_double_complex), pointer :: ubuf(:, :), bx(:), cz(:)
         complex(8), allocatable :: cbuf(:), cJ(:, :), cI(:, :), pmap(:)
         integer, allocatable :: jmap(:), gpos(:)
         integer :: ik, ikq, ikir, iop, ikirq, iopq, jl, il, ig, lp, row, jb, ib, ix, g
@@ -399,6 +481,11 @@ contains
         pbuf = fftw_alloc_complex(int(ldg, c_size_t)*int(bj + bi + 1, c_size_t))
         call c_f_pointer(pbuf, ubuf, [ldg, bj + bi + 1])     ! columns 1..ntj: occ, bj+1..bj+nti: vir, last: product
         allocate(cbuf(NTG), pmap(NTG), jmap(NTG), gpos(NTG))
+        if (prune) then   ! per-thread buffers of the y and z passes (FFTW alignment)
+          pbc = fftw_alloc_complex(int(nsx*n2*n3 + npxy*n3 + 8, c_size_t))
+          call c_f_pointer(pbc, bx, [nsx*n2*n3 + npxy*n3 + 8])
+          cz => bx(((nsx*n2*n3 + 7)/8)*8 + 1:)
+        end if
         if (lq0) then
           allocate(cJ(NTG, bj), cI(NTG, bi))
         end if
@@ -415,7 +502,11 @@ contains
           end do
           do jl = 1, ntj
             jb = tj(jl)
-            call c0_apply(NG0(ik), trs(ik), jmap, pmap, OCC(1, jb, ikir), cbuf)
+            if (wf_sp) then
+              call c0_apply_s8(NG0(ik), trs(ik), jmap, pmap, OCC4(1, jb, ikir), cbuf)
+            else
+              call c0_apply(NG0(ik), trs(ik), jmap, pmap, OCC(1, jb, ikir), cbuf)
+            end if
             ubuf(:, jl) = zzero
             do ig = 1, NG0(ik)
               ubuf(gpos(ig), jl) = cbuf(ig)
@@ -431,7 +522,11 @@ contains
           end do
           do il = 1, nti
             ib = ti(il)
-            call c0_apply(NG0(ikq), trs(ikq), jmap, pmap, VIR(1, ib, ikirq), cbuf)
+            if (wf_sp) then
+              call c0_apply_s8(NG0(ikq), trs(ikq), jmap, pmap, VIR4(1, ib, ikirq), cbuf)
+            else
+              call c0_apply(NG0(ikq), trs(ikq), jmap, pmap, VIR(1, ib, ikirq), cbuf)
+            end if
             ubuf(:, bj + il) = zzero
             do ig = 1, NG0(ikq)
               ubuf(gpos(ig), bj + il) = cbuf(ig)
@@ -443,10 +538,17 @@ contains
             jl = pjl(lp); il = pil(lp)
             row = ik + NTK*(lp - 1)
             ubuf(1:ngrid, bj + bi + 1) = conjg(ubuf(1:ngrid, bj + il))*ubuf(1:ngrid, jl)
-            call fftw_execute_dft(plan_fw, ubuf(:, bj + bi + 1), ubuf(:, bj + bi + 1))
-            do g = 1, NGeps
-              A(row, g) = ubuf(ext(g), bj + bi + 1)*scl
-            end do
+            if (prune) then
+              call prune_fw(ubuf(:, bj + bi + 1), bx, cz)
+              do g = 1, NGeps
+                A(row, g) = cz(gz(g) + 1 + n3*gp(g))*scl
+              end do
+            else
+              call fftw_execute_dft(plan_fw, ubuf(:, bj + bi + 1), ubuf(:, bj + bi + 1))
+              do g = 1, NGeps
+                A(row, g) = ubuf(ext(g), bj + bi + 1)*scl
+              end do
+            end if
             if (lq0) then
               ! calc_VMab (ikq=ik at q=0) + non-local correction + energy denominator, as in chiqw.F
               jb = tj(jl); ib = ti(il)
@@ -472,6 +574,7 @@ contains
         deallocate(cbuf, pmap, jmap, gpos)
         if (lq0) deallocate(cJ, cI)
         call fftw_free(pbuf)
+        if (prune) call fftw_free(pbc)
       end block
       !$omp end parallel
     end subroutine phase_a
@@ -479,8 +582,8 @@ contains
     subroutine phase_a_sp()   ! as phase_a, grid functions/FFTs in single precision (fast_fft_sp=1)
       !$omp parallel default(shared)
       block
-        type(c_ptr) :: pbuf
-        complex(c_float_complex), pointer :: ubuf(:, :)
+        type(c_ptr) :: pbuf, pbc
+        complex(c_float_complex), pointer :: ubuf(:, :), bx(:), cz(:)
         complex(8), allocatable :: cbuf(:), cJ(:, :), cI(:, :), pmap(:)
         integer, allocatable :: jmap(:), gpos(:)
         integer :: ik, ikq, ikir, iop, ikirq, iopq, jl, il, ig, lp, row, jb, ib, ix, g
@@ -490,6 +593,11 @@ contains
         pbuf = fftwf_alloc_complex(int(ldg, c_size_t)*int(bj + bi + 1, c_size_t))
         call c_f_pointer(pbuf, ubuf, [ldg, bj + bi + 1])     ! columns 1..ntj: occ, bj+1..bj+nti: vir, last: product
         allocate(cbuf(NTG), pmap(NTG), jmap(NTG), gpos(NTG))
+        if (prune) then   ! per-thread buffers of the y and z passes (FFTW alignment)
+          pbc = fftwf_alloc_complex(int(nsx*n2*n3 + npxy*n3 + 16, c_size_t))
+          call c_f_pointer(pbc, bx, [nsx*n2*n3 + npxy*n3 + 16])
+          cz => bx(((nsx*n2*n3 + 15)/16)*16 + 1:)
+        end if
         if (lq0) then
           allocate(cJ(NTG, bj), cI(NTG, bi))
         end if
@@ -505,7 +613,11 @@ contains
           end do
           do jl = 1, ntj
             jb = tj(jl)
-            call c0_apply(NG0(ik), trs(ik), jmap, pmap, OCC(1, jb, ikir), cbuf)
+            if (wf_sp) then
+              call c0_apply_s8(NG0(ik), trs(ik), jmap, pmap, OCC4(1, jb, ikir), cbuf)
+            else
+              call c0_apply(NG0(ik), trs(ik), jmap, pmap, OCC(1, jb, ikir), cbuf)
+            end if
             ubuf(:, jl) = (0.0, 0.0)
             do ig = 1, NG0(ik)
               ubuf(gpos(ig), jl) = cmplx(cbuf(ig), kind=4)
@@ -521,7 +633,11 @@ contains
           end do
           do il = 1, nti
             ib = ti(il)
-            call c0_apply(NG0(ikq), trs(ikq), jmap, pmap, VIR(1, ib, ikirq), cbuf)
+            if (wf_sp) then
+              call c0_apply_s8(NG0(ikq), trs(ikq), jmap, pmap, VIR4(1, ib, ikirq), cbuf)
+            else
+              call c0_apply(NG0(ikq), trs(ikq), jmap, pmap, VIR(1, ib, ikirq), cbuf)
+            end if
             ubuf(:, bj + il) = (0.0, 0.0)
             do ig = 1, NG0(ikq)
               ubuf(gpos(ig), bj + il) = cmplx(cbuf(ig), kind=4)
@@ -533,10 +649,17 @@ contains
             jl = pjl(lp); il = pil(lp)
             row = ik + NTK*(lp - 1)
             ubuf(1:ngrid, bj + bi + 1) = conjg(ubuf(1:ngrid, bj + il))*ubuf(1:ngrid, jl)
-            call fftwf_execute_dft(plan_fw4, ubuf(:, bj + bi + 1), ubuf(:, bj + bi + 1))
-            do g = 1, NGeps
-              A(row, g) = cmplx(ubuf(ext(g), bj + bi + 1), kind=8)*scl
-            end do
+            if (prune) then
+              call prune_fw4(ubuf(:, bj + bi + 1), bx, cz)
+              do g = 1, NGeps
+                A(row, g) = cmplx(cz(gz(g) + 1 + n3*gp(g)), kind=8)*scl
+              end do
+            else
+              call fftwf_execute_dft(plan_fw4, ubuf(:, bj + bi + 1), ubuf(:, bj + bi + 1))
+              do g = 1, NGeps
+                A(row, g) = cmplx(ubuf(ext(g), bj + bi + 1), kind=8)*scl
+              end do
+            end if
             if (lq0) then
               ! calc_VMab (ikq=ik at q=0) + non-local correction + energy denominator, as in chiqw.F
               jb = tj(jl); ib = ti(il)
@@ -562,9 +685,54 @@ contains
         deallocate(cbuf, pmap, jmap, gpos)
         if (lq0) deallocate(cJ, cI)
         call fftwf_free(pbuf)
+        if (prune) call fftwf_free(pbc)
       end block
       !$omp end parallel
     end subroutine phase_a_sp
+
+    ! pruned forward FFT of one grid f (x pass in place) -> cz(z + n3 (p - 1)), p over the needed (x, y) pairs
+    subroutine prune_fw(f, bx, cz)
+      complex(c_double_complex), intent(inout), contiguous :: f(:), bx(:), cz(:)
+      integer :: x, y, z, sx, pp
+      call fftw_execute_dft(plan_x, f, f)
+      do z = 0, n3 - 1
+        do sx = 1, nsx
+          x = sxl(sx)
+          do y = 0, n2 - 1
+            bx(1 + y + n2*(sx - 1 + nsx*z)) = f(1 + x + n1*(y + n2*z))
+          end do
+        end do
+      end do
+      call fftw_execute_dft(plan_y, bx, bx)
+      do pp = 1, npxy
+        do z = 0, n3 - 1
+          cz(1 + z + n3*(pp - 1)) = bx(1 + pxy(pp) + n2*(pxs(pp) + nsx*z))
+        end do
+      end do
+      call fftw_execute_dft(plan_z, cz, cz)
+    end subroutine prune_fw
+
+    ! as prune_fw in single precision (phase_a_sp)
+    subroutine prune_fw4(f, bx, cz)
+      complex(c_float_complex), intent(inout), contiguous :: f(:), bx(:), cz(:)
+      integer :: x, y, z, sx, pp
+      call fftwf_execute_dft(plan_x4, f, f)
+      do z = 0, n3 - 1
+        do sx = 1, nsx
+          x = sxl(sx)
+          do y = 0, n2 - 1
+            bx(1 + y + n2*(sx - 1 + nsx*z)) = f(1 + x + n1*(y + n2*z))
+          end do
+        end do
+      end do
+      call fftwf_execute_dft(plan_y, bx, bx)
+      do pp = 1, npxy
+        do z = 0, n3 - 1
+          cz(1 + z + n3*(pp - 1)) = bx(1 + pxy(pp) + n2*(pxs(pp) + nsx*z))
+        end do
+      end do
+      call fftwf_execute_dft(plan_z, cz, cz)
+    end subroutine prune_fw4
 
     !------------------------------------------------------------------------------------------
     ! GPU phase A: wave-function rotation on the CPU, grid/FFT/pair-density work on the GPU
@@ -590,12 +758,20 @@ contains
              nnp, L1, L2, L3, packing(-L1, -L2, -L3, ikirq), jmapI, pmapI)
         !$omp parallel do schedule(static)
         do jl = 1, ntj
-          call c0_apply(NG0(ik), trs(ik), jmapJ, pmapJ, OCC(1, tj(jl), ikir), cJ(1, jl))
+          if (wf_sp) then
+            call c0_apply_s8(NG0(ik), trs(ik), jmapJ, pmapJ, OCC4(1, tj(jl), ikir), cJ(1, jl))
+          else
+            call c0_apply(NG0(ik), trs(ik), jmapJ, pmapJ, OCC(1, tj(jl), ikir), cJ(1, jl))
+          end if
         end do
         !$omp end parallel do
         !$omp parallel do schedule(static)
         do il = 1, nti
-          call c0_apply(NG0(ikq), trs(ikq), jmapI, pmapI, VIR(1, ti(il), ikirq), cI(1, il))
+          if (wf_sp) then
+            call c0_apply_s8(NG0(ikq), trs(ikq), jmapI, pmapI, VIR4(1, ti(il), ikirq), cI(1, il))
+          else
+            call c0_apply(NG0(ikq), trs(ikq), jmapI, pmapI, VIR(1, ti(il), ikirq), cI(1, il))
+          end if
         end do
         !$omp end parallel do
         do ig = 1, NG0(ik)
@@ -804,5 +980,25 @@ contains
       dst(1:n) = (0.0d0, 0.0d0)
     end if
   end subroutine c0_apply
+
+  ! as c0_apply, single-precision source (wf_sp), double-precision result
+  subroutine c0_apply_s8(n, itrs, jmap, pmap, src, dst)
+    integer, intent(in) :: n, itrs, jmap(n)
+    complex(8), intent(in) :: pmap(n)
+    complex(4), intent(in) :: src(*)
+    complex(8), intent(inout) :: dst(*)
+    integer :: ig
+    if (itrs == 1) then
+      do ig = 1, n
+        dst(ig) = cmplx(src(jmap(ig)), kind=8)*pmap(ig)
+      end do
+    else if (itrs == -1) then
+      do ig = 1, n
+        dst(ig) = conjg(cmplx(src(jmap(ig)), kind=8)*pmap(ig))
+      end do
+    else
+      dst(1:n) = (0.0d0, 0.0d0)
+    end if
+  end subroutine c0_apply_s8
 
 end module m_chi_fast

@@ -135,6 +135,15 @@
 !VIR_new(NTG,1:nbufv,Nk_irr) 
       complex(8),allocatable::Otmp(:,:)!Otmp(NTG,1:nbufo) 
       complex(8),allocatable::Vtmp(:,:)!Vtmp(NTG,1:nbufv) 
+!fork: single-precision wave functions on the GPU path (wf_sp)
+      logical::wf_sp,wf_shared,wf_leader
+      complex(4),pointer,contiguous::OCC4(:,:,:),VIR4(:,:,:)
+      complex(4),allocatable,target::OCC4a(:,:,:),VIR4a(:,:,:)
+      complex(4),allocatable::VIR4_new(:,:,:)
+      complex(4),allocatable::Otmp4(:,:),Vtmp4(:,:)
+      complex(8),allocatable::zrd(:),zw(:)
+      character(len=16)::cenv
+      integer::ienv,lenv
       real(8),allocatable::E_OCC(:,:)!E_OCC(1:nbufo,Nk_irr) 
       real(8),allocatable::E_VIR(:,:),E_VIR_new(:,:)
       integer,allocatable::W_OCC(:),W_VIR(:),W_VIR_new(:)
