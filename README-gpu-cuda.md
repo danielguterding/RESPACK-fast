@@ -32,15 +32,55 @@ The other switches also apply on the GPU:
 
 ## Build
 
-The CPU build and its options are described in [README-zen-opt.md](README-zen-opt.md#build); the GPU path adds
-one option, `RESPACK_CUDA` (CUDA toolkit with cuFFT and cuBLAS; CMake ≥ 3.18):
+**Requirements**, in addition to those of the CPU build ([README-zen-opt.md](README-zen-opt.md#build)):
+- **CUDA toolkit** with nvcc, cuFFT and cuBLAS. Tested only with CUDA 13.0. CUDA 13 compiles for compute
+  capability 7.5 (Turing) and newer.
+- **NVIDIA driver** that supports the toolkit (CUDA 13.0: driver 580 or newer).
+- **Host compiler for nvcc**: a GCC version supported by the toolkit (tested: GCC 13.3). If the default
+  `g++` is newer than your CUDA version supports, pass `-DCMAKE_CUDA_HOST_COMPILER=g++-<version>`.
+- **CMake** ≥ 3.18 with `CMAKE_CUDA_ARCHITECTURES` given; the default architecture list `all-major` needs
+  CMake ≥ 3.23.
 
+**Configure and build:**
+
+    git clone -b gpu-cuda https://github.com/danielguterding/RESPACK-fast.git && cd RESPACK-fast
     cmake --preset native -B build/native-cuda -DRESPACK_CUDA=ON \
-          -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DCMAKE_CUDA_ARCHITECTURES=89   # 89 = L40S/Ada
+          -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc -DCMAKE_CUDA_ARCHITECTURES=89
     cmake --build build/native-cuda -j
+    cmake --install build/native-cuda --prefix $HOME/.local/respack-gpu     # optional
 
-Without `RESPACK_CUDA`, a stub is compiled and `flg_gpu=1` stops with a message. The default architecture
-list is `all-major`.
+- `CMAKE_CUDA_COMPILER` is needed only if `nvcc` is not on the `PATH`.
+- `CMAKE_CUDA_ARCHITECTURES` is the compute capability of the GPU without the dot: 89 = L40S, RTX 40xx;
+  86 = A40, RTX 30xx; 80 = A100; 90 = H100. Several are separated by semicolons. Without it, CMake builds for
+  `all-major`, which takes longer.
+- The configure step prints `-- CUDA: 13.0.88, architectures 89` (your versions).
+- `native` adds `-march=native` and LTO for the CPU part (see the presets in README-zen-opt.md); `default`
+  works as well.
+
+Without `RESPACK_CUDA`, a stub is compiled and `flg_gpu=1` stops with a message.
+
+**Check the build** on a node with the GPU:
+- With `flg_gpu=1`, the log of `calc_chiqw` names the device, e.g.
+  `chi_gpu: local rank 0 -> device 0 (NVIDIA L40S, 47.4 GB), grid 24 24 24, FFT batch 1024, single-precision FFTs`.
+- `local-tools/run_chain_cmp.sh build/native-cuda/src <CPU run> <work dir> flg_gpu=1` runs the full chain
+  (`calc_chiqw`, `calc_w3d`, `calc_j3d`) on the GPU and compares ε⁻¹ and the U/J files with a finished CPU run
+  of the same system. The CPU run directory must contain `dir-wfn`, `dir-wan`, `dir-model`, `input.in` and its
+  results. Expect the deviations in the validation table below.
+
+**Tested with:**
+
+| | |
+|---|---|
+| GPU | NVIDIA L40S (compute capability 8.9, 48 GB), driver 580.82.07 |
+| CUDA | 13.0 (nvcc V13.0.88), with its cuFFT and cuBLAS |
+| CPU, OS | AMD EPYC 9454, Ubuntu 24.04.5, Linux 6.8 |
+| compilers | GCC and gfortran 13.3.0 (also the host compiler of nvcc) |
+| CMake | 3.28.3 |
+| MPI | Open MPI 4.1.6 |
+| BLAS/LAPACK, FFTW | OpenBLAS 0.3.26 and FFTW 3.3.10 (Ubuntu packages) |
+| configuration | preset `native` with `-DRESPACK_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89` |
+
+Other CUDA versions and GPUs have not been tested.
 
 ## Running
 
