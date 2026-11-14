@@ -24,8 +24,7 @@
 >   |---|---|---|
 >   | `upstream` | the unmodified release tarball (RESPACK-20240804.tar.gz) | – |
 >   | `zen-opt` | the CPU modifications | [README-zen-opt.md](https://github.com/danielguterding/RESPACK-fast/blob/zen-opt/README-zen-opt.md) |
->   | `gpu-cuda` | `zen-opt` + a GPU path for `calc_chiqw` on NVIDIA GPUs (CUDA) | [README-gpu-cuda.md](https://github.com/danielguterding/RESPACK-fast/blob/gpu-cuda/README-gpu-cuda.md) |
->   | `gpu-hip` | `gpu-cuda` + AMD GPUs (ROCm/HIP), χ⁰ products on the matrix units (FP16 split), faster GPU pair densities | [README-gpu-hip.md](https://github.com/danielguterding/RESPACK-fast/blob/gpu-hip/README-gpu-hip.md) |
+>   | `gpu` | `zen-opt` + a GPU path for `calc_chiqw` on NVIDIA (CUDA) and AMD (ROCm/HIP) GPUs | [README-gpu.md](https://github.com/danielguterding/RESPACK-fast/blob/gpu/README-gpu.md) |
 >
 > - **License:** RESPACK is distributed under GPLv3 (see `GPL/`), and so is this fork. The
 >   generalized-tetrahedron routines carry their own citation condition, or alternatively the MIT
