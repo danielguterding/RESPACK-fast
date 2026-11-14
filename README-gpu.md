@@ -327,29 +327,34 @@ The path is reproducible: repeated runs, and runs with either setting of the two
 On integrated GPUs `k_prodx4` also computes only as many x frequencies per thread as needed (nsx = 5 for SrVO₃
 instead of 8 per pass): −20 % kernel time.
 
-Whole runs on the 680M (Ryzen 7 PRO 6850U, 8 threads; phases summed over q; with the overlap the phases run
-concurrently and their sums are not given):
+Whole runs on the 680M (Ryzen 7 PRO 6850U, 8 threads, default settings; phases summed over q; with the overlap the
+phases run concurrently and their sums are not given):
 
 | | `calc_chiqw` | pair densities | tetrahedron | χ⁰ products |
 |---|---|---|---|---|
-| SrVO₃, CPU (`fast_gemm_sp=1`, default) | 103.0 s | 31.5 s | 35.3 s | 27.4 s |
-| SrVO₃, 680M, rocBLAS CGEMM (run as gfx1030) | 109.1 s | 32.4 s | 47.6 s | 61.4 s |
-| SrVO₃, 680M, fused kernel, uploads waited for, no overlap | 77.3 s | 24.0 s | 42.9 s | 12.4 s |
-| SrVO₃, 680M, fused kernel, staged uploads, overlap (default) | 63.6 s | | | |
-| Si, CPU (`fast_gemm_sp=1`, default) | 15.7 s | 1.2 s | 6.3 s | 1.2 s |
-| Si, 680M, rocBLAS CGEMM (run as gfx1030) | 24.3 s | 6.8 s | 7.9 s | 4.9 s |
-| Si, 680M, fused kernel, uploads waited for, no overlap | 21.1 s | 5.0 s | 8.3 s | 0.6 s |
-| Si, 680M, fused kernel, staged uploads, overlap (default) | 16.2 s | | | |
+| SrVO₃, CPU | 96.6 s | 29.9 s | 26.8 s | 31.0 s |
+| SrVO₃, 680M | 48.4 s | | | |
+| Si, CPU | 13.5 s | 1.2 s | 4.3 s | 1.1 s |
+| Si, 680M | 14.0 s | | | |
+
+The steps on the 680M (`calc_chiqw`):
+
+| | SrVO₃ | Si |
+|---|---|---|
+| rocBLAS CGEMM (run as gfx1030) | 109.1 s | 24.3 s |
+| fused kernel, uploads waited for, no overlap | 77.3 s | 21.1 s |
+| + staged uploads and overlap | 63.6 s | 16.2 s |
+| + vectorised tetrahedron weights (see README-zen-opt.md) | 48.4 s | 14.0 s |
 
 Measured back to back in the same power state, SrVO₃ takes 77.2 and 78.3 s with the uploads waited for and without
-the overlap, and 63.9 and 63.2 s with the defaults. Alone, the staged uploads save about 7 s and the overlap about
-12 s. The power state of the APU (clocks, memory fabric) shifts run times by up to about 10 %; compare runs back to
-back. The CPU is now busy most of the time: on average 11.4 of the 16 hardware threads in use (before: 8.9, with
-one thread waiting for the GPU during the pair densities of every q point), apart from about 7 s of single-threaded
-start-up.
+the overlap, and 63.9 and 63.2 s with the defaults (before the tetrahedron change). Alone, the staged uploads save
+about 7 s and the overlap about 12 s. The power state of the APU (clocks, memory fabric) shifts run times by up to
+about 10 %; compare runs back to back. The CPU is busy most of the time: on average 11.4 of the 16 hardware threads
+in use (before the overlap: 8.9, with one thread waiting for the GPU during the pair densities of every q point),
+apart from about 7 s of single-threaded start-up.
 
 On this GPU the χ⁰ products are no longer the limit. What remains:
-- **Tetrahedron weights** run on the CPU and are now the critical path for SrVO₃ (about 50 s of a 63 s run on the
+- **Tetrahedron weights** run on the CPU and are the critical path for SrVO₃ (about 37 s of a 48 s run on the
   second thread). On an APU they share the power budget with the GPU.
 - **Pair densities** (rocprofv3 traces): for SrVO₃ (24³ grid) the GPU spends 9.4 s in `k_prodx4`, 6–14 s in FFTs
   (depending on the memory-fabric clock) and 2–4 s in the other kernels. `k_prodx4` is neither bandwidth- nor
@@ -357,8 +362,8 @@ On this GPU the χ⁰ products are no longer the limit. What remains:
   little work per workgroup: one pair and 32 grid lines of 24 points, 14 400 workgroups per call. Four pairs per
   workgroup with the next pair's values loaded during the transform saved another 12 % of kernel time but no wall
   time, so it is not included.
-- **Small systems:** Si (15³ grid) runs as fast as on the CPU. A run makes about 118 000 rocFFT and 20 000 other
-  kernel launches; the GPU is busy for 4.6 s of 16 s.
+- **Small systems:** Si (15³ grid) runs about as fast as on the CPU. A run makes about 118 000 rocFFT and 20 000
+  other kernel launches; the GPU is busy for 4.6 s of 14 s.
 
 ## χ⁰ products on the matrix units: FP16 split (experimental, `RESPACK_GPU_GEMM=fp16`)
 
