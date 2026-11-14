@@ -79,9 +79,9 @@ FILE_NUM_EPS_BASE_START=600000
 N_CALC_Q=0
 FLG_FAST=1!fork: restructured pair loop
 FAST_MEM_MB=4096.0d0!fork: MB per pair tile
-FAST_GEMM_SP=0!fork: double-precision ZGEMM
+FAST_GEMM_SP=1!fork: single-precision CGEMM blocks, double-precision sum (0: ZGEMM)
 FLG_GPU=0!fork: CPU path
-FAST_FFT_SP=-1!fork: auto (single-precision FFTs with flg_gpu=1)
+FAST_FFT_SP=-1!fork: auto (single-precision FFTs)
 FLG_ASYNC_EPS=-1!fork: auto (on with flg_gpu=1)
 FAST_WFN_SP=-1!fork: auto (single precision together with single-precision FFTs)
 !--

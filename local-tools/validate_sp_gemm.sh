@@ -20,6 +20,7 @@ for l in lines:
     out.append(l)
     if l.strip().lower().startswith('&param_chiqw'):
         out.append(f'fast_gemm_sp={sp},')
+        out.append('fast_fft_sp=0,')   # double-precision FFTs on both sides (the default is single)
         if crpa: out.append(f'flg_cRPA={crpa},')
 print('\n'.join(out))
 PY

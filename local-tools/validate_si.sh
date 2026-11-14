@@ -27,7 +27,9 @@ for crpa in 0 1; do
   for code in orig fork; do
     R=run-crpa$crpa-$code; rm -rf $R; mkdir -p $R; cd $R
     ln -s ../qe/dir-wfn dir-wfn; cp -r ../qe/dir-wan ../qe/dir-model .
-    { echo "&param_chiqw"; echo "flg_cRPA=$crpa/"
+    # the fork in double precision (its default is single precision; the original would reject the entries)
+    dp=""; [[ $code == fork ]] && dp="fast_gemm_sp=0, fast_fft_sp=0,"
+    { echo "&param_chiqw"; echo "$dp flg_cRPA=$crpa/"
       sed -n '/&param_wannier/,$p' ../qe/input.in; } > input.in
     bin=$ORIG/calc_chiqw; [[ $code == fork ]] && bin=$FORK
     s=$(date +%s.%N)
