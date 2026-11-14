@@ -18,8 +18,15 @@
 >
 > - **Validation scope:** checked on SrVO₃ (cRPA) and Si (RPA/cRPA) only. Please compare against
 >   `flg_fast=0` for your own system before production use.
-> - **Branches:** `upstream` contains the unmodified release tarball (RESPACK-20240804.tar.gz) and
->   `zen-opt` the modifications.
+> - **Branches:** each branch builds on the one before it and has its own README for what it adds.
+>
+>   | branch | content | README |
+>   |---|---|---|
+>   | `upstream` | the unmodified release tarball (RESPACK-20240804.tar.gz) | – |
+>   | `zen-opt` | the CPU modifications | [README-zen-opt.md](https://github.com/danielguterding/RESPACK-fast/blob/zen-opt/README-zen-opt.md) |
+>   | `gpu-cuda` | `zen-opt` + a GPU path for `calc_chiqw` on NVIDIA GPUs (CUDA) | [README-gpu-cuda.md](https://github.com/danielguterding/RESPACK-fast/blob/gpu-cuda/README-gpu-cuda.md) |
+>   | `gpu-hip` | `gpu-cuda` + AMD GPUs (ROCm/HIP), χ⁰ products on the matrix units (FP16 split), faster GPU pair densities | [README-gpu-hip.md](https://github.com/danielguterding/RESPACK-fast/blob/gpu-hip/README-gpu-hip.md) |
+>
 > - **License:** RESPACK is distributed under GPLv3 (see `GPL/`), and so is this fork. The
 >   generalized-tetrahedron routines carry their own citation condition, or alternatively the MIT
 >   license; see the header of `src/chiqw/m_tetrahedron_20170325.F`.
