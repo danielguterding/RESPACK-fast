@@ -307,8 +307,8 @@
       complex(8), intent(out) :: x0(ne)
       complex(8) :: lr_01(ne)
       call lratio(ne,g0,g1,em,lr_01)
-      x0=   (.5d0*(g0+g1)+em)/(g0-g1)**2
-      x0=x0-   lr_01*(g0+em)*(g1+em)/(g0-g1)**3
+      x0=   (.5d0*(g0+g1)+em)/((g0-g1)*(g0-g1))
+      x0=x0-   lr_01*(g0+em)*(g1+em)/(((g0-g1)*(g0-g1))*(g0-g1))
       end subroutine
 
       subroutine ttrhdrn_sub1g30g20(g0,g1,g2,g3,ne,em,x0)
@@ -318,8 +318,8 @@
       complex(8), intent(out) :: x0(ne)
       complex(8) :: lr_01(ne)
       call lratio(ne,g0,g1,em,lr_01)
-      x0=   (g0-3.d0*g1-2.d0*em)*.25d0/(g0-g1)**2
-      x0=x0+   (g1+em)**2*lr_01*.5d0/(g0-g1)**3
+      x0=   (g0-3.d0*g1-2.d0*em)*.25d0/((g0-g1)*(g0-g1))
+      x0=x0+   ((g1+em)*(g1+em))*lr_01*.5d0/(((g0-g1)*(g0-g1))*(g0-g1))
       end subroutine
 
       subroutine ttrhdrn_sub1g30   (g0,g1,g2,g3,ne,em,x0)
@@ -331,12 +331,12 @@
       call lratio(ne,g0,g1,em,lr_01)
       call lratio(ne,g1,g2,em,lr_12)
       x0=   .5d0/(g0-g2)
-      x0=x0-   .5d0/((g0-g2)*(g0-g1))**2
+      x0=x0-   .5d0/(((g0-g2)*(g0-g1))*((g0-g2)*(g0-g1)))
      $        *(g0+em)
      $        *(-2.d0*(g1+em)*(g2+em)+(g0+em)*(g1+g2+2.d0*em))
      $        *lr_01
-      x0=x0+   .5d0/(g0-g2)**2
-     $        *(g2+em)**2*lr_12/(g1-g2)
+      x0=x0+   .5d0/((g0-g2)*(g0-g2))
+     $        *((g2+em)*(g2+em))*lr_12/(g1-g2)
       x0=x0+   .5d0/((g0-g2)*(g0-g1))
      $        *(g1+em)
       end subroutine
@@ -352,15 +352,15 @@
       call lratio(ne,g3,g0,em,lr_30)
 !     x0=   (-g0-g1-2.d0*em)/((g0-g2)*(g0-g3))*.25d0
       x0=  +   (
-     $         -(g1+em)**2*lr_10)
+     $         -((g1+em)*(g1+em))*lr_10)
      $        /((g0-g2)*(g0-g3)*(g0-g1))*.5d0
 !     x0=x0-   (-g1-g2-2.d0*em)/((g0-g2)*(g2-g3))*.25d0
-      x0=x0-   ((g1+em)**2*lr_10
-     $         -(g2+em)**2*lr_20)
+      x0=x0-   (((g1+em)*(g1+em))*lr_10
+     $         -((g2+em)*(g2+em))*lr_20)
      $        /((g0-g2)*(g1-g2)*(g2-g3))*.5d0
 !     x0=x0+   (-g1-g3-2.d0*em)/((g0-g3)*(g2-g3))*.25d0
-      x0=x0+   ((g1+em)**2*lr_10
-     $         -(g3+em)**2*lr_30)
+      x0=x0+   (((g1+em)*(g1+em))*lr_10
+     $         -((g3+em)*(g3+em))*lr_30)
      $        /((g1-g3)*(g0-g3)*(g2-g3))*.5d0
       end subroutine
 
@@ -381,9 +381,9 @@
       call lratio(ne,g0,g1,em,lr_01)
       x0=   ((g0-g1)*(g0+2.d0*g1+3.d0*em)
      $         -6.d0*(g0+em)*(g1+em))
-     $        /(12.d0*(g0-g1)**3)
-      x0=x0+   (g0+em)*(g1+em)**2*lr_01
-     $        /(g0-g1)**4*.5d0
+     $        /(12.d0*(((g0-g1)*(g0-g1))*(g0-g1)))
+      x0=x0+   (g0+em)*((g1+em)*(g1+em))*lr_01
+     $        /(((g0-g1)*(g0-g1))*((g0-g1)*(g0-g1)))*.5d0
       end subroutine
 
       subroutine ttrhdrn_sub2g30g21(g0,g1,g2,g3,ne,em,x0)
@@ -401,10 +401,11 @@
       complex(8), intent(out) :: x0(ne)
       complex(8) :: lr_02(ne)
       call lratio(ne,g0,g2,em,lr_02)
-      x0=   (2.d0*(g0+em)**2-7.d0*(g0+em)*(g2+em)+11.d0*(g2+em)**2)
-     $        /(36.d0*(g0-g2)**3)
-      x0=x0-   (g2+em)**3*lr_02
-     $        /(6.d0*(g0-g2)**4)
+      x0=   (2.d0*((g0+em)*(g0+em))-7.d0*(g0+em)*(g2+em)+11.d0*((g2
+     $        +em)*(g2+em)))
+     $        /(36.d0*(((g0-g2)*(g0-g2))*(g0-g2)))
+      x0=x0-   (((g2+em)*(g2+em))*(g2+em))*lr_02
+     $        /(6.d0*(((g0-g2)*(g0-g2))*((g0-g2)*(g0-g2))))
       end subroutine
 
       subroutine ttrhdrn_sub2g10   (g0,g1,g2,g3,ne,em,x0)
@@ -415,14 +416,16 @@
       complex(8) :: lr_20(ne),lr_30(ne)
       call lratio(ne,g2,g0,em,lr_20)
       call lratio(ne,g3,g0,em,lr_30)
-      x0=   (g0+em)*((g0+em)**2+5.d0*(g2+em)*(g3+em)
+      x0=   (g0+em)*(((g0+em)*(g0+em))+5.d0*(g2+em)*(g3+em)
      $                 -3.d0*(g0+em)*(g2+g3+2.d0*em))
-     $        /(12.d0*(g0-g2)**2*(g0-g3)**2)
+     $        /(12.d0*((g0-g2)*(g0-g2))*((g0-g3)*(g0-g3)))
 !     x0=x0+   (g0+em)*(3.d0*(g2+em)*(g3+em)*(g0-g2)*(g0-g3)
 !    $                 +((g0+em)*(g2-g3))**2)
 !    $        *log(g0+em)/(6.d0*(g0-g2)**3*(g0-g3)**3)
-      x0=x0-   (g2+em)**3*lr_20/(6.d0*(g0-g2)**3*(g2-g3))
-      x0=x0+   (g3+em)**3*lr_30/(6.d0*(g0-g3)**3*(g2-g3))
+      x0=x0-   (((g2+em)*(g2+em))*(g2+em))*lr_20/(6.d0*(((g0-g2)*(g0
+     $        -g2))*(g0-g2))*(g2-g3))
+      x0=x0+   (((g3+em)*(g3+em))*(g3+em))*lr_30/(6.d0*(((g0-g3)*(g0
+     $        -g3))*(g0-g3))*(g2-g3))
       end subroutine
 
       subroutine ttrhdrn_sub2g30   (g0,g1,g2,g3,ne,em,x0)
@@ -433,14 +436,14 @@
       complex(8) :: lr_02(ne),lr_12(ne)
       call lratio(ne,g0,g2,em,lr_02)
       call lratio(ne,g1,g2,em,lr_12)
-      x0=   ((g0+em)**2*(g1-g2)+(g1+em)**2*(g0-g2))
-     $        /(6.d0*(g0-g2)*(g0-g1)**2*(g1-g2))
-      x0=x0-   (g0+em)**2*(2.d0*(g1+em)*(g0-g2)+(g2+em)*(g0-g1))
+      x0=   (((g0+em)*(g0+em))*(g1-g2)+((g1+em)*(g1+em))*(g0-g2))
+     $        /(6.d0*(g0-g2)*((g0-g1)*(g0-g1))*(g1-g2))
+      x0=x0-   ((g0+em)*(g0+em))*(2.d0*(g1+em)*(g0-g2)+(g2+em)*(g0-g1))
      $                   *lr_02
-     $        /(6.d0*(g0-g2)**2*(g0-g1)**3)
-      x0=x0+   (g1+em)**2*(2.d0*(g0+em)*(g1-g2)-(g2+em)*(g0-g1))
+     $        /(6.d0*((g0-g2)*(g0-g2))*(((g0-g1)*(g0-g1))*(g0-g1)))
+      x0=x0+   ((g1+em)*(g1+em))*(2.d0*(g0+em)*(g1-g2)-(g2+em)*(g0-g1))
      $                   *lr_12
-     $        /(6.d0*(g0-g1)**3*(g1-g2)**2)
+     $        /(6.d0*(((g0-g1)*(g0-g1))*(g0-g1))*((g1-g2)*(g1-g2)))
 !     x0=x0+   (g2+em)**3*log(g2+em)/(6.d0*(g0-g2)**2*(g1-g2)**2)
       end subroutine
 
@@ -453,17 +456,17 @@
       call lratio(ne,g2,g1,em,lr_21)
       call lratio(ne,g3,g1,em,lr_31)
       call lratio(ne,g0,g1,em,lr_01)
-      x0=-   (g1+em)**2/(6.d0*(g0-g1)*(g1-g2)*(g1-g3))
+      x0=-   ((g1+em)*(g1+em))/(6.d0*(g0-g1)*(g1-g2)*(g1-g3))
 !     x0=x0+   ((g1+em)*(g2+em)**2*(g1-g3)*(g0-g3)
 !    $         +(g1+em)*(g2+em)*(g3+em)*(g1-g2)*(g0-g3)
 !    $         +(g0+em)*(g3+em)**2*(g1-g2)**2)*log(g1+em)
 !    $        /(6.d0*(g0-g2)*(g0-g3)*(g1-g2)**2*(g1-g3)**2)
-      x0=x0-   (g2+em)**3*lr_21
-     $        /(6.d0*(g0-g2)*(g1-g2)**2*(g2-g3))
-      x0=x0+   (g3+em)**3*lr_31
-     $        /(6.d0*(g0-g3)*(g1-g3)**2*(g2-g3))
-      x0=x0+   (g0+em)**3*lr_01
-     $        /(6.d0*(g0-g1)**2*(g0-g2)*(g0-g3))
+      x0=x0-   (((g2+em)*(g2+em))*(g2+em))*lr_21
+     $        /(6.d0*(g0-g2)*((g1-g2)*(g1-g2))*(g2-g3))
+      x0=x0+   (((g3+em)*(g3+em))*(g3+em))*lr_31
+     $        /(6.d0*(g0-g3)*((g1-g3)*(g1-g3))*(g2-g3))
+      x0=x0+   (((g0+em)*(g0+em))*(g0+em))*lr_01
+     $        /(6.d0*((g0-g1)*(g0-g1))*(g0-g2)*(g0-g3))
       end subroutine
 
 
@@ -629,8 +632,14 @@
 !    surface cuts (ttct) do not depend on dsgn and are done only once.
 !    xo accumulates the dsgn=+1 and dsgn=-1 contributions, i.e. the same
 !    as ttrhdrn_chi0(..,+1,..) followed by ttrhdrn_chi0(..,-1,..).
+!    Normal tetrahedra (case 0 of calc, the common case) go to calc0_soa
+!    (m_tetrahedron_soa.f90: real arithmetic on separate real/imaginary
+!    arrays, vectorised over the frequencies); the near-degenerate cases
+!    use calc. Both signs are summed before the vertex weights are added
+!    to xo. Work arrays are automatic (on the stack: -fstack-arrays).
       subroutine ttrhdrn_chi0_pm(dmna,dmnr,n1,n2,n3,imt1
      $                          ,e1,e2,f1,f2,delt,ne,em,ca1,xo)
+      use m_tetrahedron_soa, only: calc0_soa
       real(8), intent(in) :: dmna,dmnr
       integer, intent(in) :: n1,n2,n3,imt1(nvtx,n1*n2*n3*ndiv)
       complex(8), intent(in) :: e1(n1*n2*n3),e2(n1*n2*n3)
@@ -639,11 +648,14 @@
       complex(8), intent(in) :: em(ne)
       complex(8), intent(  out) :: ca1(ne*nvtx)
       complex(8), intent(inout) :: xo(ne,n1*n2*n3)
-      integer :: i1,i2,i3,i4,i5,isg
-      real(8) :: ee1(4),ee2(4),dsg
-      complex(8) :: ffk(4),ggk(4),ggs(4),xxo(ne,4)
+      integer :: i1,i2,i3,i4,i5,isg,j3
+      integer :: ia2(4),ia3(4),ia4(4)
+      real(8) :: ee1(4),ee2(4),dsg,fr(4)
+      complex(8) :: ffk(4),ggk(4),ggs(4),xxc(ne,4)
+      real(8) :: emr(ne),emi(ne),xr(ne,4),xi(ne,4),wk(ne,12)
       integer, parameter :: ia1(4)=(/1,2,3,4/),nmax=99
       real(8) :: dwgt(4,4,nmax),dvol(nmax)
+      emr=dble(em); emi=dimag(em)
       do i1=1,n1*n2*n3*ndiv
         dwgt(:,:,1)=0.d0; do i2=1,4; dwgt(i2,i2,1)=1.d0; end do
         dvol(1)=1.d0; i2=1
@@ -653,19 +665,25 @@
           do i4=1,4
             ggk(i4)=-dcmplx(sum((ee2-ee1)*dwgt(:,i4,i3)),-delt)
           end do
+          xr=0.d0; xi=0.d0
           do isg=1,2
             dsg=dble(3-2*isg)
-            xxo=0.d0; ffk=dvol(i3)
+            ffk=dvol(i3)
             ffk=ffk*dsg; ggs=ggk*dsg
-            call calc(dmna,dmnr,ia1,4
-     $               ,ffk
-     $               ,ggs,ne,em,ca1
-     $               ,xxo)
-            do i4=1,4; do i5=1,4
-              xo(:,imt1(i5,i1))=xo(:,imt1(i5,i1))
-     $                          +xxo(:,i4)*dwgt(i5,i4,i3)
-            end do; end do
+            call chk1(dmna,dmnr,4,ggs,ia1,ia2,ia3,ia4,j3)
+            if(sum(ia2).eq.0)then
+              fr=dble(ffk)
+              call calc0_soa(ne,emr,emi,ggs,fr,ia4,wk,xr,xi)
+            else
+              xxc=0.d0
+              call calc(dmna,dmnr,ia1,4,ffk,ggs,ne,em,ca1,xxc)
+              xr=xr+dble(xxc); xi=xi+dimag(xxc)
+            end if
           end do
+          do i4=1,4; do i5=1,4
+            xo(:,imt1(i5,i1))=xo(:,imt1(i5,i1))
+     $        +dcmplx(xr(:,i4),xi(:,i4))*dwgt(i5,i4,i3)
+          end do; end do
         end do
       end do
       end subroutine
@@ -723,19 +741,19 @@
 !       +z0^3 L01/(6(g0-g1)^2(g0-g2)(g0-g3))
 !     term 1: (g0,g1,g2,g3)=(b,a,c,d)
       k11=1.d0/(6.d0*(b-a)*(a-c)*(a-d))
-      k12=1.d0/(6.d0*(b-c)*(a-c)**2*(c-d))
-      k13=1.d0/(6.d0*(b-d)*(a-d)**2*(c-d))
-      k14=1.d0/(6.d0*(b-a)**2*(b-c)*(b-d))
+      k12=1.d0/(6.d0*(b-c)*((a-c)*(a-c))*(c-d))
+      k13=1.d0/(6.d0*(b-d)*((a-d)*(a-d))*(c-d))
+      k14=1.d0/(6.d0*((b-a)*(b-a))*(b-c)*(b-d))
 !     term 2: (a,b,c,d)
       k21=1.d0/(6.d0*(a-b)*(b-c)*(b-d))
-      k22=1.d0/(6.d0*(a-c)*(b-c)**2*(c-d))
-      k23=1.d0/(6.d0*(a-d)*(b-d)**2*(c-d))
-      k24=1.d0/(6.d0*(a-b)**2*(a-c)*(a-d))
+      k22=1.d0/(6.d0*(a-c)*((b-c)*(b-c))*(c-d))
+      k23=1.d0/(6.d0*(a-d)*((b-d)*(b-d))*(c-d))
+      k24=1.d0/(6.d0*((a-b)*(a-b))*(a-c)*(a-d))
 !     term 3: (a,c,b,d)
       k31=1.d0/(6.d0*(a-c)*(c-b)*(c-d))
-      k32=1.d0/(6.d0*(a-b)*(c-b)**2*(b-d))
-      k33=1.d0/(6.d0*(a-d)*(c-d)**2*(b-d))
-      k34=1.d0/(6.d0*(a-c)**2*(a-b)*(a-d))
+      k32=1.d0/(6.d0*(a-b)*((c-b)*(c-b))*(b-d))
+      k33=1.d0/(6.d0*(a-d)*((c-d)*(c-d))*(b-d))
+      k34=1.d0/(6.d0*((a-c)*(a-c))*(a-b)*(a-d))
 !     sub1normal(g0,g1,g2,g3)=(a,d,b,c):
 !       0.5*[-z1^2 L10/((g0-g2)(g0-g3)(g0-g1))
 !            -(z1^2 L10-z2^2 L20)/((g0-g2)(g1-g2)(g2-g3))

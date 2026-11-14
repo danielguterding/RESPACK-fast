@@ -45,6 +45,17 @@ The fork computes the same quantity this way:
    - Both signs (dsgn = ±1) are done in one pass, so the Fermi-surface cuts are computed once.
    - Non-degenerate tetrahedra use a fused kernel: 6 instead of 12 logarithms, frequency-independent
      denominators inverted once, and powers as explicit products.
+   - The fused kernel of `ttrhdrn_chi0_pm` works in real arithmetic on separate real and imaginary arrays
+     (`m_tetrahedron_soa.f90`), so its loop over the frequencies is vectorised (4 frequencies per AVX2
+     instruction, 8 with AVX-512 on Zen 4/Zen 5); the complex version ran as scalar code. Both signs are summed
+     before the vertex weights are added.
+   - Work arrays on the stack (`-fstack-arrays` for `m_tetrahedron_fast.F`): gfortran otherwise allocates the
+     frequency-sized temporaries of every call with `malloc`, which with 8 threads cost about 10 % of the
+     tetrahedron time. Complex integer powers in the near-degenerate cases are explicit products instead of
+     library calls.
+   - SrVO₃ (8 threads, single-precision defaults): tetrahedron weights 36.7 s → 26.8 s, `calc_chiqw`
+     105.9 s → 96.6 s. The accuracy against a quad-precision evaluation of the original formulas is unchanged
+     (`local-tools/acc_tetra_quad.f90`).
 
 **Precision.** By default the χ⁰ part runs in single precision: CGEMM accumulation, FFTs and wave functions
 (below). For a fully double-precision run set `fast_gemm_sp=0, fast_fft_sp=0`. The deviations of the
@@ -115,12 +126,13 @@ budget means larger tiles and fewer backward FFTs.
 |---|---|---|
 | `src/chiqw/chi_fast.f90` | new | restructured band-pair loop (module `m_chi_fast`) |
 | `src/chiqw/m_tetrahedron_fast.F` | new (derived from `m_tetrahedron_20170325.F`) | vectorised log ratios, fused ± pass, fused normal tetrahedra |
+| `src/chiqw/m_tetrahedron_soa.f90` | new | normal-tetrahedron kernel of `ttrhdrn_chi0_pm` in real arithmetic on separate real/imaginary arrays (vectorised over the frequencies) |
 | `src/chiqw/chiqw_sub.F` | modified | new `make_C0_map` (per-k rotation map; `make_C0` unchanged) |
 | `src/chiqw/eps_async.f90`, `thread_util.c` | new | module `m_eps_async` (q ≠ 0 post-processing, background thread via pthreads) |
 | `src/chiqw/wfn_shared.f90` | new | module `m_wfn_shared` (wave functions shared by the ranks of a node, MPI-3 shared memory) |
 | `src/chiqw/chiqw.F`, `config.h` | modified | calls `m_chi_fast` for `flg_fast=1`, original loops kept for `flg_fast=0`; frequency loops of the ε inversion parallel (OpenMP); single-precision wave functions (`fast_wfn_sp`), shared on the node; no band ring exchange with one rank per q group |
 | `src/chiqw/m_rdinput.f90` | modified | inputs `flg_fast`, `fast_mem_mb`, `flg_async_eps`, `fast_gemm_sp`, `fast_fft_sp`, `fast_wfn_sp` |
-| `src/chiqw/CMakeLists.txt` | modified | FFTW3, new sources |
+| `src/chiqw/CMakeLists.txt` | modified | FFTW3, new sources, `-fstack-arrays` for `m_tetrahedron_fast.F` |
 | `src/calc_int/int_fast.f90` | new | module `m_int_fast` |
 | `src/calc_int/calc_intW.F`, `calc_intJ.F` | modified | call `m_int_fast` for `flg_fast=1`; original loops kept; exp(−iq·R) table in `calc_intW.F` |
 | `src/calc_int/calc_int_sub.F` | modified | `make_LG0` loop bounds (identical G lists) |
@@ -221,6 +233,12 @@ per-directory Makefiles are unchanged but don't know about the fork's new files;
   slower (SrVO₃: 17.2 s instead of 8.7 s), and ε⁻¹ differed from a build without LTO by 3.4×10⁻⁵ (1.3×10⁻⁵ with
   the flag). The CMake build sets the flag automatically. Builds made before this fix with LTO (e.g. the `zen3`
   preset) should be rebuilt.
+- **AVX-512 (Zen 4, Zen 5):** the vectorised loops (tetrahedron weights with libmvec's `log`/`atan2`) use
+  512-bit vectors when the build targets such a CPU: preset `native`, or `RESPACK_ARCH=znver4` (GCC ≥ 13) /
+  `znver5` (GCC ≥ 14). The `zen3` preset produces AVX2 code, also on Zen 4/5. Measured on an EPYC 9454 (Zen 4,
+  8 cores, other jobs on the node): tetrahedron weights for SrVO₃ 32.9 s (AVX2) and 32.2 s (AVX-512), Si 6.4 s
+  and 5.6 s; the previous code took 40.6 s and 8.4 s. Zen 4 executes 512-bit instructions in two halves; Zen 5
+  has full-width units.
 - **Other compilers:** the GNU toolchain is tested. Intel/ifx get `-xHost` with `RESPACK_NATIVE`;
   other compilers use their defaults.
 - **Validated builds:** the `zen3` and `default` builds were both checked against the reference results
