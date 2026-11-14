@@ -1,47 +1,76 @@
-# RESPACK 20240804 — `gpu-hip` branch: AMD GPUs and faster GPU χ⁰
+# RESPACK 20240804 — `gpu` branch: GPU path for `calc_chiqw` (NVIDIA and AMD)
 
-This branch is [`gpu-cuda`](README-gpu-cuda.md) plus:
-- **AMD GPUs:** the GPU path compiled as HIP (ROCm, hipFFT, hipBLAS);
-- **χ⁰ products on the matrix units:** an FP16 split with round-to-nearest accumulation, on AMD (patched
-  hipBLASLt kernel for gfx1200) and NVIDIA GPUs (own kernel for sm_80 and newer);
-- **large systems:** tile size from the device memory, fused pair products and x pass with a two-stage DFT,
-  single-precision uploads, wave-function rotation on the GPU, tetrahedron weights overlapped with the χ⁰
-  products.
+This branch is [`zen-opt`](README-zen-opt.md) plus a GPU path for the band-pair loop of `calc_chiqw`. One source,
+`src/chiqw/chi_gpu.cu`, builds for NVIDIA GPUs (CUDA, cuFFT, cuBLAS) and for AMD GPUs (ROCm/HIP, hipFFT, hipBLAS);
+`src/chiqw/gpu_api.h` maps the CUDA names one-to-one onto HIP. The kernels, the precision model and the switches
+are the same on both. The shared kernels use no warp-level operations, so the wavefront size (32 or 64) does not
+matter; only the NVIDIA FP16 kernel (`hgemm_rn.cuh`) is CUDA-specific. Everything in [README-zen-opt.md](README-zen-opt.md) applies here as well: the CPU changes,
+inputs, validation and the CPU build. Unless marked otherwise, everything below applies to both vendors.
 
-Read [README-zen-opt.md](README-zen-opt.md) (CPU changes, inputs, build) and
-[README-gpu-cuda.md](README-gpu-cuda.md) (GPU path, CUDA build, running) first; all of it applies here. This
-file describes what this branch adds. Everything except the HIP build itself also applies to the CUDA build of
-this branch.
-
-## Switches
-
-In addition to those in [README-gpu-cuda.md](README-gpu-cuda.md#switches). All are environment variables of
-`calc_chiqw`; the input file is unchanged.
-
-| switch | default | effect |
+| program | change | switch |
 |---|---|---|
-| `RESPACK_GPU_GEMM` | unset (CGEMM) | `fp16`: χ⁰ products on the matrix units (FP16 split, three products) |
-| `RESPACK_GPU_FP16_RN` | on where available | round-to-nearest kernel for hi·hi (gfx1200 in the HIP build, compute capability ≥ 8.0 in the CUDA build); 0: chunked library path |
-| `RESPACK_GPU_FP16_CHUNK` | 512 | K chunk of the chunked library path |
-| `RESPACK_GPU_FP16_TERMS` | 3 | `2x`, `2y`: drop one correction product (faster, 10–30× less accurate; exploratory runs only) |
-| `RESPACK_GPU_FP16_PAD` | 8 | the G dimension of the FP16 operands is padded to a multiple of this |
-| `RESPACK_GPU_KC` | 2048 (CUDA CGEMM), 512 (HIP CGEMM), 8192 (FP16) | GEMM block length in rows; for testing only |
-| `RESPACK_GPU_TILE_MB` | auto | tile budget in MB (default: 60 % of the device memory left after χ and 2 GB of buffers) |
-| `RESPACK_GPU_MEM_MB` | device memory | caps the device memory assumed for the tile size |
-| `RESPACK_GPU_FUSEX` | 1 | 0: separate pair products and x pass instead of `k_prodx4` |
-| `RESPACK_GPU_PRODX_Q` | auto | Q of the two-stage x DFT in `k_prodx4`; 1: direct DFT |
-| `RESPACK_GPU_ROT` | auto | wave-function rotation on the GPU; 0: on the CPU |
+| `calc_chiqw` | optional GPU path of the band-pair loop (`src/chiqw/chi_gpu.cu`) for NVIDIA (CUDA) and AMD (ROCm/HIP) GPUs | `flg_gpu` in `&param_chiqw` (default 0); build with `-DRESPACK_CUDA=ON` or `-DRESPACK_HIP=ON` |
 
-Build options: `RESPACK_HIP` (instead of `RESPACK_CUDA`), `RESPACK_HIP_FP16_RN` (default ON), preset `hip`.
+## GPU path
 
-## AMD GPUs (ROCm/HIP)
+`flg_gpu=1` in `&param_chiqw` moves the expensive parts of the band-pair loop to the GPU:
 
-The same `chi_gpu.cu` is compiled as HIP. `src/chiqw/gpu_api.h` maps the CUDA runtime, cuFFT, cuBLAS and
-cuComplex names one-to-one onto the HIP runtime, hipFFT (rocFFT) and hipBLAS (rocBLAS), so the kernels, the
-precision model and all switches (`flg_gpu`, `fast_fft_sp`, `fast_mem_mb`, `RESPACK_GPU_KC`) are the same as
-on NVIDIA GPUs. The kernels use no warp-level operations, so the wavefront size (32 or 64) does not matter.
+- **Pair densities.** The irreducible wave functions of a tile are cached on the GPU in single precision and
+  rotated there (`k_rotscatter`); for very small tiles the CPU rotates and uploads them. The bands are placed on
+  the FFT grid and transformed. The pair products and the x pass of the forward FFT are one kernel (`k_prodx4`,
+  with a two-stage DFT of the needed x frequencies); the y and z passes are pruned to the ε sphere. The needed
+  G-components are gathered into a transposed tile `At(G, row)`, which makes the writes contiguous.
+- **χ⁰ products.** By default CGEMM blocks (cuBLAS/hipBLAS), each added to a double-precision χ(G,G′,ω) kept on
+  the GPU; this is the precision model of `fast_gemm_sp=1` on the CPU. With `RESPACK_GPU_GEMM=fp16` they run on
+  the matrix units as an FP16 split with round-to-nearest accumulation (own kernel on NVIDIA GPUs with compute
+  capability ≥ 8.0, patched hipBLASLt kernel on gfx1200).
+- **q = 0 head/wing terms.** Double-precision ZGEMV on the GPU, summed over tiles and assembled on the host.
+- **Tetrahedron weights.** On the CPU, in sub-blocks that overlap with the χ⁰ products on the GPU.
+- **ε inversion and output.** On the CPU, in the background while the GPU computes the next q point
+  (`flg_async_eps`, auto = on with `flg_gpu=1`).
 
-**Requirements**, in addition to those of the CPU build ([README-zen-opt.md](README-zen-opt.md#build)):
+The tile size follows the device memory (`RESPACK_GPU_TILE_MB` overrides). `fast_fft_sp` (default: single
+precision) also applies on the GPU; single-precision FFTs are 3× faster on an L40S, and ε⁻¹ changes by about
+3×10⁻⁶. Set `fast_fft_sp=0` for double-precision FFTs.
+
+The two builds differ in two places: the CGEMM block length (2048 rows with cuBLAS, 512 with rocBLAS; see
+Validation) and the round-to-nearest FP16 kernel (all NVIDIA GPUs with compute capability ≥ 8.0, but on AMD only
+gfx1200; other AMD GPUs use the chunked library path).
+
+## Build
+
+The GPU build needs the requirements of the CPU build ([README-zen-opt.md](README-zen-opt.md#build)) and those
+listed below for each vendor. `RESPACK_CUDA` and `RESPACK_HIP` are mutually exclusive; without either, a stub is
+compiled and `flg_gpu=1` stops with a message.
+
+### NVIDIA (CUDA)
+
+- **CUDA toolkit** with nvcc, cuFFT and cuBLAS. Tested only with CUDA 13.0. CUDA 13 compiles for compute
+  capability 7.5 (Turing) and newer.
+- **NVIDIA driver** that supports the toolkit (CUDA 13.0: driver 580 or newer).
+- **Host compiler for nvcc**: a GCC version supported by the toolkit (tested: GCC 13.3). If the default
+  `g++` is newer than your CUDA version supports, pass `-DCMAKE_CUDA_HOST_COMPILER=g++-<version>`.
+- **CMake** ≥ 3.18 with `CMAKE_CUDA_ARCHITECTURES` given; the default architecture list `all-major` needs
+  CMake ≥ 3.23.
+
+```
+git clone -b gpu https://github.com/danielguterding/RESPACK-fast.git && cd RESPACK-fast
+cmake --preset native -B build/native-cuda -DRESPACK_CUDA=ON \
+      -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc -DCMAKE_CUDA_ARCHITECTURES=89
+cmake --build build/native-cuda -j
+cmake --install build/native-cuda --prefix $HOME/.local/respack-gpu     # optional
+```
+
+- `CMAKE_CUDA_COMPILER` is needed only if `nvcc` is not on the `PATH`.
+- `CMAKE_CUDA_ARCHITECTURES` is the compute capability of the GPU without the dot: 89 = L40S, RTX 40xx;
+  86 = A40, RTX 30xx; 80 = A100; 90 = H100. Several are separated by semicolons. Without it, CMake builds for
+  `all-major`, which takes longer.
+- The configure step prints `-- CUDA: 13.0.88, architectures 89` (your versions).
+- `native` adds `-march=native` and LTO for the CPU part (see the presets in README-zen-opt.md); `default`
+  works as well.
+
+### AMD (ROCm/HIP)
+
 - **ROCm** with HIP, hipFFT (rocFFT) and hipBLAS (rocBLAS), including their CMake package files. Tested only
   with ROCm 7.2.1. The code uses the hipBLAS v2 API (`HIPBLAS_V2`, the default from ROCm 7.0); ROCm 6.x has
   not been tested.
@@ -51,56 +80,121 @@ on NVIDIA GPUs. The kernels use no warp-level operations, so the wavefront size 
 - **CMake** ≥ 3.21 (HIP language).
 - **GPU access** at run time: the user must be in the groups `render` and `video`.
 
-**Configure and build:**
-
-    git clone -b gpu-hip https://github.com/danielguterding/RESPACK-fast.git && cd RESPACK-fast
-    cmake --preset hip -B build/hip -DCMAKE_HIP_ARCHITECTURES=gfx1200   # e.g. gfx1200 = RX 9060/9070, gfx942 = MI300
-    cmake --build build/hip -j
-    cmake --install build/hip --prefix $HOME/.local/respack-gpu     # optional
+```
+git clone -b gpu https://github.com/danielguterding/RESPACK-fast.git && cd RESPACK-fast
+cmake --preset hip -B build/hip -DCMAKE_HIP_ARCHITECTURES=gfx1200   # e.g. gfx1200 = RX 9060/9070, gfx942 = MI300
+cmake --build build/hip -j
+cmake --install build/hip --prefix $HOME/.local/respack-gpu     # optional
+```
 
 - Without `CMAKE_HIP_ARCHITECTURES`, CMake builds for the GPU(s) of the build machine.
 - ROCm is looked up in `ROCM_PATH` (CMake or environment variable), default `/opt/rocm`.
 - The configure step prints `-- HIP: <clang version>, architectures gfx1200, ROCm /opt/rocm`.
-- `RESPACK_CUDA` and `RESPACK_HIP` are mutually exclusive. The CUDA build of this branch is the same as
-  for `gpu-cuda` ([README-gpu-cuda.md](README-gpu-cuda.md#build)).
 - For gfx1200, the build also assembles the FP16 round-to-nearest GEMM kernel (`src/chiqw/fp16_rn/`, used with
   `RESPACK_GPU_GEMM=fp16`). `-DRESPACK_HIP_FP16_RN=OFF` leaves it out.
 
-**Check the build** on a machine with the GPU:
+### Check the build
+
+On a machine with the GPU:
 - With `flg_gpu=1`, the log of `calc_chiqw` names the device, e.g.
-  `chi_gpu: local rank 0 -> device 0 (AMD Radeon RX 9060 XT, 15.9 GB), grid …, single-precision FFTs`.
-- With `RESPACK_GPU_GEMM=fp16` on gfx1200 the next line ends in `hi*hi in one call with round-to-nearest
-  accumulation (gfx1200 kernel; experimental)`. If it says `hi*hi in K chunks of 512` instead, the embedded
-  kernel is not used.
-- `local-tools/run_chain_cmp.sh` compares a full GPU chain with a CPU run (see README-gpu-cuda.md).
+  `chi_gpu: local rank 0 -> device 0 (NVIDIA L40S, 47.4 GB), grid 24 24 24, FFT batch 1024, single-precision FFTs`
+  or `chi_gpu: local rank 0 -> device 0 (AMD Radeon RX 9060 XT, 15.9 GB), grid …`.
+- With `RESPACK_GPU_GEMM=fp16`, the next line ends in `hi*hi in one call with round-to-nearest accumulation
+  (mma.sync kernel; experimental)` on NVIDIA or `(gfx1200 kernel; experimental)` on gfx1200. If it says
+  `hi*hi in K chunks of 512` instead, the round-to-nearest kernel is not used.
+- `local-tools/run_chain_cmp.sh <build>/src <CPU run> <work dir> flg_gpu=1` runs the full chain
+  (`calc_chiqw`, `calc_w3d`, `calc_j3d`) on the GPU and compares ε⁻¹ and the U/J files with a finished CPU run
+  of the same system. The CPU run directory must contain `dir-wfn`, `dir-wan`, `dir-model`, `input.in` and its
+  results. Expect the deviations in the validation tables below.
 
-**Tested with:**
+### Tested with
 
-| | AMD (HIP build) | NVIDIA (CUDA build of this branch) |
+| | NVIDIA (CUDA build) | AMD (HIP build) |
 |---|---|---|
-| GPU | Radeon RX 9060 XT (gfx1200, 16 GB) | L40S, see [README-gpu-cuda.md](README-gpu-cuda.md#build) |
-| GPU software | ROCm 7.2.1: HIP 7.2.53211, AMD clang 22.0.0git, hipBLAS 3.2.0, rocBLAS 5.2.0, hipFFT 1.0.22, rocFFT 1.0.36 (packages for Ubuntu 24.04); in-kernel `amdgpu` driver | CUDA 13.0, driver 580.82.07 |
-| CPU, OS | AMD Ryzen 9 9950X3D, 62 GB; Ubuntu 26.04.1, Linux 7.0 | AMD EPYC 9454; Ubuntu 24.04.5 |
-| compilers | GCC and gfortran 15.2.0 | GCC and gfortran 13.3.0 |
-| CMake | 4.2.3 | 3.28.3 |
-| MPI | Open MPI 5.0.10 | Open MPI 4.1.6 |
-| BLAS/LAPACK, FFTW | OpenBLAS 0.3.32, FFTW 3.3.10 (Ubuntu packages) | OpenBLAS 0.3.26, FFTW 3.3.10 |
-| configuration | preset `hip` with `-DCMAKE_HIP_ARCHITECTURES=gfx1200 -DRESPACK_NATIVE=ON` | preset `native` with `-DRESPACK_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89` |
+| GPU | L40S (compute capability 8.9, 48 GB), driver 580.82.07 | Radeon RX 9060 XT (gfx1200, 16 GB), in-kernel `amdgpu` driver |
+| GPU software | CUDA 13.0 (nvcc V13.0.88), with its cuFFT and cuBLAS | ROCm 7.2.1: HIP 7.2.53211, AMD clang 22.0.0git, hipBLAS 3.2.0, rocBLAS 5.2.0, hipFFT 1.0.22, rocFFT 1.0.36 (packages for Ubuntu 24.04) |
+| CPU, OS | AMD EPYC 9454; Ubuntu 24.04.5, Linux 6.8 | AMD Ryzen 9 9950X3D, 62 GB; Ubuntu 26.04.1, Linux 7.0 |
+| compilers | GCC and gfortran 13.3.0 (also the host compiler of nvcc) | GCC and gfortran 15.2.0 |
+| CMake | 3.28.3 | 4.2.3 |
+| MPI | Open MPI 4.1.6 | Open MPI 5.0.10 |
+| BLAS/LAPACK, FFTW | OpenBLAS 0.3.26, FFTW 3.3.10 (Ubuntu packages) | OpenBLAS 0.3.32, FFTW 3.3.10 (Ubuntu packages) |
+| configuration | preset `native` with `-DRESPACK_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89` | preset `hip` with `-DCMAKE_HIP_ARCHITECTURES=gfx1200 -DRESPACK_NATIVE=ON` |
 
-Other ROCm versions and AMD GPUs have not been tested.
+Other CUDA and ROCm versions and other GPUs have not been tested.
 
-**Running:** as on NVIDIA GPUs, one MPI rank per GPU (local rank modulo device count); restrict the visible
-GPUs with `HIP_VISIBLE_DEVICES` or `ROCR_VISIBLE_DEVICES`. Consumer Radeon GPUs are weak in FP64 like the
-L40S, so keep the default single-precision FFTs (`fast_fft_sp`).
+## Running
 
-**CGEMM block length:** the HIP build uses blocks of at most 512 rows (`GPU_KC_MAX` in `gpu_api.h`) instead
-of 2048. rocBLAS accumulates the inner dimension sequentially in FP32, so the error grows about linearly with
-the block length. For SrVO₃ with double-precision FFTs, ε⁻¹ deviates from the CPU double-precision run by
-3.8×10⁻⁶ at 2048 rows, 8.4×10⁻⁷ at 512 and 2.2×10⁻⁷ at 128. The CGEMM time is 13.0 s, 16.6 s and 33.1 s. At
-512 rows the accuracy matches cuBLAS at 2048 rows.
+- **One MPI rank per GPU.** Rank n uses visible GPU n (local rank modulo device count). Restrict the visible
+  GPUs with `CUDA_VISIBLE_DEVICES` (NVIDIA) or `HIP_VISIBLE_DEVICES`/`ROCR_VISIBLE_DEVICES` (AMD).
+- **Under Slurm, start `mpirun` inside an `srun` step or batch job**, so that the visible-device variables and the
+  device cgroup confine the processes to the allocated GPUs:
 
-**Validation** (Radeon RX 9060 XT, gfx1200, 16 GB; ROCm 7.2.1; Ryzen 9 9950X3D, 1 rank × 4 threads), against the
-CPU double-precision run of the same build:
+      srun -c 8 --gres=gpu:2 env OMP_NUM_THREADS=4 mpirun -np 2 --oversubscribe --bind-to none calc_chiqw < input.in
+
+  A `mpirun` started from an `salloc` shell sees all GPUs of the node.
+- **BLAS threads:** keep `OPENBLAS_NUM_THREADS=1`.
+- **Precision:** keep the default single-precision FFTs (`fast_fft_sp`). The L40S and consumer GPUs such as the
+  Radeon RX 9060 XT are weak in FP64.
+- **Pruned forward FFTs:** after the forward FFT of a pair product, only the NG components of the ε sphere
+  are needed. The FFT runs as 1D passes: x for all lines, y only for the x columns that occur, z only for the
+  (x, y) pairs that occur. It is on automatically when it saves work; `RESPACK_GPU_PRUNE=0/1` forces it. Measured
+  on the RX 9060 XT for the SrVO₃ chain (NG = 81, 24³ grid; 5 of 24 x columns and 21 of 576 (x, y) pairs
+  needed): pair densities 15.1 → 9.8 s with single-precision FFTs and 31.3 → 19.1 s with double-precision FFTs.
+  Pruned and full FFTs agree to 1×10⁻¹² (double) and 1×10⁻⁷ (single). With a large ε sphere (NG = 1963 on
+  the same grid) there is nothing to prune. For a large cell with a small `Ecut_for_eps`, where the sphere
+  covers only about 10 % of each grid direction, the y and z passes shrink to about 15 %.
+- **ε inversion in the background:** with `flg_gpu=1`, `flg_async_eps` defaults to on (auto). The inversion of
+  ε(ω) and the output of a q point run on the CPU while the GPU computes χ⁰ of the next q point. Only the last
+  q point's inversion stays visible. Measured on an RX 9060 XT (SrVO₃, NG = 1963, 3 q points, 8 threads): the
+  run takes 116.5 s instead of 137.1 s, and the results are identical (ε⁻¹ bitwise). Set `flg_async_eps=0` to
+  switch it off.
+
+## Switches
+
+| switch | default | effect |
+|---|---|---|
+| `flg_gpu` (`&param_chiqw`) | 0 | 1: pair densities and χ⁰ products on the GPU |
+| `fast_fft_sp` (`&param_chiqw`) | −1 (auto = 1) | single-precision FFTs, CPU and GPU; 0: double precision |
+| `flg_async_eps` (`&param_chiqw`) | −1 (auto) | ε inversion and output of a q point in a background thread; auto = on with `flg_gpu=1` |
+| `fast_mem_mb` (`&param_chiqw`) | 4096 | tile budget of the CPU path |
+| `RESPACK_GPU_GEMM` | unset (CGEMM) | `fp16`: χ⁰ products on the matrix units (FP16 split, three products) |
+| `RESPACK_GPU_FP16_RN` | on where available | round-to-nearest kernel for hi·hi (NVIDIA compute capability ≥ 8.0, AMD gfx1200); 0: chunked library path |
+| `RESPACK_GPU_FP16_CHUNK` | 512 | K chunk of the chunked library path |
+| `RESPACK_GPU_FP16_TERMS` | 3 | `2x`, `2y`: drop one correction product (faster, 10–30× less accurate; exploratory runs only) |
+| `RESPACK_GPU_FP16_PAD` | 8 | the G dimension of the FP16 operands is padded to a multiple of this |
+| `RESPACK_GPU_KC` | 2048 (CUDA CGEMM), 512 (HIP CGEMM), 8192 (FP16) | GEMM block length in rows; for testing only |
+| `RESPACK_GPU_TILE_MB` | auto | tile budget in MB (default: 60 % of the device memory left after χ and 2 GB of buffers) |
+| `RESPACK_GPU_MEM_MB` | device memory | caps the device memory assumed for the tile size |
+| `RESPACK_GPU_ROT` | auto | wave-function rotation on the GPU; 0: on the CPU |
+| `RESPACK_GPU_FUSEX` | 1 | 0: separate pair products and x pass instead of `k_prodx4` |
+| `RESPACK_GPU_PRODX_Q` | auto | Q of the two-stage x DFT in `k_prodx4`; 1: direct DFT |
+| `RESPACK_GPU_PRUNE` | auto (when the y and z passes are below 1.6 full passes) | 0/1: pruned forward FFTs on the GPU off/on |
+| `RESPACK_GPU_FBATCH` | auto (about 256 MB of grids) | number of FFT grids per batched FFT call |
+
+The `RESPACK_*` switches are environment variables of `calc_chiqw`. Build options: `RESPACK_CUDA`, `RESPACK_HIP`,
+`RESPACK_HIP_FP16_RN` (default ON); presets `native`/`default` (with `-DRESPACK_CUDA=ON`) and `hip`.
+
+## Validation (GPU vs CPU double precision)
+
+The tables are for the default CGEMM path; the FP16 path is validated in its own section below. All runs are
+compared with a CPU double-precision run of the same build. The method's own rounding level (tetrahedron
+formulas, original code −O2 vs −O3) is 7×10⁻⁵.
+
+### NVIDIA L40S (CUDA 13.0)
+
+| test | ε⁻¹ (all q) | U(ω), J(ω) | static U, U′, J |
+|---|---|---|---|
+| SrVO₃ cRPA, 1 GPU, `fast_fft_sp=0` | 4.1×10⁻⁷ | ≤ 1×10⁻⁵ eV | identical |
+| SrVO₃ cRPA, 2 GPUs (2 ranks), `fast_fft_sp=0` | 1.5×10⁻⁷ | ≤ 1×10⁻⁵ eV | identical |
+| Si cRPA, 1 GPU, `fast_fft_sp=0` | 2.0×10⁻⁷ | ≤ 1×10⁻⁵ eV | identical |
+| SrVO₃ cRPA, 1 GPU, single-precision FFTs (default) | 4.0×10⁻⁶ | ≤ 6×10⁻⁵ eV | identical |
+| Si cRPA, 1 GPU, single-precision FFTs (default) | 4.4×10⁻⁷ | ≤ 1×10⁻⁵ eV | identical |
+
+**CGEMM block length (CUDA):** the block length matters. For SrVO₃ at NG = 583 (q = 2), ε⁻¹ deviates by
+6.9×10⁻⁶ with 7992 rows, 1.9×10⁻⁶ with 3888 and 4.7×10⁻⁷ with 2048 (the default), at 8 % extra CGEMM time.
+`RESPACK_GPU_KC` overrides it, for testing only.
+
+### AMD Radeon RX 9060 XT (ROCm 7.2.1; Ryzen 9 9950X3D, 1 rank × 4 threads)
 
 | test | ε⁻¹ (all q) | U(ω), J(ω) | static U, U′, J |
 |---|---|---|---|
@@ -115,9 +209,39 @@ LTO" in [README-zen-opt.md](README-zen-opt.md#build)). With `-fcx-fortran-rules`
 amplify ordinary code-generation differences. It is below the method's rounding level of 7×10⁻⁵. The static
 U, U′, J agree to all printed digits.
 
-The test machine was also running another job on 16 cores, so the timings above are not a benchmark.
+The test machine was also running another job on 16 cores, so its timings in this section are not a benchmark.
+
+**CGEMM block length (HIP):** the HIP build uses blocks of at most 512 rows (`GPU_KC_MAX` in `gpu_api.h`) instead
+of 2048. rocBLAS accumulates the inner dimension sequentially in FP32, so the error grows about linearly with
+the block length. For SrVO₃ with double-precision FFTs, ε⁻¹ deviates from the CPU double-precision run by
+3.8×10⁻⁶ at 2048 rows, 8.4×10⁻⁷ at 512 and 2.2×10⁻⁷ at 128. The CGEMM time is 13.0 s, 16.6 s and 33.1 s. At
+512 rows the accuracy matches cuBLAS at 2048 rows.
+
+## Performance (SrVO₃, `Ecut_for_eps` = 20 Ry, NG = 583, one q, 805 pairs, 216 k, 70 ω; 8 cores per run)
+
+| | χ⁰ products | total `calc_chiqw` |
+|---|---|---|
+| CPU double precision (EPYC 9454, 8 cores) | 182 s | 205 s |
+| CPU `fast_gemm_sp=1` | 91 s | 112 s |
+| 1 × L40S | 1.2 s | 18 s |
+
+Nsight Systems kernel times on the L40S:
+
+| | CGEMM | FFT kernels | other kernels | GPU busy, share of wall time |
+|---|---|---|---|---|
+| double-precision FFTs | 1.05 s | 0.48 s | 0.14 s | 1.67 s of 17.6 s |
+| `fast_fft_sp=1` | 1.09 s | 0.16 s | 0.15 s | 1.39 s |
+
+CGEMM runs at about 31 TFlop/s. At this size the run is dominated by CPU work: setup, wave-function rotation,
+tetrahedron weights, ε inversion and output. For large systems the GPU share grows strongly, because
+CGEMM ∝ NG²·N_k·N_pair·N_ω and the FFTs ∝ N_pair·N_k·N_grid.
+
+For a large system see “Large systems” below.
 
 ## χ⁰ products on the matrix units: FP16 split (experimental, `RESPACK_GPU_GEMM=fp16`)
+
+Available in the CUDA and the HIP build. It was developed on the RX 9060 XT; the results on the L40S are in
+the subsection “On NVIDIA GPUs (L40S)”.
 
 **Motivation.** On the RX 9060 XT the CGEMM reaches only 5–6 TFLOP/s. RDNA4's matrix units (WMMA) do not
 support FP32, but they run FP16 or BF16 inputs with FP32 accumulation about 10× faster. A GEMM microbenchmark
@@ -261,7 +385,7 @@ the installed library and patched in its assembly (`local-tools/tensile-patch/`)
   default ON).
 - **Runtime.** The kernel is used on gfx1200 devices with NG ≥ 16 (the library kernel faults for M < 8).
   `RESPACK_GPU_FP16_RN=0` selects the chunked hipBLAS path, which other AMD GPUs use. The CUDA build has its own
-  kernel (see “FP16 split on the L40S”).
+  kernel (see “On NVIDIA GPUs (L40S)”).
 - **Corrections.** These stay with hipBLAS. The best library kernel would be 3 % faster for them, not worth a
   second embedded kernel.
 
@@ -302,7 +426,7 @@ multiple of 8 (`RESPACK_GPU_FP16_PAD`, default 8; padding rows are not written a
 - **RX 9060 XT.** The corrections call takes 8.5 instead of 9.9 ms per block and frequency, and the χ⁰ products
   7 % less time; ε⁻¹ is unchanged.
 
-## FP16 split on the L40S (CUDA build)
+### On NVIDIA GPUs (L40S)
 
 The same switch (`RESPACK_GPU_GEMM=fp16`) on an L40S. CUDA 13.0, one GPU, 8 cores of an EPYC 9454; the CUDA
 versions of `accerr.cpp` and `gemmbench.cpp` build with `-DTOOLS_CUDA` (`local-tools/hip2cuda.h`).
@@ -536,26 +660,31 @@ dominate at 5 Ry. The larger levers are:
 - **Fewer frequencies in the χ⁰ products:** a spectral (Hilbert-transform) representation. Each transition
   contributes to a few energy bins instead of all 70 frequencies, with real weights. This changes the method
   and would need validation against the original code.
+- **ε inversion on the GPU** (cuSOLVER/rocSOLVER). It runs on the CPU, in the background while the GPU computes the
+  next q; this only pays off if the CPU becomes the limit.
 
 ## Modified files (GPLv3 §5a; modifications by Daniel Guterding, November 2026)
 
-In addition to those listed in [README-zen-opt.md](README-zen-opt.md) and [README-gpu-cuda.md](README-gpu-cuda.md):
+In addition to those listed in [README-zen-opt.md](README-zen-opt.md):
 
 | file | status | change |
 |---|---|---|
+| `src/chiqw/chi_gpu.cu` | new | GPU part of the band-pair loop: wave-function cache and rotation (`k_rotscatter`), bands on the FFT grid, fused pair products and x pass (`k_prodx4`), batched and pruned FFTs, gather of the ε sphere, CGEMM blocks or FP16 split into a double-precision χ on the GPU, q = 0 head/wing terms, device-memory query |
+| `src/chiqw/chi_gpu_stub.c` | new | stubs for builds without a GPU (`flg_gpu=1` then stops with a message) |
 | `src/chiqw/gpu_api.h` | new | maps the CUDA names in `chi_gpu.cu` onto HIP/hipFFT/hipBLAS for the ROCm build |
-| `src/chiqw/hgemm_rn.cuh` | new | FP16 GEMM with round-to-nearest accumulation for NVIDIA GPUs (sm_80 and newer) |
+| `src/chiqw/hgemm_rn.cuh` | new | FP16 GEMM with round-to-nearest accumulation for NVIDIA GPUs (compute capability ≥ 8.0) |
 | `src/chiqw/fp16_rn/` | new | FP16 GEMM kernel with round-to-nearest accumulation for gfx1200 (patched hipBLASLt kernel, MIT License: `LICENSE-hipBLASLt.txt`), embedding (`fp16_rn_blob.c`) |
-| `src/chiqw/chi_gpu.cu`, `chi_gpu_stub.c` | modified | HIP build; FP16 split; padding; fused `k_prodx4` with two-stage x DFT; single-precision uploads; rotation on the GPU (`k_rotscatter`, per-tile cache); device-memory query; row ranges for the sub-blocks |
-| `src/chiqw/chi_fast.f90` | modified | GPU tile size from the device memory; tetrahedron weights in sub-blocks overlapped with the χ⁰ products; single-precision uploads; choice between CPU and GPU rotation |
-| `CMakeLists.txt`, `CMakePresets.json`, `src/chiqw/CMakeLists.txt` | modified | option `RESPACK_HIP` and preset `hip`; assembly and embedding of the gfx1200 kernel (`RESPACK_HIP_FP16_RN`) |
+| `src/chiqw/chi_fast.f90` | modified | GPU branch of the pair densities and the χ⁰ products (`use_gpu`); GPU tile size from the device memory; tetrahedron weights in sub-blocks overlapped with the χ⁰ products; single-precision uploads; choice between CPU and GPU rotation |
+| `src/chiqw/chiqw.F`, `m_rdinput.f90` | modified | input `flg_gpu`; `flg_async_eps` auto = on with the GPU |
+| `CMakeLists.txt`, `CMakePresets.json`, `src/chiqw/CMakeLists.txt` | modified | options `RESPACK_CUDA` (cuFFT, cuBLAS; default architectures `all-major`) and `RESPACK_HIP` (preset `hip`); assembly and embedding of the gfx1200 kernel (`RESPACK_HIP_FP16_RN`) |
 
 ## Tools
 
-In addition to those listed in [README-zen-opt.md](README-zen-opt.md#tools) and [README-gpu-cuda.md](README-gpu-cuda.md#tools):
+In addition to those listed in [README-zen-opt.md](README-zen-opt.md#tools):
 
 | file | purpose |
 |---|---|
+| `local-tools/run_chain_cmp.sh` | full chain with extra `&param_chiqw` entries (e.g. `flg_gpu=1`) vs a reference run (also under Slurm) |
 | `local-tools/accerr.cpp`, `gemmbench.cpp`, `mpbench.cpp` | accumulation error of GEMM paths against an exact reference; GEMM rates for the χ⁰ shapes; one block and frequency of the FP16 path (HIP, or CUDA with `-DTOOLS_CUDA` and `hip2cuda.h`) |
 | `local-tools/hgemm_rn_test.cu` | accuracy, edge cases and sustained timing of `hgemm_rn.cuh` (CUDA) |
 | `local-tools/tensile-patch/` | extract, reassemble, patch, check and time hipBLASLt's FP16 kernels (see its README) |
