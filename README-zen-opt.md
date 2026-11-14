@@ -49,6 +49,26 @@ The fork computes the same quantity this way:
 `fast_mem_mb` (default 4096) is the memory budget for one tile of pair densities and weights. A larger
 budget means larger tiles and fewer backward FFTs.
 
+7. **Pruned forward FFTs.** Of each pair product only the NG components of the ε sphere are needed. The forward
+   transform is done as:
+   - x pass over all lines;
+   - gather of the needed x columns (y contiguous), then the y pass;
+   - gather of the needed (x, y) pairs (z contiguous), then the z pass.
+
+   This is used when the y and z passes are below 1.6 full passes (`RESPACK_CPU_PRUNE=0/1` forces it). Results
+   are unchanged (Si bitwise, SrVO₃ 1×10⁻¹⁵). SrVO₃ (`Ecut_for_eps` 5 Ry, all q): pair densities 45.7 s
+   instead of 58.9 s, χ⁰ total 139.8 s instead of 152.6 s.
+8. **Single-precision wave functions (`fast_wfn_sp=1`).** The wave functions are stored as complex(4), which
+   halves their memory; rotation and everything after it stay in double precision. Default −1 (auto) means
+   double precision on the CPU. ε⁻¹ deviates by 7×10⁻⁸ (Si) and 2×10⁻⁸ (SrVO₃), U(ω), J(ω) by at most 1×10⁻⁵ eV.
+   `RESPACK_WFN_DP=1` forces double precision.
+9. **One rank per q group (`MPI_num_qcomm` = number of ranks).**
+   - The band ring exchange within a q group is skipped. With one rank it only copied all virtual bands to the
+     rank itself, through a full-size buffer; that saves one complete copy of the virtual bands.
+   - The broadcast of the wave functions across q groups is skipped, since every rank has read them itself.
+   - With `fast_wfn_sp=1`, the ranks of a node share one copy of the wave functions (MPI-3 shared memory,
+     `m_wfn_shared`; `RESPACK_WFN_SHARED=0` gives private copies). Only node rank 0 reads them.
+
 ### `calc_w3d` / `calc_j3d` (`m_int_fast`)
 
 - **Cached real-space functions.** u_{w,k}(r) of all Wannier-gauge Bloch functions are transformed once and
@@ -67,8 +87,9 @@ budget means larger tiles and fewer backward FFTs.
 | `src/chiqw/m_tetrahedron_fast.F` | new (derived from `m_tetrahedron_20170325.F`) | vectorised log ratios, fused ± pass, fused normal tetrahedra |
 | `src/chiqw/chiqw_sub.F` | modified | new `make_C0_map` (per-k rotation map; `make_C0` unchanged) |
 | `src/chiqw/eps_async.f90`, `thread_util.c` | new | module `m_eps_async` (q ≠ 0 post-processing, background thread via pthreads) |
-| `src/chiqw/chiqw.F` | modified | calls `m_chi_fast` for `flg_fast=1`, original loops kept for `flg_fast=0`; frequency loops of the ε inversion parallel (OpenMP) |
-| `src/chiqw/m_rdinput.f90` | modified | inputs `flg_fast`, `fast_mem_mb`, `flg_async_eps` |
+| `src/chiqw/wfn_shared.f90` | new | module `m_wfn_shared` (wave functions shared by the ranks of a node, MPI-3 shared memory) |
+| `src/chiqw/chiqw.F`, `config.h` | modified | calls `m_chi_fast` for `flg_fast=1`, original loops kept for `flg_fast=0`; frequency loops of the ε inversion parallel (OpenMP); single-precision wave functions (`fast_wfn_sp`), shared on the node; no band ring exchange with one rank per q group |
+| `src/chiqw/m_rdinput.f90` | modified | inputs `flg_fast`, `fast_mem_mb`, `flg_async_eps`, `fast_wfn_sp` |
 | `src/chiqw/CMakeLists.txt` | modified | FFTW3, new sources |
 | `src/calc_int/int_fast.f90` | new | module `m_int_fast` |
 | `src/calc_int/calc_intW.F`, `calc_intJ.F` | modified | call `m_int_fast` for `flg_fast=1`; original loops kept; exp(−iq·R) table in `calc_intW.F` |
