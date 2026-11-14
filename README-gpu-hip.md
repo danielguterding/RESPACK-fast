@@ -41,17 +41,53 @@ cuComplex names one-to-one onto the HIP runtime, hipFFT (rocFFT) and hipBLAS (ro
 precision model and all switches (`flg_gpu`, `fast_fft_sp`, `fast_mem_mb`, `RESPACK_GPU_KC`) are the same as
 on NVIDIA GPUs. The kernels use no warp-level operations, so the wavefront size (32 or 64) does not matter.
 
-**Build** (ROCm ≥ 6 with hipFFT and hipBLAS, CMake ≥ 3.21):
+**Requirements**, in addition to those of the CPU build ([README-zen-opt.md](README-zen-opt.md#build)):
+- **ROCm** with HIP, hipFFT (rocFFT) and hipBLAS (rocBLAS), including their CMake package files. Tested only
+  with ROCm 7.2.1. The code uses the hipBLAS v2 API (`HIPBLAS_V2`, the default from ROCm 7.0); ROCm 6.x has
+  not been tested.
+- **For the FP16 round-to-nearest kernel on gfx1200:** `llvm-mc` and `ld.lld` from ROCm's LLVM
+  (`$ROCM_PATH/llvm/bin`). The kernel source was taken from the hipBLASLt of ROCm 7.2.1; it is assembled at build
+  time, and hipBLASLt itself is not needed for it.
+- **CMake** ≥ 3.21 (HIP language).
+- **GPU access** at run time: the user must be in the groups `render` and `video`.
 
+**Configure and build:**
+
+    git clone -b gpu-hip https://github.com/danielguterding/RESPACK-fast.git && cd RESPACK-fast
     cmake --preset hip -B build/hip -DCMAKE_HIP_ARCHITECTURES=gfx1200   # e.g. gfx1200 = RX 9060/9070, gfx942 = MI300
     cmake --build build/hip -j
+    cmake --install build/hip --prefix $HOME/.local/respack-gpu     # optional
 
-Without `CMAKE_HIP_ARCHITECTURES`, CMake builds for the GPU(s) of the build machine. ROCm is looked up in
-`ROCM_PATH` (CMake or environment variable), default `/opt/rocm`. `RESPACK_CUDA` and `RESPACK_HIP` are
-mutually exclusive.
+- Without `CMAKE_HIP_ARCHITECTURES`, CMake builds for the GPU(s) of the build machine.
+- ROCm is looked up in `ROCM_PATH` (CMake or environment variable), default `/opt/rocm`.
+- The configure step prints `-- HIP: <clang version>, architectures gfx1200, ROCm /opt/rocm`.
+- `RESPACK_CUDA` and `RESPACK_HIP` are mutually exclusive. The CUDA build of this branch is the same as
+  for `gpu-cuda` ([README-gpu-cuda.md](README-gpu-cuda.md#build)).
+- For gfx1200, the build also assembles the FP16 round-to-nearest GEMM kernel (`src/chiqw/fp16_rn/`, used with
+  `RESPACK_GPU_GEMM=fp16`). `-DRESPACK_HIP_FP16_RN=OFF` leaves it out.
 
-For gfx1200, the build also assembles the FP16 round-to-nearest GEMM kernel (`src/chiqw/fp16_rn/`, used with
-`RESPACK_GPU_GEMM=fp16`) with ROCm's `llvm-mc` and `ld.lld`. `-DRESPACK_HIP_FP16_RN=OFF` leaves it out.
+**Check the build** on a machine with the GPU:
+- With `flg_gpu=1`, the log of `calc_chiqw` names the device, e.g.
+  `chi_gpu: local rank 0 -> device 0 (AMD Radeon RX 9060 XT, 15.9 GB), grid …, single-precision FFTs`.
+- With `RESPACK_GPU_GEMM=fp16` on gfx1200 the next line ends in `hi*hi in one call with round-to-nearest
+  accumulation (gfx1200 kernel; experimental)`. If it says `hi*hi in K chunks of 512` instead, the embedded
+  kernel is not used.
+- `local-tools/run_chain_cmp.sh` compares a full GPU chain with a CPU run (see README-gpu-cuda.md).
+
+**Tested with:**
+
+| | AMD (HIP build) | NVIDIA (CUDA build of this branch) |
+|---|---|---|
+| GPU | Radeon RX 9060 XT (gfx1200, 16 GB) | L40S, see [README-gpu-cuda.md](README-gpu-cuda.md#build) |
+| GPU software | ROCm 7.2.1: HIP 7.2.53211, AMD clang 22.0.0git, hipBLAS 3.2.0, rocBLAS 5.2.0, hipFFT 1.0.22, rocFFT 1.0.36 (packages for Ubuntu 24.04); in-kernel `amdgpu` driver | CUDA 13.0, driver 580.82.07 |
+| CPU, OS | AMD Ryzen 9 9950X3D, 62 GB; Ubuntu 26.04.1, Linux 7.0 | AMD EPYC 9454; Ubuntu 24.04.5 |
+| compilers | GCC and gfortran 15.2.0 | GCC and gfortran 13.3.0 |
+| CMake | 4.2.3 | 3.28.3 |
+| MPI | Open MPI 5.0.10 | Open MPI 4.1.6 |
+| BLAS/LAPACK, FFTW | OpenBLAS 0.3.32, FFTW 3.3.10 (Ubuntu packages) | OpenBLAS 0.3.26, FFTW 3.3.10 |
+| configuration | preset `hip` with `-DCMAKE_HIP_ARCHITECTURES=gfx1200 -DRESPACK_NATIVE=ON` | preset `native` with `-DRESPACK_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89` |
+
+Other ROCm versions and AMD GPUs have not been tested.
 
 **Running:** as on NVIDIA GPUs, one MPI rank per GPU (local rank modulo device count); restrict the visible
 GPUs with `HIP_VISIBLE_DEVICES` or `ROCR_VISIBLE_DEVICES`. Consumer Radeon GPUs are weak in FP64 like the
