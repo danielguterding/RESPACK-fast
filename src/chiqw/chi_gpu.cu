@@ -60,7 +60,11 @@ typedef cuComplex cc;
 typedef __half hf;
 
 static struct {
-  int init, dev, verbose, sync_up;
+  int init, dev, verbose;
+  int integ;                     // integrated GPU (APU, shares the system memory)
+  int upl;                       // uploads from host memory: 0 asynchronous, 1 each one waited for, 2 via pinned staging
+  int overlap;                   // integrated GPUs: tetrahedron weights overlap the pair densities (chi_gpu_overlap)
+  char *stg; size_t stg_cap, stg_off;   // pinned staging buffer of the uploads (upl = 2)
   int n1, n2, n3, fbatch;
   size_t ngrid;
   int fft_sp;                    // fast_fft_sp=1: single-precision FFTs/products (C2C)
@@ -146,20 +150,62 @@ static int ensure(T **p, size_t *cap, size_t n) {
   return 0;
 }
 
-// Uploads from host memory. On integrated AMD GPUs (g.sync_up, see chi_gpu_init) each copy has completed before
-// the next one is issued: with ROCm 7.2.0 on a Radeon 680M (gfx1035, run as gfx1030), back-to-back
-// hipMemcpyAsync copies from pageable host memory sometimes arrived with data of the preceding copy (copies from
-// pinned memory were not affected); the GPU then read corrupted scatter indices in k_rotscatter and faulted.
-// Every API function below synchronizes the stream before it returns and no upload overlaps with running GPU
-// work, so the extra waits cost nothing. Discrete GPUs keep the plain asynchronous copies.
+// Stream synchronization; all copies issued before it have completed, so the staging buffer is free again.
+static int stream_sync() {
+  CK(cudaStreamSynchronize(g.st));
+  g.stg_off = 0;
+  return 0;
+}
+#define SYNC() do { if (stream_sync()) return -1; } while (0)
+
+// Uploads from host memory. With ROCm 7.2.0 on a Radeon 680M (gfx1035), back-to-back hipMemcpyAsync copies from
+// pageable host memory sometimes arrived with data of the preceding copy (copies from pinned memory were not
+// affected); the GPU then read corrupted scatter indices in k_rotscatter and faulted. On integrated GPUs the
+// uploads therefore go through a pinned staging buffer (g.upl = 2, default there): the data are copied into it on
+// the host and transferred from there asynchronously. The buffer is reset at every stream synchronization; when it
+// is full, the stream is synchronized first. The source may be reused as soon as h2d returns.
+// Discrete GPUs: direct asynchronous copies (g.upl = 0). Integrated GPUs: RESPACK_GPU_UPLOADS=staged (default) or
+// sync (g.upl = 1: wait for each upload; slower). See chi_gpu_init.
+static char *stg_get(size_t n) {
+  n = (n + 255) & ~(size_t)255;
+  if (g.stg_off + n > g.stg_cap) {
+    if (stream_sync()) return NULL;
+    if (n > g.stg_cap) {
+      if (g.stg) (void)cudaFreeHost(g.stg);
+      size_t cap = n > ((size_t)64 << 20) ? n : ((size_t)64 << 20);
+      g.stg = NULL; g.stg_cap = 0;
+      if (cudaHostAlloc((void **)&g.stg, cap, 0) != cudaSuccess) {
+        fprintf(stderr, "chi_gpu: cannot allocate %zu MB of pinned host memory\n", cap >> 20);
+        return NULL;
+      }
+      g.stg_cap = cap;
+    }
+  }
+  char *p = g.stg + g.stg_off;
+  g.stg_off += n;
+  return p;
+}
 static int h2d(void *dst, const void *src, size_t n) {
+  if (g.upl == 2) {
+    char *p = stg_get(n);
+    if (!p) return -1;
+    memcpy(p, src, n);
+    src = p;
+  }
   CK(cudaMemcpyAsync(dst, src, n, cudaMemcpyHostToDevice, g.st));
-  if (g.sync_up) CK(cudaStreamSynchronize(g.st));
+  if (g.upl == 1) SYNC();
   return 0;
 }
 static int h2d_2d(void *dst, size_t dpitch, const void *src, size_t spitch, size_t width, size_t height) {
+  if (g.upl == 2) {
+    char *p = stg_get(width * height);
+    if (!p) return -1;
+    for (size_t r = 0; r < height; r++) memcpy(p + r * width, (const char *)src + r * spitch, width);
+    src = p;
+    spitch = width;
+  }
   CK(cudaMemcpy2DAsync(dst, dpitch, src, spitch, width, height, cudaMemcpyHostToDevice, g.st));
-  if (g.sync_up) CK(cudaStreamSynchronize(g.st));
+  if (g.upl == 1) SYNC();
   return 0;
 }
 
@@ -205,7 +251,7 @@ static int get_plan1(int len, int batch, int sp, cufftHandle *h) {
   for (int i = 0; i < np1cache; i++)
     if (p1cache[i].len == len && p1cache[i].batch == batch && p1cache[i].sp == sp) { *h = p1cache[i].h; return 0; }
   if (np1cache == 64) {   // all queued work must be done before the plans are destroyed
-    CK(cudaStreamSynchronize(g.st));
+    SYNC();
     for (int i = 0; i < np1cache; i++) CF(cufftDestroy(p1cache[i].h));
     np1cache = 0;
   }
@@ -338,8 +384,9 @@ __global__ void k_scatter4(size_t n, int ncoef, const zc *__restrict__ coef, con
 // Q = 1 is the direct DFT (nsx n1 per line); exact twiddles from one table of n1 roots.
 #define PRODX_T 128
 #define PRODX_G 4      // groups of threads per line (PRODX_T / lpb = PRODX_G with lpb = 32)
-#define PRODX_ACC 8    // frequencies per thread and pass
+#define PRODX_ACC 8    // frequencies per thread and pass (template parameter ACC; integrated GPUs: just enough for nsx)
 #define PRODX_QMAX 16  // largest stage-1 length
+template <int ACC>
 __global__ void __launch_bounds__(PRODX_T)
 k_prodx4(int p0, const int *__restrict__ pj, const int *__restrict__ pi, const cc *__restrict__ u, int ubJ, int ubI,
          size_t ngrid, int n1, int n2, int n3, int nsx, const int *__restrict__ sxl, const cc *__restrict__ twx, int Q,
@@ -391,11 +438,11 @@ k_prodx4(int p0, const int *__restrict__ pj, const int *__restrict__ pi, const c
   const int L = l0 + l, y = L % n2, z = L / n2;
   const size_t per = (size_t)nsx * n2 * n3;
   cc *Bb = B + (size_t)b * per + y + (size_t)n2 * (size_t)nsx * z;
-  for (int s0 = g; s0 < nsx; s0 += PRODX_G * PRODX_ACC) {   // stage 2
-    int k[PRODX_ACC], idx[PRODX_ACC], ro[PRODX_ACC];
-    float ar[PRODX_ACC], ai[PRODX_ACC];
+  for (int s0 = g; s0 < nsx; s0 += PRODX_G * ACC) {   // stage 2
+    int k[ACC], idx[ACC], ro[ACC];
+    float ar[ACC], ai[ACC];
 #pragma unroll
-    for (int j = 0; j < PRODX_ACC; j++) {
+    for (int j = 0; j < ACC; j++) {
       const int sj = s0 + PRODX_G * j;
       k[j] = sj < nsx ? sxl[sj] : 0;
       ro[j] = P * (k[j] % Q);
@@ -403,7 +450,7 @@ k_prodx4(int p0, const int *__restrict__ pj, const int *__restrict__ pi, const c
     }
     for (int pp = 0; pp < P; pp++) {
 #pragma unroll
-      for (int j = 0; j < PRODX_ACC; j++) {
+      for (int j = 0; j < ACC; j++) {
         const cc v = fl[pp + ro[j]];
         const cc w = tw[idx[j]];
         ar[j] = fmaf(v.x, w.x, fmaf(-v.y, w.y, ar[j]));
@@ -413,12 +460,13 @@ k_prodx4(int p0, const int *__restrict__ pj, const int *__restrict__ pi, const c
       }
     }
 #pragma unroll
-    for (int j = 0; j < PRODX_ACC; j++) {
+    for (int j = 0; j < ACC; j++) {
       const int sj = s0 + PRODX_G * j;
       if (sj < nsx) Bb[(size_t)n2 * sj] = make_cuComplex(ar[j], ai[j]);
     }
   }
 }
+
 
 __global__ void k_products4(size_t n, size_t ngrid, int p0, const int *__restrict__ pj, const int *__restrict__ pi,
                             const cc *__restrict__ u, int ubJ, int ubI, cc *__restrict__ f) {
@@ -595,13 +643,31 @@ extern "C" int chi_gpu_init(int n1, int n2, int n3, int fbatch, int verbose, int
   if (ndev < 1) { fprintf(stderr, "chi_gpu: no " GPU_RT_NAME " device\n"); return -10; }
   g.dev = local_rank() % ndev;
   CK(cudaSetDevice(g.dev));
-  {   // integrated AMD GPU (APU): wait for each upload, see h2d(); RESPACK_GPU_SYNC_UPLOADS=0/1 overrides
-    int integ = 0;
+  {   // integrated AMD GPU (APU): staged uploads (see h2d) and overlap of the pair densities with the tetrahedron
+      // weights (chi_gpu_overlap). Only the validated combinations are accepted:
+      //   integrated GPUs: RESPACK_GPU_UPLOADS=staged (default) or sync (asynchronous copies from pageable memory
+      //                    are not safe there with ROCm 7.2.0); RESPACK_GPU_OVERLAP=1 (default) or 0
+      //   discrete GPUs:   direct asynchronous uploads, no overlap; both variables are ignored
+    g.integ = 0;
 #ifdef RESPACK_HIP
-    CK(hipDeviceGetAttribute(&integ, hipDeviceAttributeIntegrated, g.dev));
+    CK(hipDeviceGetAttribute(&g.integ, hipDeviceAttributeIntegrated, g.dev));
 #endif
-    const char *e = getenv("RESPACK_GPU_SYNC_UPLOADS");
-    g.sync_up = (e && *e) ? (atoi(e) != 0) : (integ != 0);
+    const char *eu = getenv("RESPACK_GPU_UPLOADS"), *eo = getenv("RESPACK_GPU_OVERLAP");
+    if (g.integ) {
+      g.upl = 2;
+      if (eu && strcmp(eu, "sync") == 0) g.upl = 1;
+      else if (eu && *eu && strcmp(eu, "staged") != 0)
+        fprintf(stderr, "chi_gpu: RESPACK_GPU_UPLOADS=%s is not used on integrated GPUs (async copies from pageable"
+                        " memory are not safe there); staged uploads\n", eu);
+      g.overlap = (eo && *eo) ? (atoi(eo) != 0) : 1;
+    } else {
+      g.upl = 0;
+      g.overlap = 0;
+      if (eu && *eu && strcmp(eu, "async") != 0)
+        fprintf(stderr, "chi_gpu: RESPACK_GPU_UPLOADS=%s is ignored on discrete GPUs (asynchronous uploads)\n", eu);
+      if (eo && *eo && atoi(eo) != 0)
+        fprintf(stderr, "chi_gpu: RESPACK_GPU_OVERLAP=%s is ignored on discrete GPUs (no overlap)\n", eo);
+    }
   }
   g.n1 = n1; g.n2 = n2; g.n3 = n3;
   {   // twiddles of the fused x pass (exact: computed in double precision, rounded once)
@@ -696,7 +762,11 @@ extern "C" int chi_gpu_init(int n1, int n2, int n3, int fbatch, int verbose, int
     CK(cudaGetDeviceProperties(&pr, g.dev));
     printf(" chi_gpu: local rank %d -> device %d (%s, %.1f GB), grid %d %d %d, FFT batch %d, %s FFTs\n", local_rank(),
            g.dev, pr.name, pr.totalGlobalMem / 1073741824.0, n1, n2, n3, g.fbatch, fft_sp ? "single-precision" : "double-precision");
-    if (g.sync_up) printf(" chi_gpu: uploads from host memory one at a time (integrated GPU; RESPACK_GPU_SYNC_UPLOADS=0 turns this off)\n");
+    if (g.upl)
+      printf(" chi_gpu: uploads from host memory %s%s\n", g.upl == 2 ? "via pinned staging" : "one at a time",
+             g.integ ? " (integrated GPU)" : "");
+    if (g.overlap)
+      printf(" chi_gpu: tetrahedron weights overlap the pair densities%s\n", g.integ ? " (integrated GPU)" : "");
 #ifdef RESPACK_HIP
     if (g.fused)
       printf(" chi_gpu: chi products with the fused RDNA2 kernel (no BLAS; FP32 blocks of %d rows added to the"
@@ -824,7 +894,7 @@ extern "C" int chi_gpu_tile_begin(int rows, int nu, int np, const int *pj, const
   if (ensure(&g.pj, &g.pj_cap, (size_t)np)) return -1;
   if (ensure(&g.pi, &g.pi_cap, (size_t)np)) return -1;
   if (h2d(g.pj, pj, np * sizeof(int)) || h2d(g.pi, pi, np * sizeof(int))) return -1;
-  CK(cudaStreamSynchronize(g.st));
+  SYNC();
   return 0;
 }
 
@@ -850,8 +920,8 @@ extern "C" int chi_gpu_bands(int nb, int ldc, const zc *coef, int ncoef, const i
     CK(cudaGetLastError());
     if (fft_many(u0, nb, 0, CUFFT_INVERSE)) return -2;   // batched backward FFTs of the bands
   }
-  // the host buffers (coef, idx) are reused by the caller for the next call
-  CK(cudaStreamSynchronize(g.st));
+  // the host buffers (coef, idx) are reused by the caller for the next call (staged uploads: already copied)
+  if (g.upl != 2) SYNC();
   return 0;
 }
 
@@ -871,8 +941,8 @@ extern "C" int chi_gpu_bands_sp(int nb, int ldc, const cc *coef, int ncoef, cons
   k_scatter4s<<<grid1(n), 256, 0, g.st>>>(n, ncoef, g.coef4, g.idx, u0, g.ngrid);
   CK(cudaGetLastError());
   if (fft_many(u0, nb, 1, CUFFT_INVERSE)) return -2;
-  // the host buffers (coef, idx) are reused by the caller for the next call
-  CK(cudaStreamSynchronize(g.st));
+  // the host buffers (coef, idx) are reused by the caller for the next call (staged uploads: already copied)
+  if (g.upl != 2) SYNC();
   return 0;
 }
 
@@ -920,8 +990,9 @@ extern "C" int chi_gpu_bands_rot(int nb, int slot0, int ikr, int ncoef, const in
     CK(cudaGetLastError());
   }
   if (fft_many(u0, nb, 1, CUFFT_INVERSE)) return -2;
-  // the host buffers (jmap, pmap, idx) are reused by the caller for the next k point
-  CK(cudaStreamSynchronize(g.st));
+  // the host buffers (jmap, pmap, idx) are reused by the caller for the next k point (staged uploads: already
+  // copied)
+  if (g.upl != 2) SYNC();
   return 0;
 }
 
@@ -948,8 +1019,19 @@ extern "C" int chi_gpu_pairs(int ik0, int NTK, int ubJ, int ubI, double scl) {
         const int lpb = PRODX_T / PRODX_G;
         const dim3 grd(m, (n2 * n3 + lpb - 1) / lpb);
         const size_t shm = (size_t)(lpb * (n1 + 1) + n1) * sizeof(cc);
-        k_prodx4<<<grd, PRODX_T, shm, g.st>>>(p0, g.pj, g.pi, g.u4, ubJ, ubI, g.ngrid, n1, n2, n3, nsx, g.sxl, g.twx,
-                                              g.prodq, (cc *)g.Bp);
+        // stage 2 computes ACC output frequencies per thread and pass: 8 (all GPUs); on integrated GPUs just enough
+        // for the nsx frequencies (one pass), since the unused accumulators cost as much as the used ones
+        int acc = PRODX_ACC;
+        if (g.integ) {
+          const int need = (nsx + PRODX_G - 1) / PRODX_G;
+          acc = need <= 1 ? 1 : need <= 2 ? 2 : need <= 4 ? 4 : PRODX_ACC;
+        }
+        switch (acc) {
+          case 1: k_prodx4<1><<<grd, PRODX_T, shm, g.st>>>(p0, g.pj, g.pi, g.u4, ubJ, ubI, g.ngrid, n1, n2, n3, nsx, g.sxl, g.twx, g.prodq, (cc *)g.Bp); break;
+          case 2: k_prodx4<2><<<grd, PRODX_T, shm, g.st>>>(p0, g.pj, g.pi, g.u4, ubJ, ubI, g.ngrid, n1, n2, n3, nsx, g.sxl, g.twx, g.prodq, (cc *)g.Bp); break;
+          case 4: k_prodx4<4><<<grd, PRODX_T, shm, g.st>>>(p0, g.pj, g.pi, g.u4, ubJ, ubI, g.ngrid, n1, n2, n3, nsx, g.sxl, g.twx, g.prodq, (cc *)g.Bp); break;
+          default: k_prodx4<PRODX_ACC><<<grd, PRODX_T, shm, g.st>>>(p0, g.pj, g.pi, g.u4, ubJ, ubI, g.ngrid, n1, n2, n3, nsx, g.sxl, g.twx, g.prodq, (cc *)g.Bp); break;
+        }
         CK(cudaGetLastError());
       } else {
         if (sp) k_products4<<<grid1(n), 256, 0, g.st>>>(n, g.ngrid, p0, g.pj, g.pi, g.u4, ubJ, ubI, g.f4);
@@ -1009,7 +1091,7 @@ static int gemm_mp(const zc *W, int ldw, const zc *At, int rows, int kc) {
   CK(cudaGetLastError());
   unsigned int ua = 0;
   CK(cudaMemcpyAsync(&ua, g.amax, sizeof(ua), cudaMemcpyDeviceToHost, g.st));
-  CK(cudaStreamSynchronize(g.st));
+  SYNC();
   float fa;
   memcpy(&fa, &ua, sizeof(fa));
   const double mA = fa;
@@ -1189,16 +1271,16 @@ extern "C" int chi_gpu_gemm(const zc *Wh, const zc *Vh, int kc, int ldw, int row
     if (ensure(&g.tmp, &g.tmp_cap, (size_t)NG)) return -1;
     if (h2d_2d(g.V, (size_t)rows * sizeof(zc), V, (size_t)ldw * sizeof(zc), (size_t)rows * sizeof(zc), 3)) return -1;
 #ifdef RESPACK_HIP
-    if (g.fused) {   // all frequencies and directions in one pass over At (k_yz_at), no BLAS
+    if (g.fused) {   // all frequencies and directions in one pass over At (k_yz_at), no BLAS, reproducible
       const size_t ny = (size_t)NG * 3 * nen;
-      if (ensure(&g.tmp, &g.tmp_cap, ny)) return -1;
-      CK(cudaMemsetAsync(g.tmp, 0, ny * sizeof(zc), g.st));
       int sp = rows / 4096;
       if (sp < 1) sp = 1;
       if (sp > 64) sp = 64;
+      if (ensure(&g.tmp, &g.tmp_cap, 2 * (size_t)sp * ny)) return -1;
+      double2 *yp = (double2 *)g.tmp, *zp = yp + (size_t)sp * ny;
       k_yz_at<<<dim3((NG + 31) / 32, (nen + 7) / 8, sp), 256, 0, g.st>>>(NG, rows, nen, (const double2 *)At,
-          (const double2 *)g.W, (const double2 *)g.V, (double2 *)g.tmp, (double2 *)g.Z);
-      k_addconj<<<grid1(ny), 256, 0, g.st>>>(ny, g.tmp, g.Y);
+          (const double2 *)g.W, (const double2 *)g.V, yp, zp);
+      k_yz_add<<<grid1(ny), 256, 0, g.st>>>(ny, sp, yp, zp, (double2 *)g.Y, (double2 *)g.Z);
       CK(cudaGetLastError());
     } else
 #endif
@@ -1220,8 +1302,9 @@ extern "C" int chi_gpu_gemm(const zc *Wh, const zc *Vh, int kc, int ldw, int row
     }
     CK(cudaGetLastError());
   }
-  // W (host) is rewritten by the caller for the next tile
-  CK(cudaStreamSynchronize(g.st));
+  // W (host) is rewritten by the caller for the next tile (staged uploads: already copied, the products run on
+  // while the caller computes the next weights)
+  if (g.upl != 2) SYNC();
   return 0;
 }
 
@@ -1229,7 +1312,7 @@ extern "C" int chi_gpu_gemm(const zc *Wh, const zc *Vh, int kc, int ldw, int row
 extern "C" int chi_gpu_q_end(zc *chi_host, zc *Y_host, zc *Z_host) {
   const int NG = g.NG, nen = g.nen;
   size_t ns = (size_t)NG * NG;
-  CK(cudaStreamSynchronize(g.st));
+  SYNC();
   if (ns > g.hbuf_cap) {
     if (g.hbuf) CK(cudaFreeHost(g.hbuf));
     CK(cudaMallocHost((void **)&g.hbuf, ns * sizeof(zc)));
@@ -1252,6 +1335,8 @@ extern "C" int chi_gpu_q_end(zc *chi_host, zc *Y_host, zc *Z_host) {
 }
 
 extern "C" int chi_gpu_available(void) { return 1; }
+// 1: chi_fast.f90 computes the tetrahedron weights also during the pair densities (integrated GPUs only)
+extern "C" int chi_gpu_overlap(void) { return g.init ? g.overlap : 0; }
 // total memory of the device used by this rank (MB), for the tile size in chi_fast.f90
 // RESPACK_GPU_MEM_MB caps it (e.g. to emulate a smaller card in tests)
 extern "C" double chi_gpu_mem_total_mb(void) {

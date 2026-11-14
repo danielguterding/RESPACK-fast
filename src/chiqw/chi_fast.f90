@@ -62,6 +62,13 @@ module m_chi_fast
     integer(c_int) function chi_gpu_available() bind(C, name='chi_gpu_available')
       import :: c_int
     end function chi_gpu_available
+    integer(c_int) function chi_gpu_overlap() bind(C, name='chi_gpu_overlap')
+      import :: c_int
+    end function chi_gpu_overlap
+    integer(c_int) function c_usleep(us) bind(C, name='usleep')
+      import :: c_int
+      integer(c_int), value :: us
+    end function c_usleep
     real(c_double) function chi_gpu_mem_total_mb() bind(C, name='chi_gpu_mem_total_mb')
       import :: c_double
     end function chi_gpu_mem_total_mb
@@ -248,6 +255,10 @@ contains
     integer :: ntj, nti
     real(8) :: t0, t1, tA, tB, tC, tArot, tAbnd, tApair   ! phase A (GPU): rotation / bands / pairs (host wall)
     integer :: itn, lev0, spl, nsub, isub, lpa, lpb
+    ! overlap mode (chi_gpu_overlap, integrated GPUs): weight sub-blocks done for the current / next tile, shared by
+    ! the two threads of a tile (written by the weights thread only); cdone: the GPU thread is through the tile
+    logical :: ovl
+    integer :: nwc, nwn, cdone
     logical :: gpu_rot                         ! wave-function rotation on the GPU (tile cache of irreducible bands)
     real(8) :: bytes_band, tsq
     ! pruned forward FFT (the NGeps components of the eps sphere only): x pass over all lines, gather of the needed x
@@ -472,12 +483,16 @@ contains
       lev0 = omp_get_max_active_levels()
       if (lev0 < 2) call omp_set_max_active_levels(2)
       spl = max(1, 32768/NTK)
+      ovl = chi_gpu_overlap() == 1
+      nwn = 0
       itn = next_tile(0)
       if (itn > 0) then
         allocate(Wn(NTK*tcount(itn), nen))
-        t0 = omp_get_wtime()
-        call phase_b(itn, 1, min(spl, tcount(itn)), Wn)
-        tB = tB + omp_get_wtime() - t0
+        if (.not. ovl) then   ! overlap mode: computed during the pair densities of the first tile
+          t0 = omp_get_wtime()
+          call phase_b(itn, 1, min(spl, tcount(itn)), Wn)
+          tB = tB + omp_get_wtime() - t0
+        end if
       end if
     end if
     do it = 1, ntile
@@ -502,6 +517,7 @@ contains
       if (use_gpu) then
         allocate(A(1, 1))                       ! pair densities live on the GPU
         call move_alloc(Wn, W)                  ! weights of this tile, computed during the previous tile
+        nwc = nwn; nwn = 0                      ! (overlap mode: nwc of its sub-blocks are done)
         itn = next_tile(it)
         if (itn > 0) allocate(Wn(NTK*tcount(itn), nen))
       else
@@ -513,7 +529,69 @@ contains
         allocate(V(1, 1))
       end if
 
-      if (use_gpu) then
+      if (use_gpu .and. ovl) then
+        ! Overlap mode (integrated GPUs, where the pair densities are mostly GPU time and the CPU would wait): the
+        ! main thread drives the pair densities and then the chi products of each sub-block as soon as its weights
+        ! are there; a second thread computes the weight sub-blocks of this tile in order, then those of the next
+        ! tile until the main thread is through. All GPU calls stay on the main thread.
+        nsub = (np + spl - 1)/spl
+        cdone = 0
+        !$omp parallel num_threads(2) default(shared)
+        if (omp_get_thread_num() == 0) then
+          block
+            integer :: is, ka, kb, kd, ierr
+            real(8) :: s0
+            s0 = omp_get_wtime()
+            call phase_a_gpu()
+            tA = tA + omp_get_wtime() - s0
+            do is = 1, nsub
+              do
+                !$omp atomic read
+                kd = nwc
+                if (kd >= is) exit
+                ierr = c_usleep(200_c_int)
+              end do
+              !$omp flush
+              ka = (is - 1)*spl + 1
+              kb = min(np, is*spl)
+              s0 = omp_get_wtime()
+              call phase_c_gpu(ka, kb)
+              tC = tC + omp_get_wtime() - s0
+            end do
+            !$omp atomic write
+            cdone = 1
+          end block
+        else
+          block
+            integer :: kd, nsubn, kn
+            real(8) :: s1
+            nsubn = 0
+            if (itn > 0) nsubn = (tcount(itn) + spl - 1)/spl
+            do
+              if (nwc < nsub) then
+                s1 = omp_get_wtime()
+                call phase_b(it, nwc*spl + 1, min(np, (nwc + 1)*spl), W)
+                tB = tB + omp_get_wtime() - s1
+                kn = nwc + 1
+                !$omp flush
+                !$omp atomic write
+                nwc = kn
+              else if (itn > 0 .and. nwn < nsubn) then
+                !$omp atomic read
+                kd = cdone
+                if (kd == 1) exit
+                s1 = omp_get_wtime()
+                call phase_b(itn, nwn*spl + 1, min(tcount(itn), (nwn + 1)*spl), Wn)
+                tB = tB + omp_get_wtime() - s1
+                nwn = nwn + 1
+              else
+                exit
+              end if
+            end do
+          end block
+        end if
+        !$omp end parallel
+      else if (use_gpu) then
         t0 = omp_get_wtime()
         call phase_a_gpu()
         tA = tA + omp_get_wtime() - t0

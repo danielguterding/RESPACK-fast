@@ -215,17 +215,17 @@ __global__ void k_w2f_pad(int nen, int nr, int nrp, const double2 *__restrict__ 
 
 // q = 0, all frequencies and directions in one pass over At (replaces 6 nen ZGEMV calls: no BLAS on this path),
 // double precision:
-//   Yt(G, ix, ie) += sum_r At(G, r) conj(w_r,ie v_r,ix)    (Y += conj(Yt) afterwards)
-//   Z(G, ix, ie)  += sum_r At(G, r) w_r,ie conj(v_r,ix)
-// W: rows x nen, V: rows x 3, Yt and Z: NG x 3 x nen. Thread (G, ie) = (32 consecutive G per wave, 8 frequencies per
-// block); gridDim.z splits the rows, partial sums added atomically.
+//   Y(G, ix, ie) += conj( sum_r At(G, r) conj(w_r,ie v_r,ix) )
+//   Z(G, ix, ie) += sum_r At(G, r) w_r,ie conj(v_r,ix)
+// W: rows x nen, V: rows x 3, Y and Z: NG x 3 x nen (ny elements). Thread (G, ie) = (32 consecutive G per wave,
+// 8 frequencies per block); gridDim.z splits the rows. Each split writes its partial sums to Yp, Zp + split ny;
+// k_yz_add adds them in a fixed order (reproducible, no atomics).
 __global__ __launch_bounds__(256)
 void k_yz_at(int NG, int rows, int nen, const double2 *__restrict__ At, const double2 *__restrict__ W,
-             const double2 *__restrict__ V, double2 *__restrict__ Yt, double2 *__restrict__ Z) {
+             const double2 *__restrict__ V, double2 *__restrict__ Yp, double2 *__restrict__ Zp) {
   const int G = blockIdx.x * 32 + threadIdx.x % 32, ie = blockIdx.y * 8 + threadIdx.x / 32;
   if (G >= NG || ie >= nen) return;
   const int per = (rows + gridDim.z - 1) / gridDim.z, rb = blockIdx.z * per, re = min(rows, rb + per);
-  if (rb >= re) return;
   double2 y[3], z[3];
   for (int ix = 0; ix < 3; ix++) { y[ix] = make_double2(0., 0.); z[ix] = make_double2(0., 0.); }
   for (int r = rb; r < re; r++) {
@@ -239,11 +239,25 @@ void k_yz_at(int NG, int rows, int nen, const double2 *__restrict__ At, const do
       z[ix].x += a.x * wc.x - a.y * wc.y; z[ix].y += a.x * wc.y + a.y * wc.x;                // a w conj(v)
     }
   }
+  const size_t ny = (size_t)NG * 3 * nen, off = (size_t)blockIdx.z * ny;
 #pragma unroll
   for (int ix = 0; ix < 3; ix++) {
     const size_t o = G + (size_t)NG * (ie * 3 + ix);
-    atomicAdd(&Yt[o].x, y[ix].x); atomicAdd(&Yt[o].y, y[ix].y);
-    atomicAdd(&Z[o].x, z[ix].x); atomicAdd(&Z[o].y, z[ix].y);
+    Yp[off + o] = y[ix];
+    Zp[off + o] = z[ix];
+  }
+}
+// Y(i) += conj(sum_s Yp(i + s n)), Z(i) += sum_s Zp(i + s n), s = 0 .. nsp-1 in order
+__global__ void k_yz_add(size_t n, int nsp, const double2 *__restrict__ Yp, const double2 *__restrict__ Zp,
+                         double2 *__restrict__ Y, double2 *__restrict__ Z) {
+  for (size_t t = blockIdx.x * (size_t)blockDim.x + threadIdx.x; t < n; t += (size_t)gridDim.x * blockDim.x) {
+    double yr = 0., yi = 0., zr = 0., zi = 0.;
+    for (int s = 0; s < nsp; s++) {
+      yr += Yp[t + s * n].x; yi += Yp[t + s * n].y;
+      zr += Zp[t + s * n].x; zi += Zp[t + s * n].y;
+    }
+    Y[t].x += yr; Y[t].y -= yi;
+    Z[t].x += zr; Z[t].y += zi;
   }
 }
 

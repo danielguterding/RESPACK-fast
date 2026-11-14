@@ -27,7 +27,8 @@ inputs, validation and the CPU build. Unless marked otherwise, everything below 
   the default instead (see “Integrated and RDNA2 GPUs” below); it needs no BLAS.
 - **q = 0 head/wing terms.** Double-precision ZGEMV on the GPU (on RDNA2: one own kernel for all frequencies),
   summed over tiles and assembled on the host.
-- **Tetrahedron weights.** On the CPU, in sub-blocks that overlap with the χ⁰ products on the GPU.
+- **Tetrahedron weights.** On the CPU, in sub-blocks that overlap with the χ⁰ products on the GPU; on integrated
+  GPUs also with the pair densities (`RESPACK_GPU_OVERLAP`).
 - **ε inversion and output.** On the CPU, in the background while the GPU computes the next q point
   (`flg_async_eps`, auto = on with `flg_gpu=1`).
 
@@ -106,7 +107,8 @@ On a machine with the GPU:
   `chi_gpu: local rank 0 -> device 0 (NVIDIA L40S, 47.4 GB), grid 24 24 24, FFT batch 1024, single-precision FFTs`
   or `chi_gpu: local rank 0 -> device 0 (AMD Radeon RX 9060 XT, 15.9 GB), grid …`.
 - On RDNA2 GPUs the log says `chi_gpu: chi products with the fused RDNA2 kernel (no BLAS; …)`, and on integrated
-  GPUs also `chi_gpu: uploads from host memory one at a time (integrated GPU; …)`.
+  GPUs also `chi_gpu: tetrahedron weights overlap the pair densities (integrated GPU)` and
+  `chi_gpu: uploads from host memory via pinned staging (integrated GPU)`.
 - With `RESPACK_GPU_GEMM=fp16`, the next line ends in `hi*hi in one call with round-to-nearest accumulation
   (mma.sync kernel; experimental)` on NVIDIA or `(gfx1200 kernel; experimental)` on gfx1200. If it says
   `hi*hi in K chunks of 512` instead, the round-to-nearest kernel is not used.
@@ -171,7 +173,8 @@ Other CUDA and ROCm versions and other GPUs have not been tested.
 | `RESPACK_GPU_FP16_TERMS` | 3 | `2x`, `2y`: drop one correction product (faster, 10–30× less accurate; exploratory runs only) |
 | `RESPACK_GPU_FP16_PAD` | 8 | the G dimension of the FP16 operands is padded to a multiple of this |
 | `RESPACK_GPU_KC` | 2048 (CUDA CGEMM), 512 (HIP CGEMM and RDNA2 kernel), 8192 (FP16) | GEMM block length in rows; for testing only |
-| `RESPACK_GPU_SYNC_UPLOADS` | 1 on integrated AMD GPUs, else 0 | 1: wait for each upload from host memory (works around a ROCm 7.2.0 problem on APUs, see “Integrated and RDNA2 GPUs”) |
+| `RESPACK_GPU_UPLOADS` | `staged` (integrated AMD GPUs only) | integrated GPUs: uploads from host memory `staged` through pinned host memory, or `sync` (waits for each upload; slower); `async` is refused there (not safe with ROCm 7.2.0). Ignored on discrete GPUs, which always upload directly and asynchronously. See “Integrated and RDNA2 GPUs” |
+| `RESPACK_GPU_OVERLAP` | 1 (integrated AMD GPUs only) | integrated GPUs: 1 computes the tetrahedron weights also while the pair densities run, 0 only during the χ⁰ products. Ignored on discrete GPUs (no overlap) |
 | `RESPACK_GPU_TILE_MB` | auto | tile budget in MB (default: 60 % of the device memory left after χ and 2 GB of buffers) |
 | `RESPACK_GPU_MEM_MB` | device memory | caps the device memory assumed for the tile size |
 | `RESPACK_GPU_ROT` | auto | wave-function rotation on the GPU; 0: on the CPU |
@@ -300,30 +303,62 @@ two speeds. Convert measured rates with the active cycles, not with the reported
 
 **Uploads on integrated GPUs:** with ROCm 7.2.0 on the 680M, back-to-back `hipMemcpyAsync` copies from pageable
 host memory sometimes delivered the data of the preceding copy (copies from pinned memory were not affected); the
-GPU then read wrong scatter indices and stopped with a memory fault. On integrated GPUs each upload therefore waits
-until it has completed (`RESPACK_GPU_SYNC_UPLOADS`, default 1 on integrated AMD GPUs). Discrete GPUs keep the
-asynchronous copies.
+GPU then read wrong scatter indices and stopped with a memory fault. On integrated GPUs the uploads therefore go
+through a pinned staging buffer: the data are copied into it on the host and transferred from there
+asynchronously; the buffer is reused after the next stream synchronization. The host does not wait for each copy
+and can run ahead of the GPU. Discrete GPUs keep the direct asynchronous copies.
 
-Whole runs on the 680M (Ryzen 7 PRO 6850U, 8 threads; phases summed over q):
+**Overlap on integrated GPUs:** on discrete GPUs the tetrahedron weights (CPU) overlap only the χ⁰ products, because
+the CPU part of the pair densities would compete for the cores. On an APU the pair densities are mostly GPU time
+while the CPU waits, and the χ⁰ products are too short to hide the weights. There (`RESPACK_GPU_OVERLAP=1`,
+default on integrated GPUs) the main thread drives the pair densities and then the χ⁰ products of each sub-block as
+soon as its weights are there, while a second thread computes the weights continuously: the remaining sub-blocks
+of the tile, then those of the next tile. All GPU calls stay on the main thread; the results are bitwise the same.
+
+Choice of the two switches (only the validated combinations are accepted; others are ignored with a message):
+
+| switch | integrated AMD GPUs | discrete GPUs (NVIDIA, AMD) |
+|---|---|---|
+| `RESPACK_GPU_UPLOADS` | `staged` (default). `sync` waits for each copy: same results, slower (Si 20 s instead of 16 s). `async` is refused: with ROCm 7.2.0, copies from pageable memory can deliver the data of the preceding copy | ignored: direct asynchronous copies |
+| `RESPACK_GPU_OVERLAP` | 1 (default). 0 computes the weights only during the χ⁰ products, as on discrete GPUs: same results, slower | ignored: no overlap (the CPU part of the pair densities would compete with the weights for the cores) |
+
+The path is reproducible: repeated runs, and runs with either setting of the two switches, give bitwise the same ε⁻¹
+(the q = 0 kernel adds the partial sums of its row splits in a fixed order).
+On integrated GPUs `k_prodx4` also computes only as many x frequencies per thread as needed (nsx = 5 for SrVO₃
+instead of 8 per pass): −20 % kernel time.
+
+Whole runs on the 680M (Ryzen 7 PRO 6850U, 8 threads; phases summed over q; with the overlap the phases run
+concurrently and their sums are not given):
 
 | | `calc_chiqw` | pair densities | tetrahedron | χ⁰ products |
 |---|---|---|---|---|
 | SrVO₃, CPU (`fast_gemm_sp=1`, default) | 103.0 s | 31.5 s | 35.3 s | 27.4 s |
 | SrVO₃, 680M, rocBLAS CGEMM (run as gfx1030) | 109.1 s | 32.4 s | 47.6 s | 61.4 s |
-| SrVO₃, 680M, fused kernel | 77.3 s | 24.0 s | 42.9 s | 12.4 s |
+| SrVO₃, 680M, fused kernel, uploads waited for, no overlap | 77.3 s | 24.0 s | 42.9 s | 12.4 s |
+| SrVO₃, 680M, fused kernel, staged uploads, overlap (default) | 63.6 s | | | |
 | Si, CPU (`fast_gemm_sp=1`, default) | 15.7 s | 1.2 s | 6.3 s | 1.2 s |
 | Si, 680M, rocBLAS CGEMM (run as gfx1030) | 24.3 s | 6.8 s | 7.9 s | 4.9 s |
-| Si, 680M, fused kernel | 21.1 s | 5.0 s | 8.3 s | 0.6 s |
+| Si, 680M, fused kernel, uploads waited for, no overlap | 21.1 s | 5.0 s | 8.3 s | 0.6 s |
+| Si, 680M, fused kernel, staged uploads, overlap (default) | 16.2 s | | | |
+
+Measured back to back in the same power state, SrVO₃ takes 77.2 and 78.3 s with the uploads waited for and without
+the overlap, and 63.9 and 63.2 s with the defaults. Alone, the staged uploads save about 7 s and the overlap about
+12 s. The power state of the APU (clocks, memory fabric) shifts run times by up to about 10 %; compare runs back to
+back. The CPU is now busy most of the time: on average 11.4 of the 16 hardware threads in use (before: 8.9, with
+one thread waiting for the GPU during the pair densities of every q point), apart from about 7 s of single-threaded
+start-up.
 
 On this GPU the χ⁰ products are no longer the limit. What remains:
-- **Tetrahedron weights** run on the CPU (8 threads). On an APU they share the power budget with the GPU.
-- **Pair densities** (rocprofv3 traces): for SrVO₃ (24³ grid) the GPU spends 11.7 s in `k_prodx4`, 6 s in FFTs
-  and 2 s in the other kernels. `k_prodx4` is neither bandwidth- nor compute-bound on the 680M: 1.4 GB/s read from
-  memory, 73 % L2 hits, VALU busy 46 %. It is latency-bound, with little work per workgroup: one pair and 32 grid
-  lines of 24 points, 14 400 workgroups per call. On integrated GPUs the log's “bands (upload, FFT)” time also
-  contains the wait for the preceding pair kernels, because the synchronized uploads wait for them.
-- **Small systems:** Si (15³ grid) is slower on the 680M than on the CPU. A run makes about 118 000 rocFFT and
-  20 000 other kernel launches and 28 000 stream synchronizations; the GPU is busy for 4.6 s of 21 s.
+- **Tetrahedron weights** run on the CPU and are now the critical path for SrVO₃ (about 50 s of a 63 s run on the
+  second thread). On an APU they share the power budget with the GPU.
+- **Pair densities** (rocprofv3 traces): for SrVO₃ (24³ grid) the GPU spends 9.4 s in `k_prodx4`, 6–14 s in FFTs
+  (depending on the memory-fabric clock) and 2–4 s in the other kernels. `k_prodx4` is neither bandwidth- nor
+  compute-bound on the 680M: 1.4 GB/s read from memory, 73 % L2 hits, VALU busy 46 %. It is latency-bound, with
+  little work per workgroup: one pair and 32 grid lines of 24 points, 14 400 workgroups per call. Four pairs per
+  workgroup with the next pair's values loaded during the transform saved another 12 % of kernel time but no wall
+  time, so it is not included.
+- **Small systems:** Si (15³ grid) runs as fast as on the CPU. A run makes about 118 000 rocFFT and 20 000 other
+  kernel launches; the GPU is busy for 4.6 s of 16 s.
 
 ## χ⁰ products on the matrix units: FP16 split (experimental, `RESPACK_GPU_GEMM=fp16`)
 
@@ -749,8 +784,9 @@ dominate at 5 Ry. The larger levers are:
   and would need validation against the original code.
 - **ε inversion on the GPU** (cuSOLVER/rocSOLVER). It runs on the CPU, in the background while the GPU computes the
   next q; this only pays off if the CPU becomes the limit.
-- **Integrated GPUs:** pinned staging buffers for the uploads instead of waiting for each copy; more work per
-  workgroup in `k_prodx4` (several pairs or more lines per workgroup); fewer, larger FFT launches for small grids.
+- **Integrated GPUs:** the tetrahedron weights are the critical path; fewer, larger FFT launches for small grids
+  (the FFT batch size, `RESPACK_GPU_FBATCH`, makes no difference for Si); the single-threaded start-up (about 7 s for
+  SrVO₃, mostly reading the wave functions).
 
 ## Modified files (GPLv3 §5a; modifications by Daniel Guterding, November 2026)
 
@@ -758,13 +794,13 @@ In addition to those listed in [README-zen-opt.md](README-zen-opt.md):
 
 | file | status | change |
 |---|---|---|
-| `src/chiqw/chi_gpu.cu` | new | GPU part of the band-pair loop: wave-function cache and rotation (`k_rotscatter`), bands on the FFT grid, fused pair products and x pass (`k_prodx4`), batched and pruned FFTs, gather of the ε sphere, CGEMM blocks, FP16 split or the fused RDNA2 kernel into a double-precision χ on the GPU, q = 0 head/wing terms, synchronized uploads on integrated GPUs, device-memory query |
+| `src/chiqw/chi_gpu.cu` | new | GPU part of the band-pair loop: wave-function cache and rotation (`k_rotscatter`), bands on the FFT grid, fused pair products and x pass (`k_prodx4`), batched and pruned FFTs, gather of the ε sphere, CGEMM blocks, FP16 split or the fused RDNA2 kernel into a double-precision χ on the GPU, q = 0 head/wing terms, staged uploads and overlap switch on integrated GPUs, device-memory query |
 | `src/chiqw/chi0_rdna2.h` | new | fused χ⁰ kernel for RDNA2 GPUs (gfx103x) and the q = 0 head/wing kernel without BLAS |
 | `src/chiqw/chi_gpu_stub.c` | new | stubs for builds without a GPU (`flg_gpu=1` then stops with a message) |
 | `src/chiqw/gpu_api.h` | new | maps the CUDA names in `chi_gpu.cu` onto HIP/hipFFT/hipBLAS for the ROCm build |
 | `src/chiqw/hgemm_rn.cuh` | new | FP16 GEMM with round-to-nearest accumulation for NVIDIA GPUs (compute capability ≥ 8.0) |
 | `src/chiqw/fp16_rn/` | new | FP16 GEMM kernel with round-to-nearest accumulation for gfx1200 (patched hipBLASLt kernel, MIT License: `LICENSE-hipBLASLt.txt`), embedding (`fp16_rn_blob.c`) |
-| `src/chiqw/chi_fast.f90` | modified | GPU branch of the pair densities and the χ⁰ products (`use_gpu`); GPU tile size from the device memory; tetrahedron weights in sub-blocks overlapped with the χ⁰ products; single-precision uploads; choice between CPU and GPU rotation |
+| `src/chiqw/chi_fast.f90` | modified | GPU branch of the pair densities and the χ⁰ products (`use_gpu`); GPU tile size from the device memory; tetrahedron weights in sub-blocks overlapped with the χ⁰ products (on integrated GPUs also with the pair densities); single-precision uploads; choice between CPU and GPU rotation |
 | `src/chiqw/chiqw.F`, `m_rdinput.f90` | modified | input `flg_gpu`; `flg_async_eps` auto = on with the GPU |
 | `CMakeLists.txt`, `CMakePresets.json`, `src/chiqw/CMakeLists.txt` | modified | options `RESPACK_CUDA` (cuFFT, cuBLAS; default architectures `all-major`) and `RESPACK_HIP` (preset `hip`); assembly and embedding of the gfx1200 kernel (`RESPACK_HIP_FP16_RN`) |
 
