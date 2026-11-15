@@ -53,9 +53,9 @@ The fork computes the same quantity this way:
      frequency-sized temporaries of every call with `malloc`, which with 8 threads cost about 10 % of the
      tetrahedron time. Complex integer powers in the near-degenerate cases are explicit products instead of
      library calls.
-   - SrVO₃ (8 threads, single-precision defaults): tetrahedron weights 36.7 s → 26.8 s, `calc_chiqw`
-     105.9 s → 96.6 s. The accuracy against a quad-precision evaluation of the original formulas is unchanged
-     (`local-tools/acc_tetra_quad.f90`).
+   - SrVO₃ (Ryzen 7 PRO 6850U, 8 threads, single-precision defaults): tetrahedron weights 36.7 s → 26.8 s,
+     `calc_chiqw` 105.9 s → 96.6 s. Ryzen 9 9950X3D (Zen 5, 16 threads, AVX-512): 4.9 s → 3.8 s. The accuracy
+     against a quad-precision evaluation of the original formulas is unchanged (`local-tools/acc_tetra_quad.f90`).
 
 **Precision.** By default the χ⁰ part runs in single precision: CGEMM accumulation, FFTs and wave functions
 (below). For a fully double-precision run set `fast_gemm_sp=0, fast_fft_sp=0`. The deviations of the
@@ -235,10 +235,23 @@ per-directory Makefiles are unchanged but don't know about the fork's new files;
   preset) should be rebuilt.
 - **AVX-512 (Zen 4, Zen 5):** the vectorised loops (tetrahedron weights with libmvec's `log`/`atan2`) use
   512-bit vectors when the build targets such a CPU: preset `native`, or `RESPACK_ARCH=znver4` (GCC ≥ 13) /
-  `znver5` (GCC ≥ 14). The `zen3` preset produces AVX2 code, also on Zen 4/5. Measured on an EPYC 9454 (Zen 4,
-  8 cores, other jobs on the node): tetrahedron weights for SrVO₃ 32.9 s (AVX2) and 32.2 s (AVX-512), Si 6.4 s
-  and 5.6 s; the previous code took 40.6 s and 8.4 s. Zen 4 executes 512-bit instructions in two halves; Zen 5
-  has full-width units.
+  `znver5` (GCC ≥ 14). The `zen3` preset produces AVX2 code, also on Zen 4/5. Tetrahedron weights (sum over q,
+  single-precision defaults), previous code built with `native` → new code with AVX2 (`zen3` preset or
+  `RESPACK_ARCH=znver3`) / AVX-512 (`native`):
+
+  | CPU | SrVO₃ | Si |
+  |---|---|---|
+  | EPYC 9454 (Zen 4), 8 cores, other jobs on the node, GCC 13.3 | 40.6 → 32.9 / 32.2 s | 8.4 → 6.4 / 5.6 s |
+  | Ryzen 9 9950X3D (Zen 5), 16 threads, GCC 15.2 | 4.9 → 5.1 / 3.8 s | 1.0 → 1.0 / 0.8 s |
+  | Ryzen 9 9950X3D (Zen 5), 8 threads | 9.2 → – / 6.8 s | – |
+
+  Zen 4 executes 512-bit instructions in two halves, so AVX-512 gains only 2 % there. Zen 5 has full-width
+  units: the AVX-512 build is 25 % faster than the AVX2 build. On Zen 5 the previous code built with `native`
+  already used AVX-512 for the log ratios, so the AVX2 build of the new code is not faster than it. On the
+  9950X3D, ε⁻¹ of the new code deviates from the previous code by 5×10⁻⁹ (SrVO₃) and 9×10⁻¹⁰ (Si) in double
+  precision; U(ω), J(ω) are identical (SrVO₃) or differ in the last printed digit (1×10⁻⁵ eV, Si). Single
+  against double precision of the same build gives 1.7×10⁻⁶ and 3.8×10⁻⁷ for both versions, and the AVX2 and
+  AVX-512 builds differ by 2×10⁻⁸ (single precision).
 - **Other compilers:** the GNU toolchain is tested. Intel/ifx get `-xHost` with `RESPACK_NATIVE`;
   other compilers use their defaults.
 - **Validated builds:** the `zen3` and `default` builds were both checked against the reference results
