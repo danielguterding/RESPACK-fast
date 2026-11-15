@@ -229,6 +229,25 @@ the block length. For SrVO₃ with double-precision FFTs, ε⁻¹ deviates from 
 3.8×10⁻⁶ at 2048 rows, 8.4×10⁻⁷ at 512 and 2.2×10⁻⁷ at 128. The CGEMM time is 13.0 s, 16.6 s and 33.1 s. At
 512 rows the accuracy matches cuBLAS at 2048 rows.
 
+**Current version against the previous one.** `1dec356` (vectorised tetrahedron weights from `zen-opt`, the
+changes for integrated GPUs) against `ae97867` (before both), on the same machine without other jobs, 1 rank ×
+8 threads, single-precision defaults:
+
+| test | `calc_chiqw` before → now | tetrahedron weights | ε⁻¹ vs CPU double | ε⁻¹ now vs before |
+|---|---|---|---|---|
+| SrVO₃ chain, CGEMM | 31.6 → 30.2 s | 9.4 → 6.9 s | 3.0×10⁻⁶ | 1.6×10⁻⁸ |
+| SrVO₃ chain, FP16 | 25.4 → 24.8 s | 9.4 → 7.0 s | 2.5×10⁻⁶ | 1.9×10⁻⁸ |
+| Si chain, CGEMM | 11.4 → 11.0 s | 1.8 → 1.3 s | 1.1×10⁻⁶ | 1.1×10⁻⁸ |
+| Si chain, FP16 | 10.2 → 9.8 s | 1.8 → 1.3 s | 1.1×10⁻⁶ | 8.7×10⁻⁹ |
+| SrVO₃, NG = 1963, one q, FP16 | 42.2 → 42.7 s | 0.45 → 0.35 s | 6.7×10⁻⁷ | 7.7×10⁻⁹ |
+
+U(ω) and J(ω) are unchanged (≤ 3×10⁻⁵ eV from CPU double precision for SrVO₃, ≤ 1×10⁻⁵ eV for Si). On the
+large molecular crystal (one q, FP16, 16 threads; see "Large systems") the χ⁰ part takes 79.4 → 79.0 s at
+3.5 Ry and 185.4 → 184.2 s at 5 Ry, and ε⁻¹ changes by 3×10⁻⁸. Only the tetrahedron weights changed on this
+GPU. The fused kernel, the staged uploads and the overlap are for integrated GPUs: with
+`RESPACK_GPU_UPLOADS=staged RESPACK_GPU_OVERLAP=1` the log says both are ignored on discrete GPUs, and ε⁻¹ is
+bitwise the same.
+
 ### AMD Radeon 680M, integrated (ROCm 7.2.0, native gfx1035 build; Ryzen 7 PRO 6850U, 1 rank × 8 threads)
 
 Fused RDNA2 kernel (default on this GPU), single-precision FFTs (default):
